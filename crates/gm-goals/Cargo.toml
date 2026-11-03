@@ -8,6 +8,7 @@ license.workspace = true
 gm-core = { workspace = true }
 gm-platform = { workspace = true }
 gm-llm = { workspace = true }
+gm-safety = { workspace = true }
 gm-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

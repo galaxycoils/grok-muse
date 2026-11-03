@@ -1,7 +1,8 @@
 use clap::Parser;
 use gm_core::error::Result;
 use gm_daemon::{
-    Cli, Commands, run_daemon, run_do, run_kill, run_onboard, run_permissions, run_status,
+    Cli, Commands, run_daemon, run_do, run_dogfood, run_kill, run_onboard, run_permissions,
+    run_review, run_service, run_stats, run_status,
 };
 
 #[tokio::main]
@@ -31,6 +32,18 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Kill) => {
             run_kill().await?;
+        }
+        Some(Commands::Service { action }) => {
+            run_service(action).await?;
+        }
+        Some(Commands::Dogfood { action, json }) => {
+            run_dogfood(action, json).await?;
+        }
+        Some(Commands::Stats { json }) => {
+            run_stats(json).await?;
+        }
+        Some(Commands::Review { date }) => {
+            run_review(date).await?;
         }
         None => {
             if let Some(task) = cli.task {

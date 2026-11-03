@@ -53,6 +53,10 @@ impl BudgetManager {
     pub fn get_job_spent(&self) -> f64 {
         *self.current_job_spent_usd.lock()
     }
+
+    pub fn config(&self) -> &BudgetConfig {
+        &self.config
+    }
 }
 
 #[cfg(test)]

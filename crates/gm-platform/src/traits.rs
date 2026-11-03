@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use gm_core::error::Result;
 use gm_core::types::{
-    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, PermissionStatus, ReminderItem,
-    UserActivity,
+    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, MailItem, PermissionStatus,
+    ReminderItem, UserActivity,
 };
 
 #[async_trait]
@@ -38,6 +38,9 @@ pub trait Platform: Send + Sync {
 
     /// Retrieve reminder tasks from EventKit.
     async fn get_reminders(&self, include_completed: bool) -> Result<Vec<ReminderItem>>;
+
+    /// Retrieve unread email messages.
+    async fn get_unread_emails(&self) -> Result<Vec<MailItem>>;
 
     /// Send a native macOS user alert notification.
     async fn send_notification(

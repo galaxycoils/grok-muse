@@ -17,6 +17,7 @@ pub struct MockPlatform {
     cancelled_count: Arc<Mutex<u32>>,
     calendar_events: Arc<Mutex<Vec<CalendarItem>>>,
     reminders: Arc<Mutex<Vec<ReminderItem>>>,
+    unread_emails: Arc<Mutex<Vec<MailItem>>>,
     sent_notifications: Arc<Mutex<Vec<NotificationPayload>>>,
 }
 
@@ -46,6 +47,7 @@ impl MockPlatform {
             cancelled_count: Arc::new(Mutex::new(0)),
             calendar_events: Arc::new(Mutex::new(Vec::new())),
             reminders: Arc::new(Mutex::new(Vec::new())),
+            unread_emails: Arc::new(Mutex::new(Vec::new())),
             sent_notifications: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -76,6 +78,10 @@ impl MockPlatform {
 
     pub fn set_reminders(&self, reminders: Vec<ReminderItem>) {
         *self.reminders.lock() = reminders;
+    }
+
+    pub fn set_unread_emails(&self, emails: Vec<MailItem>) {
+        *self.unread_emails.lock() = emails;
     }
 
     pub fn get_sent_notifications(&self) -> Vec<NotificationPayload> {
@@ -223,6 +229,10 @@ impl Platform for MockPlatform {
             .cloned()
             .collect();
         Ok(filtered)
+    }
+
+    async fn get_unread_emails(&self) -> Result<Vec<MailItem>> {
+        Ok(self.unread_emails.lock().clone())
     }
 
     async fn send_notification(

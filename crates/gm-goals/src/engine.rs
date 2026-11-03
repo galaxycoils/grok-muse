@@ -1,3 +1,5 @@
+use crate::dogfood::DogfoodTracker;
+use crate::nightly_review::{NightlyReviewSummary, run_nightly_review};
 use crate::notice::ProactiveNotice;
 use crate::quiet_gate::{QuietGate, QuietGateConfig};
 use crate::scheduler::ProactiveScheduler;
@@ -14,15 +16,35 @@ pub struct ProactiveEngine {
     quiet_gate: QuietGate,
     budget: Arc<BudgetManager>,
     notices_history: Arc<Mutex<Vec<ProactiveNotice>>>,
+    dogfood_tracker: Arc<DogfoodTracker>,
 }
 
 impl ProactiveEngine {
     pub fn new(quiet_gate_config: QuietGateConfig, budget: Arc<BudgetManager>) -> Self {
+        let tracker = Arc::new(
+            DogfoodTracker::default_tracker(budget.config().daily_spend_cap_usd)
+                .unwrap_or_else(|_| DogfoodTracker::in_memory()),
+        );
         Self {
             scheduler: ProactiveScheduler::new(),
             quiet_gate: QuietGate::new(quiet_gate_config),
             budget,
             notices_history: Arc::new(Mutex::new(Vec::new())),
+            dogfood_tracker: tracker,
+        }
+    }
+
+    pub fn with_tracker(
+        quiet_gate_config: QuietGateConfig,
+        budget: Arc<BudgetManager>,
+        dogfood_tracker: Arc<DogfoodTracker>,
+    ) -> Self {
+        Self {
+            scheduler: ProactiveScheduler::new(),
+            quiet_gate: QuietGate::new(quiet_gate_config),
+            budget,
+            notices_history: Arc::new(Mutex::new(Vec::new())),
+            dogfood_tracker,
         }
     }
 
@@ -38,6 +60,10 @@ impl ProactiveEngine {
         &self.budget
     }
 
+    pub fn dogfood_tracker(&self) -> &Arc<DogfoodTracker> {
+        &self.dogfood_tracker
+    }
+
     pub fn get_history(&self) -> Vec<ProactiveNotice> {
         self.notices_history.lock().clone()
     }
@@ -46,6 +72,9 @@ impl ProactiveEngine {
         let mut history = self.notices_history.lock();
         if let Some(notice) = history.iter_mut().find(|n| n.id == notice_id) {
             notice.rate_useful(useful);
+            let _ = self
+                .dogfood_tracker
+                .record_rating(notice_id, useful, Utc::now());
             true
         } else {
             false
@@ -188,6 +217,15 @@ impl ProactiveEngine {
                 self.quiet_gate.record_delivery_at(&dedup_hash, now);
 
                 let notice = ProactiveNotice::new(title, body, topic, is_urgent);
+                let _ = self.dogfood_tracker.record_notice_delivered(
+                    &notice.id,
+                    &notice.topic,
+                    &notice.title,
+                    notice.is_urgent,
+                    &dedup_hash,
+                    triage_cost,
+                    now,
+                );
                 self.notices_history.lock().push(notice.clone());
                 delivered.push(notice);
             }
@@ -209,6 +247,106 @@ impl ProactiveEngine {
             .handle_feedback(topic, dedup_hash, action, now);
         let useful = !matches!(action, crate::quiet_gate::NoticeAction::Stop);
         self.rate_notice(notice_id, useful);
+        let action_str = match action {
+            crate::quiet_gate::NoticeAction::Done => "done",
+            crate::quiet_gate::NoticeAction::Later(_) => "later",
+            crate::quiet_gate::NoticeAction::Stop => "stop",
+        };
+        let _ =
+            self.dogfood_tracker
+                .record_feedback(notice_id, topic, action_str, Some(useful), now);
+    }
+
+    /// Evaluates unread emails via Platform, checks for urgency, applies QuietGate rules
+    /// and budget limits, and dispatches native alert notifications.
+    pub async fn patrol_mail<P: Platform>(
+        &self,
+        platform: &P,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ProactiveNotice>> {
+        let emails = platform.get_unread_emails().await?;
+        let mut candidate_notices = Vec::new();
+
+        for email in emails {
+            if email.is_read {
+                continue;
+            }
+            let is_urgent = email.is_urgent_heuristic();
+            let title = if is_urgent {
+                format!("Urgent Mail: {}", email.subject)
+            } else {
+                format!("Mail: {}", email.subject)
+            };
+
+            let body = if email.snippet.trim().is_empty() {
+                format!("From {}", email.sender)
+            } else {
+                format!("From {}: {}", email.sender, email.snippet)
+            };
+
+            let dedup_hash = format!("mail_{}_{}", email.id, email.received_time_ms);
+            candidate_notices.push((title, body, "mail".to_string(), is_urgent, dedup_hash));
+        }
+
+        let mut delivered = Vec::new();
+
+        for (title, body, topic, is_urgent, dedup_hash) in candidate_notices {
+            // A. Check Quiet Gate
+            let (allowed, reason) =
+                self.quiet_gate
+                    .can_deliver(&topic, &dedup_hash, is_urgent, now);
+            if !allowed {
+                info!(
+                    "Mail notice '{}' suppressed by QuietGate: {}",
+                    title,
+                    reason.unwrap_or("unknown")
+                );
+                continue;
+            }
+
+            // B. Enforce Daily Spend Cap Tracking
+            let triage_cost = 0.001;
+            if let Err(e) = self.budget.record_spend(triage_cost) {
+                warn!("Mail alert suppressed due to budget spend cap: {e}");
+                continue;
+            }
+
+            // C. Deliver via macOS UserNotifications alert
+            let sent = platform
+                .send_notification(&title, Some("Mail Patrol"), &body)
+                .await?;
+
+            if sent {
+                self.quiet_gate.record_delivery_at(&dedup_hash, now);
+
+                let notice = ProactiveNotice::new(title, body, topic, is_urgent);
+                let _ = self.dogfood_tracker.record_notice_delivered(
+                    &notice.id,
+                    &notice.topic,
+                    &notice.title,
+                    notice.is_urgent,
+                    &dedup_hash,
+                    triage_cost,
+                    now,
+                );
+                self.notices_history.lock().push(notice.clone());
+                delivered.push(notice);
+            }
+        }
+
+        Ok(delivered)
+    }
+
+    /// Synthesizes structured nightly review from audit events, memories, dogfood metrics and calendar/reminders.
+    pub async fn nightly_review<P: Platform>(
+        &self,
+        platform: Option<&P>,
+        audit: &gm_safety::AuditLogger,
+        memory: &gm_memory::PersonalMemoryStore,
+        now: DateTime<Utc>,
+    ) -> Result<NightlyReviewSummary> {
+        let df_metrics = self.dogfood_tracker.compute_metrics();
+        run_nightly_review(platform, audit, memory, Some(&df_metrics), now).await
     }
 
     /// Schedule automated EventKit patrol runs on the given interval (in seconds).
@@ -216,10 +354,11 @@ impl ProactiveEngine {
         let engine_gate = self.quiet_gate.clone();
         let engine_budget = Arc::clone(&self.budget);
         let engine_history = Arc::clone(&self.notices_history);
+        let cal_platform = Arc::clone(&platform);
 
         self.scheduler
             .register_job("patrol_calendar_reminders", interval_secs, move || {
-                let p = Arc::clone(&platform);
+                let p = Arc::clone(&cal_platform);
                 let gate = engine_gate.clone();
                 let budget = Arc::clone(&engine_budget);
                 let history = Arc::clone(&engine_history);
@@ -300,6 +439,54 @@ impl ProactiveEngine {
                                         is_urgent,
                                     ));
                                 }
+                            }
+                        }
+                    }
+                });
+            });
+
+        let mail_gate = self.quiet_gate.clone();
+        let mail_budget = Arc::clone(&self.budget);
+        let mail_history = Arc::clone(&self.notices_history);
+        let mail_tracker = Arc::clone(&self.dogfood_tracker);
+        let mail_platform = Arc::clone(&platform);
+
+        self.scheduler
+            .register_job("patrol_mail", interval_secs, move || {
+                let p = Arc::clone(&mail_platform);
+                let gate = mail_gate.clone();
+                let budget = Arc::clone(&mail_budget);
+                let history = Arc::clone(&mail_history);
+                let tracker = Arc::clone(&mail_tracker);
+
+                tokio::spawn(async move {
+                    let now = Utc::now();
+                    if let Ok(emails) = p.get_unread_emails().await {
+                        for email in emails {
+                            if email.is_read {
+                                continue;
+                            }
+                            let is_urgent = email.is_urgent_heuristic();
+                            let dedup = format!("mail_{}_{}", email.id, email.received_time_ms);
+                            let title = if is_urgent {
+                                format!("Urgent Mail: {}", email.subject)
+                            } else {
+                                format!("Unread Mail: {}", email.subject)
+                            };
+                            let body = format!("From {}: {}", email.sender, email.snippet);
+
+                            if gate.can_deliver("mail", &dedup, is_urgent, now).0
+                                && budget.record_spend(0.001).is_ok()
+                            {
+                                let _ = p
+                                    .send_notification(&title, Some("Mail Patrol"), &body)
+                                    .await;
+                                gate.record_delivery_at(&dedup, now);
+                                let notice = ProactiveNotice::new(&title, &body, "mail", is_urgent);
+                                let _ = tracker.record_notice_delivered(
+                                    &notice.id, "mail", &title, is_urgent, &dedup, 0.001, now,
+                                );
+                                history.lock().push(notice);
                             }
                         }
                     }
@@ -477,5 +664,112 @@ mod tests {
             .await
             .expect("patrol after done");
         assert_eq!(delivered_again.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_mail_patrol() {
+        use gm_core::types::MailItem;
+
+        let mock_platform = Arc::new(MockPlatform::new());
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let tracker = Arc::new(DogfoodTracker::in_memory());
+        let engine = ProactiveEngine::with_tracker(QuietGateConfig::default(), budget, tracker);
+
+        // 1. Midnight time (2 AM UTC) - quiet hours active
+        let midnight = Utc.with_ymd_and_hms(2026, 11, 3, 2, 0, 0).unwrap();
+        let now_ms = midnight.timestamp_millis() as u64;
+
+        mock_platform.set_unread_emails(vec![
+            // Non-urgent newsletter -> should be suppressed during quiet hours
+            MailItem {
+                id: "msg_news".into(),
+                sender: "news@tech.com".into(),
+                subject: "Weekly Digest".into(),
+                snippet: "Here is your weekly summary".into(),
+                received_time_ms: now_ms,
+                is_read: false,
+                is_flagged: false,
+                is_urgent: false,
+            },
+            // Urgent mail -> should bypass quiet hours
+            MailItem {
+                id: "msg_urgent".into(),
+                sender: "boss@corp.com".into(),
+                subject: "CRITICAL: Server Down ASAP".into(),
+                snippet: "Production database unreachable".into(),
+                received_time_ms: now_ms,
+                is_read: false,
+                is_flagged: true,
+                is_urgent: true,
+            },
+        ]);
+
+        let delivered = engine
+            .patrol_mail(&*mock_platform, midnight)
+            .await
+            .expect("mail patrol");
+
+        // Only the urgent mail should be delivered during quiet hours
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].title.contains("CRITICAL: Server Down ASAP"));
+        assert!(delivered[0].is_urgent);
+
+        // Verify dogfood metrics recorded this delivery
+        let metrics = engine.dogfood_tracker().compute_metrics();
+        assert_eq!(metrics.total_notices_delivered, 1);
+
+        // Immediate subsequent mail patrol should dedup
+        let delivered_again = engine
+            .patrol_mail(&*mock_platform, midnight)
+            .await
+            .expect("mail dedup");
+        assert_eq!(delivered_again.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_nightly_review() {
+        use gm_memory::PersonalMemoryStore;
+        use gm_safety::AuditLogger;
+
+        let mock_platform = Arc::new(MockPlatform::new());
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), budget);
+
+        let audit = AuditLogger::in_memory();
+        audit.log(
+            "task_done",
+            Some("meta".into()),
+            Some("muse-spark".into()),
+            Some(300),
+            Some(0.003),
+            Some("Automated file reorganization".into()),
+            serde_json::json!({}),
+        );
+
+        let memory = PersonalMemoryStore::in_memory().unwrap();
+        memory
+            .record_preference("Prefers dark mode in all apps", &["ui", "preferences"])
+            .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 11, 3, 21, 30, 0).unwrap();
+        let summary = engine
+            .nightly_review(Some(&*mock_platform), &audit, &memory, now)
+            .await
+            .expect("nightly review");
+
+        assert_eq!(summary.date, "2026-11-03");
+        assert_eq!(summary.tasks_completed.len(), 1);
+        assert!(summary.tasks_completed[0].contains("Automated file reorganization"));
+        assert!(
+            summary
+                .memories_formed
+                .iter()
+                .any(|m| m.contains("Prefers dark mode"))
+        );
+        assert!(summary.review_markdown.contains("Grok-Muse Nightly Review"));
+
+        // Verify that nightly review was persisted in memory store
+        let search_results = memory.search("Nightly Review", 5).unwrap();
+        assert!(!search_results.is_empty());
     }
 }

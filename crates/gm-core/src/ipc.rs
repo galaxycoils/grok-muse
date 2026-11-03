@@ -1,7 +1,7 @@
 use crate::error::{GmError, Result};
 use crate::types::{
-    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, PermissionStatus, ReminderItem,
-    UserActivity,
+    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, MailItem, PermissionStatus,
+    ReminderItem, UserActivity,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -34,6 +34,7 @@ pub enum HelperRequest {
     GetReminders {
         include_completed: bool,
     },
+    GetUnreadEmails,
     SendNotification {
         title: String,
         subtitle: Option<String>,
@@ -56,6 +57,7 @@ pub enum HelperResponse {
     Cancelled,
     CalendarEvents(Vec<CalendarItem>),
     Reminders(Vec<ReminderItem>),
+    UnreadEmails(Vec<MailItem>),
     NotificationSent(bool),
     Error(String),
 }

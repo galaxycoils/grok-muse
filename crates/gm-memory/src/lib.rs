@@ -57,8 +57,13 @@ impl PersonalMemoryStore {
     }
 
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Record>> {
+        let text = if query_str.trim().is_empty() {
+            None
+        } else {
+            Some(query_str.to_string())
+        };
         let query = SearchQuery {
-            text: Some(query_str.to_string()),
+            text,
             kinds: vec![],
             limit,
         };

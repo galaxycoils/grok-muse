@@ -2,7 +2,7 @@ use crate::traits::Platform;
 use async_trait::async_trait;
 use gm_core::error::{GmError, Result};
 use gm_core::types::{
-    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, FrameData, MouseButton,
+    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, FrameData, MailItem, MouseButton,
     PermissionStatus, ReminderItem, UserActivity,
 };
 use parking_lot::RwLock;
@@ -559,6 +559,71 @@ impl Platform for MacPlatform {
         };
         let items: Vec<ReminderItem> = serde_json::from_str(&json_str).unwrap_or_default();
         Ok(items)
+    }
+
+    async fn get_unread_emails(&self) -> Result<Vec<MailItem>> {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::task::spawn_blocking(|| {
+                std::process::Command::new("osascript")
+                    .args([
+                        "-e",
+                        r#"tell application "System Events"
+    if not (exists (processes where name is "Mail")) then return ""
+end tell
+tell application "Mail"
+    try
+        set unreadList to {}
+        set msgs to (messages of inbox whose read status is false)
+        repeat with m in msgs
+            set end of unreadList to (id of m as text) & "\t" & (sender of m as text) & "\t" & (subject of m as text) & "\t" & (flagged status of m as text)
+        end repeat
+        set AppleScript's text item delimiters to linefeed
+        return unreadList as text
+    on error
+        return ""
+    end try
+end tell"#,
+                    ])
+                    .output()
+            }),
+        )
+        .await;
+
+        if let Ok(Ok(Ok(out))) = output
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut emails = Vec::new();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 3 {
+                    let id = parts[0].trim().to_string();
+                    let sender = parts[1].trim().to_string();
+                    let subject = parts[2].trim().to_string();
+                    let is_flagged = parts.get(3).map(|s| s.trim() == "true").unwrap_or(false);
+                    let mut mail = MailItem {
+                        id,
+                        sender,
+                        subject,
+                        snippet: String::new(),
+                        received_time_ms: now_ms,
+                        is_read: false,
+                        is_flagged,
+                        is_urgent: false,
+                    };
+                    mail.is_urgent = mail.is_urgent_heuristic();
+                    emails.push(mail);
+                }
+            }
+            return Ok(emails);
+        }
+
+        Ok(Vec::new())
     }
 
     async fn send_notification(

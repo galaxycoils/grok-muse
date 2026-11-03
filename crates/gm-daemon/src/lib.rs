@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
+pub mod service;
+pub use service::*;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gm",
@@ -64,6 +67,65 @@ pub enum Commands {
     Status,
     /// Trigger emergency kill switch
     Kill,
+    /// Service management and auto-start (LaunchAgent install/uninstall/status)
+    Service {
+        #[command(subcommand)]
+        action: ServiceSubcommand,
+    },
+    /// Proactive dogfood rating & metrics tracking (G6 gate)
+    Dogfood {
+        #[command(subcommand)]
+        action: Option<DogfoodSubcommand>,
+        /// Output metrics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show system health, permissions, and dogfood statistics
+    Stats {
+        /// Output statistics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run structured nightly review synthesis
+    Review {
+        /// Date to review (YYYY-MM-DD, defaults to today)
+        #[arg(long)]
+        date: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ServiceSubcommand {
+    /// Install and bootstrap LaunchAgent plists for gm-daemon and gm-cu-helper
+    Install {
+        /// Optional custom binary directory
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+    /// Bootout and remove LaunchAgent plists
+    Uninstall,
+    /// Show LaunchAgent registration and process status
+    Status,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DogfoodSubcommand {
+    /// Print dogfood metrics report and G6 gate status
+    Summary,
+    /// Rate a notice useful or not useful
+    Rate {
+        notice_id: String,
+        #[arg(long)]
+        useful: bool,
+    },
+    /// Record user feedback action for a notice (done, later, stop)
+    Feedback {
+        notice_id: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        action: String,
+    },
 }
 
 pub async fn run_permissions(
@@ -455,6 +517,101 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     Ok(())
 }
 
+pub async fn run_service(action: ServiceSubcommand) -> Result<()> {
+    match action {
+        ServiceSubcommand::Install { bin_dir } => service::install_services(bin_dir.as_deref()),
+        ServiceSubcommand::Uninstall => service::uninstall_services(),
+        ServiceSubcommand::Status => service::show_services_status(),
+    }
+}
+
+pub async fn run_dogfood(action: Option<DogfoodSubcommand>, json: bool) -> Result<()> {
+    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    match action {
+        Some(DogfoodSubcommand::Rate { notice_id, useful }) => {
+            tracker.record_rating(&notice_id, useful, chrono::Utc::now())?;
+            println!(
+                "✔ Notice '{}' rated as {}",
+                notice_id,
+                if useful { "Useful" } else { "Not Useful" }
+            );
+        }
+        Some(DogfoodSubcommand::Feedback {
+            notice_id,
+            topic,
+            action,
+        }) => {
+            let act = action.to_lowercase();
+            let useful = if act == "stop" {
+                Some(false)
+            } else {
+                Some(true)
+            };
+            tracker.record_feedback(&notice_id, &topic, &act, useful, chrono::Utc::now())?;
+            println!(
+                "✔ Recorded feedback '{}' for notice '{}' in topic '{}'",
+                action, notice_id, topic
+            );
+        }
+        Some(DogfoodSubcommand::Summary) | None => {
+            if json {
+                let metrics = tracker.compute_metrics();
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                print!("{}", tracker.format_report());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_stats(json: bool) -> Result<()> {
+    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    let metrics = tracker.compute_metrics();
+    let perms = check_all_permissions();
+    let helper_socket = Path::new("/tmp/grok-muse-helper.sock");
+
+    if json {
+        let val = serde_json::json!({
+            "permissions": {
+                "screen_recording": perms.screen_recording,
+                "accessibility": perms.accessibility,
+                "calendar": perms.calendar,
+                "reminders": perms.reminders,
+                "all_granted": perms.all_granted(),
+            },
+            "helper_connected": helper_socket.exists(),
+            "dogfood_metrics": metrics,
+        });
+        println!("{}", serde_json::to_string_pretty(&val)?);
+    } else {
+        run_status().await?;
+        print!("{}", tracker.format_report());
+    }
+    Ok(())
+}
+
+pub async fn run_review(date_str: Option<String>) -> Result<()> {
+    let now = chrono::Utc::now();
+    let date = date_str.unwrap_or_else(|| now.format("%Y-%m-%d").to_string());
+    println!(
+        "==> Running Grok-Muse Nightly Review synthesis for {}...",
+        date
+    );
+
+    let audit = AuditLogger::in_memory();
+    let memory = PersonalMemoryStore::in_memory()?;
+    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    let metrics = tracker.compute_metrics();
+
+    let platform = IpcPlatformClient::new("/tmp/grok-muse-helper.sock");
+    let review =
+        gm_goals::run_nightly_review(Some(&platform), &audit, &memory, Some(&metrics), now).await?;
+
+    println!("\n{}", review.review_markdown);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +670,53 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_service_commands() {
+        let res = run_service(ServiceSubcommand::Status).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dogfood_commands() {
+        // Summary
+        assert!(run_dogfood(None, false).await.is_ok());
+        assert!(run_dogfood(None, true).await.is_ok());
+        // Feedback and Rate
+        assert!(
+            run_dogfood(
+                Some(DogfoodSubcommand::Rate {
+                    notice_id: "test_n1".into(),
+                    useful: true,
+                }),
+                false
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            run_dogfood(
+                Some(DogfoodSubcommand::Feedback {
+                    notice_id: "test_n1".into(),
+                    topic: "calendar".into(),
+                    action: "done".into(),
+                }),
+                false
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_command() {
+        assert!(run_stats(false).await.is_ok());
+        assert!(run_stats(true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_review_command() {
+        assert!(run_review(Some("2026-11-03".into())).await.is_ok());
     }
 }

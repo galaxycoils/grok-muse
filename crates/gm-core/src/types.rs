@@ -325,3 +325,41 @@ pub struct NotificationPayload {
     pub subtitle: Option<String>,
     pub body: String,
 }
+
+/// Email message item retrieved from Mail client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailItem {
+    pub id: String,
+    pub sender: String,
+    pub subject: String,
+    pub snippet: String,
+    pub received_time_ms: u64,
+    pub is_read: bool,
+    pub is_flagged: bool,
+    pub is_urgent: bool,
+}
+
+impl MailItem {
+    pub fn is_urgent_heuristic(&self) -> bool {
+        if self.is_flagged || self.is_urgent {
+            return true;
+        }
+        let subj = self.subject.to_lowercase();
+        let body = self.snippet.to_lowercase();
+        let urgent_terms = [
+            "urgent",
+            "asap",
+            "emergency",
+            "action required",
+            "immediate attention",
+            "critical",
+            "deadline today",
+            "security alert",
+            "time-sensitive",
+            "alert:",
+        ];
+        urgent_terms
+            .iter()
+            .any(|&term| subj.contains(term) || body.contains(term))
+    }
+}

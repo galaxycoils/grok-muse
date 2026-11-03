@@ -4,7 +4,9 @@ use gm_core::error::{GmError, Result};
 use gm_core::ipc::{
     HelperRequest, HelperResponse, IpcMessage, read_ipc_message, write_ipc_message,
 };
-use gm_core::types::{AxSnapshot, ComputerAction, FrameCapture, PermissionStatus, UserActivity};
+use gm_core::types::{
+    AxSnapshot, ComputerAction, FrameCapture, MailItem, PermissionStatus, UserActivity,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,6 +174,15 @@ impl Platform for IpcPlatformClient {
             HelperResponse::Reminders(rems) => Ok(rems),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for get_reminders: {other:?}"
+            ))),
+        }
+    }
+
+    async fn get_unread_emails(&self) -> Result<Vec<MailItem>> {
+        match self.send_request(HelperRequest::GetUnreadEmails).await? {
+            HelperResponse::UnreadEmails(emails) => Ok(emails),
+            other => Err(GmError::Ipc(format!(
+                "Unexpected response for get_unread_emails: {other:?}"
             ))),
         }
     }

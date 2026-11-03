@@ -117,6 +117,10 @@ async fn handle_connection<P: Platform>(mut stream: UnixStream, platform: Arc<P>
                     Err(e) => HelperResponse::Error(e.to_string()),
                 }
             }
+            HelperRequest::GetUnreadEmails => match platform.get_unread_emails().await {
+                Ok(emails) => HelperResponse::UnreadEmails(emails),
+                Err(e) => HelperResponse::Error(e.to_string()),
+            },
             HelperRequest::SendNotification {
                 title,
                 subtitle,
