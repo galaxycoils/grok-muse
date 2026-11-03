@@ -12,6 +12,7 @@ members = [
     "crates/gm-daemon",
     "crates/gm-ui",
     "crates/gm-eval",
+    "crates/gm-vlm-candle",
     "xtask",
 ]
 exclude = ["target"]
@@ -32,6 +33,7 @@ gm-memory = { path = "crates/gm-memory" }
 gm-llm = { path = "crates/gm-llm" }
 gm-goals = { path = "crates/gm-goals" }
 gm-agent = { path = "crates/gm-agent" }
+gm-vlm-candle = { path = "crates/gm-vlm-candle" }
 
 # Darius path dependencies
 darius-core = { path = "../Darius/crates/darius-core" }

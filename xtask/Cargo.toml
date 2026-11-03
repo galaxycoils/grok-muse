@@ -19,5 +19,8 @@ gm-platform = { workspace = true }
 gm-llm = { workspace = true }
 gm-agent = { workspace = true }
 gm-safety = { workspace = true }
+gm-goals = { workspace = true }
+gm-vlm-candle = { workspace = true }
+chrono = { workspace = true }
 serde_json = { workspace = true }
 

@@ -5,3 +5,7 @@
 .env
 .env.*
 !.env.example
+dogfood_metrics.jsonl
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

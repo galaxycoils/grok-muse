@@ -1,0 +1,29 @@
+[package]
+name = "gm-vlm-candle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Grok-Muse Local Vision-Language Model Engine using Candle with Apple Silicon Metal acceleration and CPU fallback"
+
+[dependencies]
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+safetensors = "0.8"
+gm-core = { workspace = true }
+gm-llm = { workspace = true, features = ["local-vlm"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
