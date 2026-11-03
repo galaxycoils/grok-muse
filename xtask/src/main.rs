@@ -78,6 +78,21 @@ enum Commands {
         #[arg(long, default_value = "dogfood_metrics.jsonl")]
         output: String,
     },
+    /// Install GrokMuse.app and GrokMuseCUHelper.app into /Applications (or ~/Applications) with symlink creation
+    Install {
+        /// Target applications directory (defaults to /Applications or ~/Applications)
+        #[arg(long)]
+        dest_dir: Option<PathBuf>,
+        /// Target bin directory for CLI symlinks (defaults to /usr/local/bin or ~/.local/bin)
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Identity for code signing (defaults to detected or self-signed dev identity)
+        #[arg(long)]
+        identity: Option<String>,
+        /// Skip code signing prior to installation
+        #[arg(long)]
+        no_sign: bool,
+    },
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -179,6 +194,11 @@ fn detect_identity() -> String {
 }
 
 fn create_app_bundles() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.parent() {
+        let _ = std::env::set_current_dir(workspace_root);
+    }
+
     println!("==> Compiling Grok-Muse binaries for bundling...");
     let build_status = Command::new("cargo")
         .args([
@@ -189,6 +209,8 @@ fn create_app_bundles() -> Result<(), Box<dyn std::error::Error>> {
             "gm-daemon",
             "-p",
             "gm-ui",
+            "--bin",
+            "gm",
         ])
         .status()?;
     if !build_status.success() {
@@ -826,6 +848,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::SimulateDogfood { days, output } => {
             run_simulate_dogfood(days, &output)?;
+        }
+
+        Commands::Install {
+            dest_dir,
+            bin_dir,
+            identity,
+            no_sign,
+        } => {
+            run_install(dest_dir, bin_dir, identity, no_sign)?;
         }
     }
 
@@ -1673,8 +1704,163 @@ async fn run_test_all(identity: Option<String>) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn run_install(
+    dest_dir: Option<PathBuf>,
+    bin_dir: Option<PathBuf>,
+    identity: Option<String>,
+    no_sign: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.parent() {
+        let _ = std::env::set_current_dir(workspace_root);
+    }
+
+    println!("\n===============================================================================");
+    println!("  Grok-Muse System Installation (xtask install)");
+    println!("===============================================================================\n");
+
+    // 1. Compile & assemble app bundles
+    create_app_bundles()?;
+
+    // 2. Code sign bundles unless explicitly skipped
+    if !no_sign {
+        let id = identity.unwrap_or_else(detect_identity);
+        println!("==> Signing app bundles with identity '{id}'...");
+        sign_bundle(
+            "target/bundle/GrokMuseCUHelper.app",
+            &id,
+            Some("entitlements.plist"),
+        )?;
+        sign_bundle(
+            "target/bundle/GrokMuse.app",
+            &id,
+            Some("entitlements.plist"),
+        )?;
+    } else {
+        println!("  [Install] Skipping code signing as requested by --no-sign flag");
+    }
+
+    // 3. Determine target application installation directory
+    let target_app_dir = if let Some(dir) = dest_dir {
+        dir
+    } else {
+        // Probe /Applications write access
+        let probe = Path::new("/Applications/.gm_probe");
+        if fs::write(probe, b"probe").is_ok() {
+            let _ = fs::remove_file(probe);
+            PathBuf::from("/Applications")
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join("Applications")
+        }
+    };
+
+    println!("==> Target application directory: {:?}", target_app_dir);
+    fs::create_dir_all(&target_app_dir)?;
+
+    // 4. Install GrokMuse.app and GrokMuseCUHelper.app
+    for app_name in ["GrokMuse.app", "GrokMuseCUHelper.app"] {
+        let src = Path::new("target/bundle").join(app_name);
+        let dest = target_app_dir.join(app_name);
+
+        println!("  Installing {} -> {:?}...", app_name, dest);
+        if dest.exists() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+
+        let cp_status = Command::new("cp")
+            .args([
+                "-R",
+                src.to_str().unwrap(),
+                target_app_dir.to_str().unwrap(),
+            ])
+            .status()?;
+        if !cp_status.success() {
+            return Err(format!("Failed to copy {app_name} to {:?}", target_app_dir).into());
+        }
+
+        // Verify codesign of installed app
+        if !no_sign {
+            let _ = Command::new("codesign")
+                .args(["--verify", "--deep", "--strict", dest.to_str().unwrap()])
+                .status();
+        }
+    }
+
+    // 5. Create CLI symlinks
+    let target_bin_dir = if let Some(dir) = bin_dir {
+        dir
+    } else {
+        let probe = Path::new("/usr/local/bin/.gm_probe");
+        if fs::write(probe, b"probe").is_ok() {
+            let _ = fs::remove_file(probe);
+            PathBuf::from("/usr/local/bin")
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".local/bin")
+        }
+    };
+
+    println!("==> Target CLI binary directory: {:?}", target_bin_dir);
+    fs::create_dir_all(&target_bin_dir)?;
+
+    let symlinks = [
+        ("gm", target_app_dir.join("GrokMuse.app/Contents/MacOS/gm")),
+        (
+            "gm-daemon",
+            target_app_dir.join("GrokMuse.app/Contents/MacOS/gm-daemon"),
+        ),
+        (
+            "gm-cu-helper",
+            target_app_dir.join("GrokMuseCUHelper.app/Contents/MacOS/gm-cu-helper"),
+        ),
+    ];
+
+    for (link_name, target_file) in symlinks {
+        let link_path = target_bin_dir.join(link_name);
+        if link_path.exists() || fs::symlink_metadata(&link_path).is_ok() {
+            let _ = fs::remove_file(&link_path);
+        }
+
+        println!("  Symlinking {:?} -> {:?}", link_path, target_file);
+        let ln_status = Command::new("ln")
+            .args([
+                "-sf",
+                target_file.to_str().unwrap(),
+                link_path.to_str().unwrap(),
+            ])
+            .status()?;
+        if !ln_status.success() {
+            eprintln!("  Warning: failed to create symlink at {:?}", link_path);
+        }
+    }
+
+    println!("\n╔═════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                   GROK-MUSE INSTALLATION COMPLETE                           ║");
+    println!("╚═════════════════════════════════════════════════════════════════════════════╝");
+    println!("  Applications installed to:");
+    println!("    • {}/GrokMuse.app", target_app_dir.display());
+    println!("    • {}/GrokMuseCUHelper.app", target_app_dir.display());
+    println!("  CLI symlinks created in:");
+    println!("    • {}/gm", target_bin_dir.display());
+    println!("    • {}/gm-daemon", target_bin_dir.display());
+    println!("    • {}/gm-cu-helper", target_bin_dir.display());
+    println!();
+    println!("  Next Steps:");
+    println!("    1. Check and grant required macOS system permissions:");
+    println!("       gm permissions --open-missing");
+    println!("    2. Register LaunchAgent background services:");
+    println!("       gm service install");
+    println!("    3. Launch the desktop tray application:");
+    println!("       open \"{}/GrokMuse.app\"", target_app_dir.display());
+    println!("═══════════════════════════════════════════════════════════════════════════════\n");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1736,5 +1922,49 @@ mod tests {
         assert!(path.exists());
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(temp_data);
+    }
+
+    #[test]
+    fn test_install_command_execution() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Some(workspace_root) = manifest_dir.parent() {
+            let _ = std::env::set_current_dir(workspace_root);
+        }
+
+        let temp_dir = std::env::temp_dir();
+        let test_apps = temp_dir.join("test_gm_install_apps");
+
+        let test_bin = temp_dir.join("test_gm_install_bin");
+        let _ = fs::create_dir_all(&test_apps);
+        let _ = fs::create_dir_all(&test_bin);
+
+        let res = run_install(
+            Some(test_apps.clone()),
+            Some(test_bin.clone()),
+            None,
+            true, // no_sign for fast offline test
+        );
+        assert!(res.is_ok(), "run_install failed: {:?}", res.err());
+
+        assert!(test_apps.join("GrokMuse.app/Contents/MacOS/gm-ui").exists());
+        assert!(
+            test_apps
+                .join("GrokMuse.app/Contents/MacOS/gm-daemon")
+                .exists()
+        );
+        assert!(test_apps.join("GrokMuse.app/Contents/MacOS/gm").exists());
+        assert!(
+            test_apps
+                .join("GrokMuseCUHelper.app/Contents/MacOS/gm-cu-helper")
+                .exists()
+        );
+
+        // Verify symlinks created
+        assert!(test_bin.join("gm").exists());
+        assert!(test_bin.join("gm-daemon").exists());
+        assert!(test_bin.join("gm-cu-helper").exists());
+
+        let _ = fs::remove_dir_all(test_apps);
+        let _ = fs::remove_dir_all(test_bin);
     }
 }

@@ -1227,6 +1227,7 @@ dependencies = [
  "gm-platform",
  "gm-safety",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

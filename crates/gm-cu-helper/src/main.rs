@@ -45,9 +45,25 @@ async fn main() -> Result<()> {
         server.run(socket_path).await?;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        info!("Instantiating MockPlatform on non-macOS target");
+        info!("Instantiating native LinuxPlatform (AT-SPI + X11/Wayland)");
+        let platform = gm_platform::LinuxPlatform::new()?;
+        let server = HelperServer::new(platform);
+        server.run(socket_path).await?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        info!("Instantiating native WindowsPlatform (UI Automation + DXGI/WGC)");
+        let platform = gm_platform::WindowsPlatform::new()?;
+        let server = HelperServer::new(platform);
+        server.run(socket_path).await?;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        info!("Instantiating MockPlatform on unknown target");
         let platform = MockPlatform::new();
         let server = HelperServer::new(platform);
         server.run(socket_path).await?;

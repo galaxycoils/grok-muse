@@ -1,6 +1,6 @@
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
         println!("cargo:rerun-if-changed=src/mac_screen.m");
         cc::Build::new()
             .file("src/mac_screen.m")

@@ -5,8 +5,12 @@ use gm_core::ipc::{
 use gm_platform::Platform;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
-use tracing::{error, info, warn};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(unix)]
+use tracing::error;
+use tracing::{info, warn};
 
 pub struct HelperServer<P: Platform + 'static> {
     platform: Arc<P>,
@@ -28,31 +32,67 @@ impl<P: Platform + 'static> HelperServer<P> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let listener = UnixListener::bind(path)?;
-        info!("Helper server listening on {:?}", path);
+        #[cfg(unix)]
+        {
+            let listener = UnixListener::bind(path)?;
+            info!("Helper server listening on {:?}", path);
 
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let platform = Arc::clone(&self.platform);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, platform).await {
-                            warn!("Connection error: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Listener error: {e}");
-                    break;
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        let platform = Arc::clone(&self.platform);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, platform).await {
+                                warn!("Connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Listener error: {e}");
+                        break;
+                    }
                 }
             }
         }
 
+        #[cfg(windows)]
+        {
+            let pipe_name = path.to_string_lossy();
+            info!("Helper server listening on named pipe {}", pipe_name);
+
+            loop {
+                let server = tokio::net::windows::named_pipe::ServerOptions::new()
+                    .create(path.as_os_str())
+                    .map_err(|e| {
+                        gm_core::error::GmError::Platform(format!(
+                            "Failed to create named pipe {pipe_name}: {e}"
+                        ))
+                    })?;
+
+                server.connect().await.map_err(|e| {
+                    gm_core::error::GmError::Platform(format!(
+                        "Failed to connect client to named pipe: {e}"
+                    ))
+                })?;
+
+                let platform = Arc::clone(&self.platform);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(server, platform).await {
+                        warn!("Connection error: {e}");
+                    }
+                });
+            }
+        }
+
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
 
-async fn handle_connection<P: Platform>(mut stream: UnixStream, platform: Arc<P>) -> Result<()> {
+async fn handle_connection<P: Platform, S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    platform: Arc<P>,
+) -> Result<()> {
     loop {
         let request: IpcMessage<HelperRequest> = match read_ipc_message(&mut stream).await {
             Ok(msg) => msg,

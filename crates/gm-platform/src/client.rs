@@ -10,12 +10,16 @@ use gm_core::types::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::net::UnixStream;
+#[cfg(unix)]
+use tokio::net::UnixStream as IpcStream;
+
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient as IpcStream;
 
 pub struct IpcPlatformClient {
     socket_path: PathBuf,
     req_counter: AtomicU64,
-    stream: Arc<tokio::sync::Mutex<Option<UnixStream>>>,
+    stream: Arc<tokio::sync::Mutex<Option<IpcStream>>>,
 }
 
 impl IpcPlatformClient {
@@ -30,12 +34,26 @@ impl IpcPlatformClient {
     async fn send_request(&self, req_body: HelperRequest) -> Result<HelperResponse> {
         let mut guard = self.stream.lock().await;
         if guard.is_none() {
-            let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-                GmError::Platform(format!(
-                    "Failed to connect to cu-helper socket {:?}: {e}",
-                    self.socket_path
-                ))
-            })?;
+            #[cfg(unix)]
+            let stream = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|e| {
+                    GmError::Platform(format!(
+                        "Failed to connect to cu-helper socket {:?}: {e}",
+                        self.socket_path
+                    ))
+                })?;
+
+            #[cfg(windows)]
+            let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&self.socket_path)
+                .map_err(|e| {
+                    GmError::Platform(format!(
+                        "Failed to connect to cu-helper named pipe {:?}: {e}",
+                        self.socket_path
+                    ))
+                })?;
+
             *guard = Some(stream);
         }
 

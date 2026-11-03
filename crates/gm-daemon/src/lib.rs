@@ -17,7 +17,10 @@ use std::sync::Arc;
 use tracing::info;
 
 pub mod service;
+pub mod updater;
+
 pub use service::*;
+pub use updater::*;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -131,6 +134,24 @@ pub enum Commands {
         /// Optional initial system prompt override
         #[arg(long)]
         system: Option<String>,
+    },
+    /// Check for updates or download newer release DMG with checksum verification (Action A11)
+    Update {
+        /// Check only for updates without downloading
+        #[arg(long)]
+        check: bool,
+        /// Force download even if current version is up to date
+        #[arg(long)]
+        force: bool,
+        /// Target GitHub repository (default: grok-muse/grok-muse)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Output update status as JSON
+        #[arg(long)]
+        json: bool,
+        /// Custom download destination directory
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -1389,5 +1410,38 @@ mod tests {
         assert!(out_str.contains("[1] user:"));
         assert!(out_str.contains("[2] assistant:"));
         assert!(out_str.contains("Exiting Grok-Muse chat. Goodbye!"));
+    }
+
+    #[tokio::test]
+    async fn test_update_command_error_and_guidance() {
+        // Test update command with invalid repo returns appropriate error
+        let res = run_update(
+            true,
+            false,
+            Some("invalid-org/nonexistent-repo-999".into()),
+            true,
+            None,
+        )
+        .await;
+        assert!(res.is_err());
+
+        // Test installation guidance formatting does not panic
+        let dummy_dmg = std::path::Path::new("/tmp/test/Grok-Muse.dmg");
+        let result = UpdateCheckResult {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            release_tag: "v0.2.0".into(),
+            release_name: Some("v0.2.0".into()),
+            release_url: "https://github.com/grok-muse/grok-muse/releases/tag/v0.2.0".into(),
+            dmg_asset_name: Some("Grok-Muse.dmg".into()),
+            dmg_download_url: Some("https://example.com/Grok-Muse.dmg".into()),
+            dmg_size_bytes: Some(1024),
+            checksum_download_url: None,
+            expected_sha256: None,
+            published_at: None,
+            release_notes: Some("Release notes".into()),
+        };
+        print_installation_guidance(dummy_dmg, &result);
     }
 }

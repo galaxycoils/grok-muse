@@ -3,7 +3,7 @@ use gm_core::error::Result;
 use gm_daemon::{
     Cli, Commands, run_audit, run_chat, run_daemon, run_do, run_dogfood, run_feed, run_ideas,
     run_kill, run_onboard, run_permissions, run_review, run_service, run_stats, run_status,
-    run_upkeep,
+    run_update, run_upkeep,
 };
 
 #[tokio::main]
@@ -32,6 +32,13 @@ async fn main() -> Result<()> {
         Some(Commands::Upkeep { stale_days, json }) => run_upkeep(stale_days, json).await,
         Some(Commands::Feed { limit, json }) => run_feed(limit, json).await,
         Some(Commands::Ideas { json }) => run_ideas(json).await,
+        Some(Commands::Update {
+            check,
+            force,
+            repo,
+            json,
+            dir,
+        }) => run_update(check, force, repo, json, dir).await,
         None => {
             // Default behavior when invoked as gm-daemon: run daemon or one-shot task
             run_daemon(cli.config, cli.task).await

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use gm_core::error::Result;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use tracing::info;
 
@@ -59,6 +60,7 @@ enum Commands {
     Kill,
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn hotkey_callback(hotkey_id: std::os::raw::c_int) {
     if hotkey_id == 1 {
         info!("Hotkey fired: Summon (Cmd+Shift+Space)");
@@ -69,6 +71,7 @@ extern "C" fn hotkey_callback(hotkey_id: std::os::raw::c_int) {
     }
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn task_submitted_callback(text_ptr: *const std::os::raw::c_char) {
     if !text_ptr.is_null() {
         let task_str = unsafe { std::ffi::CStr::from_ptr(text_ptr) }.to_string_lossy();
@@ -77,6 +80,7 @@ extern "C" fn task_submitted_callback(text_ptr: *const std::os::raw::c_char) {
     }
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn pause_toggled_callback(is_paused: std::os::raw::c_int) {
     info!("Agent coexistence pause changed: is_paused={is_paused}");
     println!(
@@ -179,6 +183,10 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| CString::new("Inspecting target window...").unwrap());
                 gm_mac_ui_set_overlay_state(state_code, std::ptr::null(), c_detail.as_ptr());
                 gm_mac_ui_show_overlay(1);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&state, &detail);
             }
             println!("Visual action overlay displayed. Press Ctrl+C or dismiss to exit.");
         }
