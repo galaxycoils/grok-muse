@@ -8,8 +8,8 @@ use gm_llm::{
     XAI_KEY_ACCOUNT,
 };
 use gm_memory::PersonalMemoryStore;
-use gm_platform::IpcPlatformClient;
 use gm_platform::permissions::{PrivacyPane, check_all_permissions};
+use gm_platform::{IpcPlatformClient, Platform};
 use gm_safety::{AuditLogger, BlocklistManager, KillSwitch};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,17 +74,11 @@ pub async fn run_permissions(
     let status = check_all_permissions();
 
     if let Some(ref pane_str) = open_pane {
-        let pane = match pane_str.to_lowercase().as_str() {
-            "screen" | "screencapture" | "screenrecording" => PrivacyPane::ScreenRecording,
-            "ax" | "accessibility" => PrivacyPane::Accessibility,
-            "cal" | "calendar" | "calendars" => PrivacyPane::Calendars,
-            "rem" | "reminder" | "reminders" => PrivacyPane::Reminders,
-            other => {
-                return Err(GmError::Config(format!(
-                    "Unknown privacy pane '{other}'. Valid options: screen, accessibility, calendar, reminders"
-                )));
-            }
-        };
+        let pane = PrivacyPane::parse(pane_str).ok_or_else(|| {
+            GmError::Config(format!(
+                "Unknown privacy pane '{pane_str}'. Valid options: screen, accessibility, calendar, reminders, or Privacy_<Name>"
+            ))
+        })?;
         println!("Opening System Settings for {}...", pane.title());
         let opened = pane.open();
         if opened {
@@ -362,6 +356,26 @@ pub async fn run_status() -> Result<()> {
     Ok(())
 }
 
+pub async fn run_kill() -> Result<()> {
+    println!("🚨 Grok-Muse Emergency Kill Switch Triggered");
+    let helper_socket = Path::new("/tmp/grok-muse-helper.sock");
+    if helper_socket.exists() {
+        println!(
+            "Connecting to CU Helper socket ({:?}) to drop active actions...",
+            helper_socket
+        );
+        let platform = IpcPlatformClient::new("/tmp/grok-muse-helper.sock");
+        match platform.cancel().await {
+            Ok(()) => println!("✔ CU Helper confirmed: active actions cancelled and dropped."),
+            Err(e) => eprintln!("⚠ Notice: Could not send cancel over socket: {e}"),
+        }
+    } else {
+        println!("○ CU Helper socket is not active (no background actions queued).");
+    }
+    println!("Emergency stop completed.");
+    Ok(())
+}
+
 pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> Result<()> {
     let config = if let Some(p) = config_path {
         if let Ok(content) = std::fs::read_to_string(&p) {
@@ -467,5 +481,37 @@ mod tests {
     async fn test_status_command() {
         let res = run_status().await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_kill_command() {
+        let res = run_kill().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_permissions_open_pane_validation() {
+        // Valid panes
+        assert!(
+            run_permissions(false, Some("Privacy_Calendars".into()), false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            run_permissions(false, Some("screen".into()), false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            run_permissions(false, Some("ax".into()), false)
+                .await
+                .is_ok()
+        );
+        // Invalid pane returns error
+        assert!(
+            run_permissions(false, Some("nonexistent_pane".into()), false)
+                .await
+                .is_err()
+        );
     }
 }

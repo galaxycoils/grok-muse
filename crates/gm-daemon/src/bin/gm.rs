@@ -1,6 +1,8 @@
 use clap::Parser;
 use gm_core::error::Result;
-use gm_daemon::{Cli, Commands, run_daemon, run_do, run_onboard, run_permissions, run_status};
+use gm_daemon::{
+    Cli, Commands, run_daemon, run_do, run_kill, run_onboard, run_permissions, run_status,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,7 +30,7 @@ async fn main() -> Result<()> {
             run_status().await?;
         }
         Some(Commands::Kill) => {
-            println!("Emergency kill switch triggered.");
+            run_kill().await?;
         }
         None => {
             if let Some(task) = cli.task {

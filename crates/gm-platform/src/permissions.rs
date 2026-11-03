@@ -28,6 +28,22 @@ impl PrivacyPane {
         }
     }
 
+    /// Parse a pane name or identifier from string.
+    pub fn parse(input: &str) -> Option<Self> {
+        let clean = input.trim().to_lowercase();
+        match clean.as_str() {
+            "screen"
+            | "screencapture"
+            | "screenrecording"
+            | "privacy_screencapture"
+            | "privacy_screenrecording" => Some(Self::ScreenRecording),
+            "ax" | "accessibility" | "privacy_accessibility" => Some(Self::Accessibility),
+            "cal" | "calendar" | "calendars" | "privacy_calendars" => Some(Self::Calendars),
+            "rem" | "reminder" | "reminders" | "privacy_reminders" => Some(Self::Reminders),
+            _ => None,
+        }
+    }
+
     /// Full deep-link URL to open macOS System Settings directly to this pane.
     pub fn url(&self) -> &'static str {
         match self {
@@ -150,6 +166,37 @@ mod tests {
             assert!(!pane.title().is_empty());
             assert!(!pane.description().is_empty());
         }
+    }
+
+    #[test]
+    fn test_privacy_pane_parse() {
+        assert_eq!(
+            PrivacyPane::parse("Privacy_ScreenCapture"),
+            Some(PrivacyPane::ScreenRecording)
+        );
+        assert_eq!(
+            PrivacyPane::parse("Privacy_Accessibility"),
+            Some(PrivacyPane::Accessibility)
+        );
+        assert_eq!(
+            PrivacyPane::parse("Privacy_Calendars"),
+            Some(PrivacyPane::Calendars)
+        );
+        assert_eq!(
+            PrivacyPane::parse("Privacy_Reminders"),
+            Some(PrivacyPane::Reminders)
+        );
+        assert_eq!(
+            PrivacyPane::parse("screen"),
+            Some(PrivacyPane::ScreenRecording)
+        );
+        assert_eq!(PrivacyPane::parse("ax"), Some(PrivacyPane::Accessibility));
+        assert_eq!(PrivacyPane::parse("cal"), Some(PrivacyPane::Calendars));
+        assert_eq!(
+            PrivacyPane::parse("reminders"),
+            Some(PrivacyPane::Reminders)
+        );
+        assert_eq!(PrivacyPane::parse("unknown_pane"), None);
     }
 
     #[test]

@@ -151,7 +151,9 @@ int gm_mac_open_system_settings_pane(const char *pane_name) {
     @autoreleasepool {
         if (!pane_name) return -1;
         NSString *pane = [NSString stringWithUTF8String:pane_name];
-        NSString *urlStr = [NSString stringWithFormat:@"x-apple.systempreferences:com.apple.preference.security?%@", pane];
+        NSString *urlStr = [pane hasPrefix:@"x-apple.systempreferences:"]
+            ? pane
+            : [NSString stringWithFormat:@"x-apple.systempreferences:com.apple.preference.security?%@", pane];
         NSURL *url = [NSURL URLWithString:urlStr];
         if (!url) return -1;
         BOOL ok = [[NSWorkspace sharedWorkspace] openURL:url];

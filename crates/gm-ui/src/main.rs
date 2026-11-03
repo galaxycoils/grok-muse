@@ -19,6 +19,8 @@ unsafe extern "C" {
     fn gm_mac_ui_show_onboarding() -> std::os::raw::c_int;
     fn gm_mac_ui_refresh_onboarding_permissions();
     fn gm_mac_ui_init_global_hotkeys() -> std::os::raw::c_int;
+    fn gm_mac_ui_run_app();
+    fn gm_mac_ui_stop_app();
     fn gm_mac_ui_set_callbacks(
         hotkey_cb: extern "C" fn(std::os::raw::c_int),
         task_cb: extern "C" fn(*const std::os::raw::c_char),
@@ -87,8 +89,32 @@ extern "C" fn pause_toggled_callback(is_paused: std::os::raw::c_int) {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let cmd = cli.command.unwrap_or(Commands::Tray);
 
-    match cli.command.unwrap_or(Commands::Tray) {
+    if matches!(cmd, Commands::Kill) {
+        info!("Emergency kill switch activated from CLI");
+        #[cfg(target_os = "macos")]
+        unsafe {
+            gm_mac_ui_set_overlay_state(
+                3,
+                CString::new("🛑 Grok-Muse: Stopped").unwrap().as_ptr(),
+                CString::new("CLI Kill Signal").unwrap().as_ptr(),
+            );
+        }
+        println!("Emergency kill signal dispatched.");
+        return Ok(());
+    }
+
+    // Spawn background task to stop AppKit event loop on Ctrl+C signal
+    tokio::spawn(async {
+        tokio::signal::ctrl_c().await.ok();
+        #[cfg(target_os = "macos")]
+        unsafe {
+            gm_mac_ui_stop_app();
+        }
+    });
+
+    match cmd {
         Commands::Tray => {
             info!("Launching Grok-Muse tray desktop shell");
             #[cfg(target_os = "macos")]
@@ -107,7 +133,6 @@ async fn main() -> Result<()> {
             println!("  • Instant Summon: Cmd+Shift+Space");
             println!("  • Emergency Kill Switch: Cmd+Alt+Escape");
             println!("  • Tray menu: Summon, Pause/Resume, Run Task, Permissions, Quit");
-            tokio::signal::ctrl_c().await.ok();
         }
         Commands::Chat => {
             info!("Opening floating chat interface");
@@ -125,7 +150,6 @@ async fn main() -> Result<()> {
                 gm_mac_ui_show_chat_window();
             }
             println!("Grok-Muse chat interface initialized.");
-            tokio::signal::ctrl_c().await.ok();
         }
         Commands::Onboard => {
             info!("Opening Onboarding & Permissions dialog");
@@ -137,7 +161,6 @@ async fn main() -> Result<()> {
                 }
             }
             println!("Grok-Muse permissions & onboarding dialog active.");
-            tokio::signal::ctrl_c().await.ok();
         }
         Commands::Overlay { state, detail } => {
             info!("Initializing floating visual action overlay (state={state})");
@@ -157,22 +180,17 @@ async fn main() -> Result<()> {
                 gm_mac_ui_set_overlay_state(state_code, std::ptr::null(), c_detail.as_ptr());
                 gm_mac_ui_show_overlay(1);
             }
-            println!("Visual action overlay displayed. Press Ctrl+C to dismiss.");
-            tokio::signal::ctrl_c().await.ok();
+            println!("Visual action overlay displayed. Press Ctrl+C or dismiss to exit.");
         }
-        Commands::Kill => {
-            info!("Emergency kill switch activated from CLI");
-            #[cfg(target_os = "macos")]
-            unsafe {
-                gm_mac_ui_set_overlay_state(
-                    3,
-                    CString::new("🛑 Grok-Muse: Stopped").unwrap().as_ptr(),
-                    CString::new("CLI Kill Signal").unwrap().as_ptr(),
-                );
-            }
-            println!("Kill signal dispatched to daemon.");
-        }
+        Commands::Kill => unreachable!(),
     }
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        gm_mac_ui_run_app();
+    }
+    #[cfg(not(target_os = "macos"))]
+    tokio::signal::ctrl_c().await.ok();
 
     Ok(())
 }

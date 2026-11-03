@@ -42,8 +42,10 @@ int gm_mac_ui_show_chat_window(void);
 int gm_mac_ui_show_onboarding(void);
 void gm_mac_ui_refresh_onboarding_permissions(void);
 void gm_mac_ui_set_overlay_state(int state, const char *status_text, const char *detail_text);
+void gm_mac_ui_stop_app(void);
+void gm_mac_ui_run_app(void);
 
-@interface GmUiController : NSObject
+@interface GmUiController : NSObject <NSWindowDelegate>
 - (void)onSummon:(id)sender;
 - (void)onTogglePause:(id)sender;
 - (void)onRunTask:(id)sender;
@@ -56,6 +58,8 @@ void gm_mac_ui_set_overlay_state(int state, const char *status_text, const char 
 - (void)onRefreshPermissions:(id)sender;
 - (void)onCloseOnboarding:(id)sender;
 - (void)onSendChat:(id)sender;
+- (void)terminate:(id)sender;
+- (void)windowWillClose:(NSNotification *)notification;
 - (void)openSettingsPane:(NSString *)pane;
 @end
 
@@ -162,6 +166,21 @@ static GmUiController *g_ui_controller = nil;
     if (g_onboarding_window) {
         [g_onboarding_window orderOut:nil];
     }
+    if (!g_status_item) {
+        gm_mac_ui_stop_app();
+    }
+}
+
+- (void)terminate:(id)sender {
+    (void)sender;
+    [NSApp terminate:nil];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    (void)notification;
+    if (!g_status_item) {
+        gm_mac_ui_stop_app();
+    }
 }
 
 - (void)onSendChat:(id)sender {
@@ -209,6 +228,9 @@ static OSStatus GmCarbonUiHotkeyHandler(EventHandlerCallRef nextHandler, EventRe
 }
 
 int gm_mac_ui_init_global_hotkeys(void) {
+    if (!g_ui_controller) {
+        g_ui_controller = [[GmUiController alloc] init];
+    }
     if (g_carbon_ui_handler) return 0;
     
     EventTypeSpec eventType;
@@ -227,7 +249,7 @@ int gm_mac_ui_init_global_hotkeys(void) {
     EventHotKeyID killID = { 'GMUI', 2 };
     RegisterEventHotKey(53, cmdKey | optionKey, killID, GetApplicationEventTarget(), 0, &g_ui_kill_hotkey);
     
-    // Also install Cocoa global monitor for redundancy
+    // Also install Cocoa global monitor for redundancy when backgrounded
     [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^(NSEvent *event) {
         NSUInteger flags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
         if (event.keyCode == 49 && (flags == (NSEventModifierFlagCommand | NSEventModifierFlagShift))) {
@@ -240,6 +262,23 @@ int gm_mac_ui_init_global_hotkeys(void) {
             });
         }
     }];
+
+    // Also install Cocoa local monitor when app has focus
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
+        NSUInteger flags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+        if (event.keyCode == 49 && (flags == (NSEventModifierFlagCommand | NSEventModifierFlagShift))) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [g_ui_controller onSummon:nil];
+            });
+            return nil;
+        } else if (event.keyCode == 53 && (flags == (NSEventModifierFlagCommand | NSEventModifierFlagOption))) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [g_ui_controller onEmergencyKill:nil];
+            });
+            return nil;
+        }
+        return event;
+    }];
     
     return 0;
 }
@@ -249,6 +288,9 @@ int gm_mac_ui_init_action_overlay(void) {
         if (g_overlay_panel) return 0;
         
         NSRect screenRect = [[NSScreen mainScreen] frame];
+        if (screenRect.size.width <= 0 || screenRect.size.height <= 0) {
+            screenRect = NSMakeRect(0, 0, 1440, 900);
+        }
         CGFloat width = 290.0;
         CGFloat height = 56.0;
         CGFloat x = screenRect.origin.x + screenRect.size.width - width - 20.0;
@@ -406,6 +448,7 @@ int gm_mac_ui_show_onboarding(void) {
                                                             backing:NSBackingStoreBuffered
                                                               defer:NO];
         if (!g_onboarding_window) return -1;
+        [g_onboarding_window setDelegate:g_ui_controller];
         
         [g_onboarding_window setTitle:@"Grok-Muse Permissions & Setup"];
         [g_onboarding_window center];
@@ -529,6 +572,7 @@ int gm_mac_ui_init_chat_window(void) {
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
         if (!g_chat_window) return -1;
+        [g_chat_window setDelegate:g_ui_controller];
         
         [g_chat_window setTitle:@"Grok-Muse Assistant"];
         [g_chat_window center];
@@ -671,4 +715,27 @@ void gm_mac_ui_set_callbacks(GmHotkeyCallback hotkey_cb, GmTaskSubmittedCallback
     g_hotkey_callback = hotkey_cb;
     g_task_callback = task_cb;
     g_pause_callback = pause_cb;
+}
+
+void gm_mac_ui_run_app(void) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp run];
+    }
+}
+
+void gm_mac_ui_stop_app(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp stop:nil];
+        NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                            location:NSMakePoint(0, 0)
+                                       modifierFlags:0
+                                           timestamp:0
+                                        windowNumber:0
+                                             context:nil
+                                             subtype:0
+                                               data1:0
+                                               data2:0];
+        [NSApp postEvent:event atStart:YES];
+    });
 }
