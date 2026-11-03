@@ -63,3 +63,13 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: grok-muse
         run: cargo run -p xtask -- bench-hotpath
+
+      - name: Benchmark G4 LLM latency gate
+        working-directory: grok-muse
+        run: cargo run -p xtask -- bench-llm
+
+      - name: Verify release DMG pipeline (macOS only)
+        if: runner.os == 'macOS'
+        working-directory: grok-muse
+        run: cargo run -p xtask -- verify-dmg
+

@@ -2681,9 +2681,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "gm-agent",
  "gm-core",
  "gm-eval",
+ "gm-llm",
  "gm-platform",
+ "gm-safety",
  "serde_json",
  "tokio",
  "tracing",

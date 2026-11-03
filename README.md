@@ -76,15 +76,16 @@
 - **[`crates/gm-core`](crates/gm-core)**: Shared domain types (`AxSnapshot`, `ComputerAction`, `MailItem`, `CalendarItem`), IPC protocol, config schemas.
 - **[`crates/gm-platform`](crates/gm-platform)**: `Platform` trait (`capture`, `ax_snapshot`, `act`, `windows`, `user_idle`, `permissions`), native `MacPlatform`, and offline `MockPlatform`.
 - **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Privileged macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
-- **[`crates/gm-llm`](crates/gm-llm)**: OpenAI-compatible wire client, provider router (Meta Muse + xAI Grok), budget governor, Keychain secret integration.
+- **[`crates/gm-llm`](crates/gm-llm)**: OpenAI-compatible wire client, provider router (Meta Muse + xAI Grok), budget governor, Keychain secret integration, and pluggable `LocalVlmBackend` interface with `local-vlm` feature flag (Action A12 prep, Candle/MLX ready).
 - **[`crates/gm-safety`](crates/gm-safety)**: Approval tier classifier, emergency kill switch, secure text field redaction, blocklist manager, append-only `AuditLogger`, weekly/monthly report synthesis.
 - **[`crates/gm-memory`](crates/gm-memory)**: SQLite FTS memory store, deduplication, knowledge clustering, and stale observation pruning.
 - **[`crates/gm-goals`](crates/gm-goals)**: Goal state machine, proactive scheduler, quiet gate, calendar/mail patrol, nightly review, feed stream, and ideas generator.
 - **[`crates/gm-agent`](crates/gm-agent)**: Autonomous computer-use loop, verify-after-act diffing, user-coexistence detection, trajectory recorder.
-- **[`crates/gm-daemon`](crates/gm-daemon)**: Unprivileged background daemon and primary CLI library.
+- **[`crates/gm-daemon`](crates/gm-daemon)**: Unprivileged background daemon, primary CLI, and interactive terminal REPL (`gm chat`).
 - **[`crates/gm-ui`](crates/gm-ui)**: AppKit desktop shell (tray, floating windows, action overlay, global hotkeys).
 - **[`crates/gm-eval`](crates/gm-eval)**: 25-task macOS evaluation runner and deterministic offline replay fixtures.
-- **[`xtask`](xtask)**: Release packaging (`.dmg`), hardened runtime signing, and automated benchmark gates.
+- **[`xtask`](xtask)**: Release packaging (`.dmg`), automated DMG verification (`verify-dmg`), hardened runtime signing, and automated benchmark gates (`bench-hotpath`, `bench-rss`, `bench-llm`).
+
 
 ---
 
@@ -192,6 +193,8 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 | `gm upkeep` | `[--stale-days <N>] [--json]` | Run memory upkeep (deduplicate facts, cluster topics, expire stale observations). |
 | `gm feed` | `[--limit <N>] [--json]` | Terminal timeline stream of recent observations, patrol insights, and tasks. |
 | `gm ideas` | `[--json]` | Proactive recommendations from calendar gaps, unread threads, and memory. |
+| `gm chat` | `[--system "<prompt>"]` | Interactive terminal REPL for conversation, memory retrieval, status, and inline tasks. |
+
 
 ---
 
@@ -259,9 +262,52 @@ cargo run --package xtask -- bench-hotpath
 # 2. Benchmark G2 idle RSS footprint (< 50MB idle tree)
 cargo run --package xtask -- bench-rss
 
-# 3. Run G5 25-task evaluation suite (Finder, Safari, Notes, Mail, Settings, Electron, Canvas)
+# 3. Benchmark G4 LLM latency gate (< 1.5s median, < 4.0s p95) measuring TTFT & tokens/sec
+cargo run --package xtask -- bench-llm
+
+# 4. Verify release DMG bundle integrity, codesign, and /Applications symlink
+cargo run --package xtask -- verify-dmg
+
+# 5. Run G5 25-task evaluation suite (Finder, Safari, Notes, Mail, Settings, Electron, Canvas)
 cargo run --package xtask -- eval
 ```
+
+---
+
+## Interactive Terminal REPL (`gm chat`)
+
+Direct conversational interaction with Grok-Muse supporting SQLite personal memory retrieval, live status inspection, and inline computer-use task dispatch:
+
+```bash
+# Start interactive REPL
+gm chat
+
+# Override default assistant system prompt
+gm chat --system "You are an automated coding reviewer."
+```
+
+### REPL Commands
+- **`/memory <query>`**: Search personal memory records using SQLite FTS5.
+- **`/status`**: Inspect live TCC privacy permissions, CU helper socket status, and spend budget.
+- **`/do <instruction>`**: Dispatch an autonomous computer-use task directly from within the conversation.
+- **`/clear`**: Clear current chat history while preserving the system prompt.
+- **`/history`**: Display total message count and conversation turn statistics.
+- **`/help`**: Show REPL command reference.
+- **`/exit` or `/quit`**: Cleanly exit the REPL session.
+
+---
+
+## Local Vision-Language Model Interface (Action A12 Prep)
+
+Grok-Muse provides a pluggable `LocalVlmBackend` trait in `crates/gm-llm` for offline local model grounding and visual triage (Candle/MLX ready):
+
+```bash
+# Compile and test with local-vlm feature flag enabled
+cargo test --package gm-llm --features local-vlm
+```
+- **`LocalVlmBackend`**: Pluggable interface for `ground()`, `triage()`, and `generate()`.
+- **`CandleMlxBridgeBackend`**: Pre-scaffolded bridge supporting Metal / CPU device execution and quantized weights (`Fp16`, `Q4_0`, `Q4_K`).
+- **`LocalVlmLlmAdapter`**: Adapter exposing local VLMs through the standard `LlmBackend` interface.
 
 ---
 
@@ -273,6 +319,9 @@ Grok-Muse is continuously tested on both **macOS (`macos-14`)** and **Linux (`ub
 - `cargo nextest run --workspace` (or `cargo test --workspace`)
 - `cargo run -p xtask -- eval` (25-task evaluation gate)
 - `cargo run -p xtask -- bench-hotpath` (native hot-path budgets on macOS)
+- `cargo run -p xtask -- bench-llm` (G4 latency gate calibration)
+- `cargo run -p xtask -- verify-dmg` (macOS release bundle verification)
+
 
 ---
 

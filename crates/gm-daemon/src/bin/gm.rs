@@ -1,8 +1,9 @@
 use clap::Parser;
 use gm_core::error::Result;
 use gm_daemon::{
-    Cli, Commands, run_audit, run_daemon, run_do, run_dogfood, run_feed, run_ideas, run_kill,
-    run_onboard, run_permissions, run_review, run_service, run_stats, run_status, run_upkeep,
+    Cli, Commands, run_audit, run_chat, run_daemon, run_do, run_dogfood, run_feed, run_ideas,
+    run_kill, run_onboard, run_permissions, run_review, run_service, run_stats, run_status,
+    run_upkeep,
 };
 
 #[tokio::main]
@@ -11,6 +12,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Chat { system }) => {
+            run_chat(system, cli.config).await?;
+        }
         Some(Commands::Permissions {
             open_missing,
             open,
@@ -18,6 +22,7 @@ async fn main() -> Result<()> {
         }) => {
             run_permissions(open_missing, open, json).await?;
         }
+
         Some(Commands::Onboard { check_only }) => {
             run_onboard(check_only).await?;
         }

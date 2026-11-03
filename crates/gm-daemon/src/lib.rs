@@ -4,13 +4,14 @@ use gm_core::config::GmConfig;
 use gm_core::error::{GmError, Result};
 use gm_goals::{ProactiveEngine, QuietGateConfig};
 use gm_llm::{
-    BudgetManager, HybridLlmClient, KeychainSecrets, LlmRouter, META_KEY_ACCOUNT, MockLlmBackend,
-    XAI_KEY_ACCOUNT,
+    BudgetManager, ChatMessage, HybridLlmClient, KeychainSecrets, LlmBackend, LlmRouter,
+    META_KEY_ACCOUNT, MockLlmBackend, ReqwestLlmBackend, TaskType, XAI_KEY_ACCOUNT,
 };
 use gm_memory::PersonalMemoryStore;
 use gm_platform::permissions::{PrivacyPane, check_all_permissions};
 use gm_platform::{IpcPlatformClient, Platform};
 use gm_safety::{AuditLogger, BlocklistManager, KillSwitch};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -124,6 +125,12 @@ pub enum Commands {
         /// Output suggestions as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Interactive terminal REPL for conversation, memory retrieval, status inspection, and inline task dispatch
+    Chat {
+        /// Optional initial system prompt override
+        #[arg(long)]
+        system: Option<String>,
     },
 }
 
@@ -460,6 +467,389 @@ pub async fn run_kill() -> Result<()> {
         println!("○ CU Helper socket is not active (no background actions queued).");
     }
     println!("Emergency stop completed.");
+    Ok(())
+}
+
+pub async fn run_chat(system_override: Option<String>, config_path: Option<PathBuf>) -> Result<()> {
+    let stdin = std::io::stdin();
+    let reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+    run_chat_loop(reader, &mut stdout, system_override, config_path).await
+}
+
+pub async fn run_chat_loop<R: BufRead, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    system_override: Option<String>,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = if let Some(p) = config_path {
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            GmConfig::default()
+        }
+    } else {
+        GmConfig::default()
+    };
+
+    let keychain = KeychainSecrets::default();
+    let meta_key = keychain.get_meta_key().ok();
+    let xai_key = keychain.get_xai_key().ok();
+
+    let (backend, backend_name): (Arc<dyn LlmBackend>, &str) = if meta_key.is_some()
+        || xai_key.is_some()
+    {
+        (
+            Arc::new(ReqwestLlmBackend::with_keys(meta_key, xai_key)),
+            "Live API (Keychain / Environment)",
+        )
+    } else {
+        let mock = MockLlmBackend::new();
+        mock.set_response("I am ready to assist you. You can ask me questions, search memory with /memory, check system status with /status, or dispatch actions with /do.");
+        (Arc::new(mock), "Offline / Conversational Simulator")
+    };
+
+    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let llm_client = Arc::new(HybridLlmClient::new(backend, Arc::clone(&budget)));
+    let router = LlmRouter::new(config.providers.clone());
+    let memory = Arc::new(
+        PersonalMemoryStore::default_store()
+            .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap()),
+    );
+    let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
+    let kill_switch = KillSwitch::new();
+    let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
+
+    let system_prompt = system_override.unwrap_or_else(|| {
+        "You are Grok-Muse, a fast computer-use personal assistant for macOS. \
+        You have direct access to local memory, system permissions, and desktop automation tools. \
+        Respond concisely, accurately, and politely."
+            .into()
+    });
+
+    let mut history: Vec<ChatMessage> = vec![ChatMessage {
+        role: "system".into(),
+        content: system_prompt,
+    }];
+
+    writeln!(
+        writer,
+        "\n╔═════════════════════════════════════════════════════════════════════════════╗"
+    )?;
+    writeln!(
+        writer,
+        "║                 Grok-Muse Interactive Terminal REPL                         ║"
+    )?;
+    writeln!(
+        writer,
+        "╚═════════════════════════════════════════════════════════════════════════════╝"
+    )?;
+    writeln!(writer, "  Active Backend : {}", backend_name)?;
+    writeln!(
+        writer,
+        "  Helper Socket  : {}",
+        config.socket_path.display()
+    )?;
+    writeln!(writer, "\nCommands:")?;
+
+    writeln!(
+        writer,
+        "  • /memory <query>  : Search personal knowledge base (FTS5)"
+    )?;
+    writeln!(
+        writer,
+        "  • /status          : Inspect system health, permissions, and budget"
+    )?;
+    writeln!(
+        writer,
+        "  • /do <task>       : Dispatch an inline computer-use task directly"
+    )?;
+    writeln!(writer, "  • /clear           : Clear conversation history")?;
+    writeln!(
+        writer,
+        "  • /history         : Show message count and turns"
+    )?;
+    writeln!(writer, "  • /help            : Show this help guide")?;
+    writeln!(writer, "  • /exit or /quit   : Exit interactive chat\n")?;
+    writer.flush()?;
+
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        write!(writer, "grok-muse> ")?;
+        writer.flush()?;
+
+        let bytes_read = reader.read_line(&mut line_buf)?;
+        if bytes_read == 0 {
+            writeln!(writer, "\nGoodbye!")?;
+            break;
+        }
+
+        let input = line_buf.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "/exit" || input == "/quit" || input == "exit" || input == "quit" {
+            writeln!(writer, "Exiting Grok-Muse chat. Goodbye!")?;
+            break;
+        }
+
+        if input == "/help" {
+            writeln!(writer, "\nAvailable REPL Commands:")?;
+            writeln!(
+                writer,
+                "  /memory <query>    Search SQLite personal memory with FTS5"
+            )?;
+            writeln!(
+                writer,
+                "  /status            Display system permissions, helper socket, and spend"
+            )?;
+            writeln!(
+                writer,
+                "  /do <task>         Dispatch an inline computer-use action via AgentLoop"
+            )?;
+            writeln!(
+                writer,
+                "  /clear             Clear conversation context (preserves system prompt)"
+            )?;
+            writeln!(
+                writer,
+                "  /history           Display conversation turn count"
+            )?;
+            writeln!(writer, "  /help              Print this command guide")?;
+            writeln!(writer, "  /exit, /quit       Exit REPL\n")?;
+            writer.flush()?;
+            continue;
+        }
+
+        if input == "/clear" {
+            let sys = history[0].clone();
+            history.clear();
+            history.push(sys);
+            writeln!(writer, "✔ Conversation history cleared.\n")?;
+            writer.flush()?;
+            continue;
+        }
+
+        if input == "/history" {
+            let user_msgs = history.iter().filter(|m| m.role == "user").count();
+            let asst_msgs = history.iter().filter(|m| m.role == "assistant").count();
+            writeln!(
+                writer,
+                "Context History: {} messages total ({} user, {} assistant)\n",
+                history.len(),
+                user_msgs,
+                asst_msgs
+            )?;
+            writer.flush()?;
+            continue;
+        }
+
+        if input == "/status" {
+            let perms = check_all_permissions();
+            let helper_active = Path::new(&config.socket_path).exists();
+            let spend = budget.get_daily_spent();
+            let cap = budget.config().daily_spend_cap_usd;
+            writeln!(writer, "\n--- System Status Inspection ---")?;
+            writeln!(
+                writer,
+                "  Screen Recording : {}",
+                if perms.screen_recording {
+                    "Granted"
+                } else {
+                    "Missing"
+                }
+            )?;
+            writeln!(
+                writer,
+                "  Accessibility    : {}",
+                if perms.accessibility {
+                    "Granted"
+                } else {
+                    "Missing"
+                }
+            )?;
+            writeln!(
+                writer,
+                "  Calendar         : {}",
+                if perms.calendar { "Granted" } else { "Missing" }
+            )?;
+            writeln!(
+                writer,
+                "  Reminders        : {}",
+                if perms.reminders {
+                    "Granted"
+                } else {
+                    "Missing"
+                }
+            )?;
+            writeln!(
+                writer,
+                "  CU Helper Socket : {}",
+                if helper_active { "Active" } else { "Idle" }
+            )?;
+            writeln!(
+                writer,
+                "  Daily Spend      : ${:.4} / ${:.2} USD\n",
+                spend, cap
+            )?;
+            writer.flush()?;
+            continue;
+        }
+
+        if input.starts_with("/memory") || input.starts_with("/mem") {
+            let query = if let Some(q) = input.strip_prefix("/memory") {
+                q.trim()
+            } else if let Some(q) = input.strip_prefix("/mem") {
+                q.trim()
+            } else {
+                ""
+            };
+
+            if query.is_empty() {
+                writeln!(writer, "Usage: /memory <search terms>\n")?;
+                writer.flush()?;
+                continue;
+            }
+
+            match memory.search(query, 5) {
+                Ok(records) if records.is_empty() => {
+                    writeln!(
+                        writer,
+                        "No matching memory records found for '{}'.\n",
+                        query
+                    )?;
+                }
+                Ok(records) => {
+                    writeln!(
+                        writer,
+                        "\nFound {} memory record(s) for '{}':",
+                        records.len(),
+                        query
+                    )?;
+                    for r in &records {
+                        let title = r.title.as_deref().unwrap_or("untitled");
+                        writeln!(
+                            writer,
+                            "  • [{:?}] {} (Importance: {:.2}, Tags: [{}])",
+                            r.kind,
+                            title,
+                            r.importance,
+                            r.tags.join(", ")
+                        )?;
+                        writeln!(writer, "    {}", r.body)?;
+                    }
+                    writeln!(writer)?;
+                }
+                Err(e) => {
+                    writeln!(writer, "Memory search error: {e}\n")?;
+                }
+            }
+            writer.flush()?;
+            continue;
+        }
+
+        if input.starts_with("/do") || input.starts_with("/task") {
+            let task_instruction = if let Some(t) = input.strip_prefix("/do") {
+                t.trim()
+            } else if let Some(t) = input.strip_prefix("/task") {
+                t.trim()
+            } else {
+                ""
+            };
+
+            if task_instruction.is_empty() {
+                writeln!(writer, "Usage: /do <task instruction>\n")?;
+                writer.flush()?;
+                continue;
+            }
+
+            writeln!(
+                writer,
+                "==> Dispatching inline computer-use task: \"{}\"...",
+                task_instruction
+            )?;
+            writer.flush()?;
+
+            let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
+            let agent = AgentLoop::new(
+                platform,
+                llm_client.clone(),
+                router.clone(),
+                kill_switch.clone(),
+                blocklist.clone(),
+                AgentLoopConfig::default(),
+            )
+            .with_audit(Arc::new(audit_log.clone()));
+
+            match agent.run_task("repl_inline", task_instruction).await {
+                Ok(summary) => {
+                    writeln!(writer, "✔ Task succeeded: {}\n", summary)?;
+                    history.push(ChatMessage {
+                        role: "system".into(),
+                        content: format!("Computer-use action executed: {summary}"),
+                    });
+                }
+                Err(e) => {
+                    writeln!(writer, "✘ Task failed: {}\n", e)?;
+                }
+            }
+            writer.flush()?;
+            continue;
+        }
+
+        // Regular conversational message
+        // 1. Contextual memory retrieval
+        let memory_context = match memory.search(input, 3) {
+            Ok(recs) if !recs.is_empty() => {
+                let context_lines: Vec<String> = recs
+                    .iter()
+                    .map(|r| format!("- ({}): {}", r.title.as_deref().unwrap_or("Fact"), r.body))
+                    .collect();
+                format!(
+                    "\n[Relevant Personal Memory Context:\n{}]\n\n",
+                    context_lines.join("\n")
+                )
+            }
+            _ => String::new(),
+        };
+
+        let enriched_prompt = format!("{}{}", memory_context, input);
+        history.push(ChatMessage {
+            role: "user".into(),
+            content: enriched_prompt,
+        });
+
+        let (primary, fallback) = router.route(TaskType::Planning);
+        match llm_client
+            .execute_routed(&primary, fallback.as_ref(), &history)
+            .await
+        {
+            Ok(resp) => {
+                writeln!(writer, "\n{}\n", resp.content.trim())?;
+                history.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: resp.content.clone(),
+                });
+                audit_log.log(
+                    "chat_message",
+                    Some(format!("{:?}", primary.provider).to_lowercase()),
+                    Some(primary.model),
+                    Some(resp.prompt_tokens + resp.completion_tokens),
+                    Some(resp.estimated_cost_usd),
+                    None,
+                    serde_json::json!({ "user_input": input }),
+                );
+            }
+            Err(e) => {
+                writeln!(writer, "\nError completing chat request: {}\n", e)?;
+            }
+        }
+        writer.flush()?;
+    }
+
     Ok(())
 }
 
@@ -925,5 +1315,23 @@ mod tests {
             .collect();
         // Crucial verification: task_done is logged EXACTLY ONCE
         assert_eq!(done_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_chat_repl_commands_and_interaction() {
+        let input = "/help\n/status\n/history\n/clear\n/memory rust\nHello assistant!\n/exit\n";
+        let reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+
+        let res = run_chat_loop(reader, &mut output, None, None).await;
+        assert!(res.is_ok());
+
+        let out_str = String::from_utf8_lossy(&output);
+        assert!(out_str.contains("Grok-Muse Interactive Terminal REPL"));
+        assert!(out_str.contains("Available REPL Commands:"));
+        assert!(out_str.contains("System Status Inspection"));
+        assert!(out_str.contains("Context History:"));
+        assert!(out_str.contains("Conversation history cleared."));
+        assert!(out_str.contains("Exiting Grok-Muse chat. Goodbye!"));
     }
 }
