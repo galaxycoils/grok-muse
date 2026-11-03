@@ -30,7 +30,12 @@ pub fn helper_plist_path() -> PathBuf {
     launch_agents_dir().join(format!("{HELPER_LABEL}.plist"))
 }
 
+pub fn helper_short_plist_path() -> PathBuf {
+    launch_agents_dir().join("helper.plist")
+}
+
 pub fn generate_daemon_plist(daemon_bin: &Path, log_stdout: &Path, log_stderr: &Path) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -43,6 +48,8 @@ pub fn generate_daemon_plist(daemon_bin: &Path, log_stdout: &Path, log_stderr: &
         <string>{}</string>
         <string>daemon</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>{}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -58,12 +65,14 @@ pub fn generate_daemon_plist(daemon_bin: &Path, log_stdout: &Path, log_stderr: &
 "#,
         DAEMON_LABEL,
         daemon_bin.display(),
+        home,
         log_stdout.display(),
         log_stderr.display()
     )
 }
 
 pub fn generate_helper_plist(helper_bin: &Path, log_stdout: &Path, log_stderr: &Path) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -75,6 +84,8 @@ pub fn generate_helper_plist(helper_bin: &Path, log_stdout: &Path, log_stderr: &
     <array>
         <string>{}</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>{}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -90,6 +101,7 @@ pub fn generate_helper_plist(helper_bin: &Path, log_stdout: &Path, log_stderr: &
 "#,
         HELPER_LABEL,
         helper_bin.display(),
+        home,
         log_stdout.display(),
         log_stderr.display()
     )
@@ -135,14 +147,33 @@ pub fn resolve_binaries(custom_bin_dir: Option<&Path>) -> (PathBuf, PathBuf) {
         }
     }
 
-    // 3. Check workspace target/debug or target/bundle
-    let ws_debug_d = PathBuf::from("target/debug/gm-daemon");
-    let ws_debug_h = PathBuf::from("target/debug/gm-cu-helper");
-    if ws_debug_d.exists() && ws_debug_h.exists() {
-        return (
-            std::fs::canonicalize(&ws_debug_d).unwrap_or(ws_debug_d),
-            std::fs::canonicalize(&ws_debug_h).unwrap_or(ws_debug_h),
-        );
+    // 3. Check workspace target/release or target/debug
+    let candidates = [
+        ("target/release/gm-daemon", "target/release/gm-cu-helper"),
+        ("target/debug/gm-daemon", "target/debug/gm-cu-helper"),
+        (
+            "grok-muse/target/release/gm-daemon",
+            "grok-muse/target/release/gm-cu-helper",
+        ),
+        (
+            "grok-muse/target/debug/gm-daemon",
+            "grok-muse/target/debug/gm-cu-helper",
+        ),
+        (
+            "../target/release/gm-daemon",
+            "../target/release/gm-cu-helper",
+        ),
+        ("../target/debug/gm-daemon", "../target/debug/gm-cu-helper"),
+    ];
+    for (d, h) in candidates {
+        let dp = PathBuf::from(d);
+        let hp = PathBuf::from(h);
+        if dp.exists() && hp.exists() {
+            return (
+                std::fs::canonicalize(&dp).unwrap_or(dp),
+                std::fs::canonicalize(&hp).unwrap_or(hp),
+            );
+        }
     }
 
     (app_daemon, app_helper)
@@ -204,7 +235,8 @@ pub struct ServiceStatus {
 }
 
 pub fn inspect_service(label: &str, plist_path: PathBuf) -> ServiceStatus {
-    let installed = plist_path.exists();
+    let installed =
+        plist_path.exists() || (label == HELPER_LABEL && helper_short_plist_path().exists());
     let mut is_running = false;
     let mut pid = None;
 
@@ -221,12 +253,14 @@ pub fn inspect_service(label: &str, plist_path: PathBuf) -> ServiceStatus {
             is_running = text.contains("state = running");
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("pid =")
-                    && let Some(num_str) = trimmed.split('=').nth(1)
-                    && let Ok(p) = num_str.trim().parse::<u32>()
-                {
-                    pid = Some(p);
-                    is_running = true;
+                if let Some(rest) = trimmed.strip_prefix("pid") {
+                    let rest = rest.trim_start();
+                    if let Some(val) = rest.strip_prefix('=')
+                        && let Ok(p) = val.trim().parse::<u32>()
+                    {
+                        pid = Some(p);
+                        is_running = true;
+                    }
                 }
             }
         }
@@ -260,16 +294,20 @@ pub fn install_services(custom_bin_dir: Option<&Path>) -> Result<()> {
     let d_stderr = log_dir.join("daemon.stderr.log");
     let d_plist_content = generate_daemon_plist(&daemon_bin, &d_stdout, &d_stderr);
     let d_path = daemon_plist_path();
-    fs::write(&d_path, d_plist_content).map_err(GmError::Io)?;
+    fs::write(&d_path, &d_plist_content).map_err(GmError::Io)?;
     println!("  ✔ Generated: {:?}", d_path);
 
-    // 2. Helper Plist
+    // 2. Helper Plist (both standard bundle label path and short helper.plist)
     let h_stdout = log_dir.join("helper.stdout.log");
     let h_stderr = log_dir.join("helper.stderr.log");
     let h_plist_content = generate_helper_plist(&helper_bin, &h_stdout, &h_stderr);
     let h_path = helper_plist_path();
-    fs::write(&h_path, h_plist_content).map_err(GmError::Io)?;
+    fs::write(&h_path, &h_plist_content).map_err(GmError::Io)?;
     println!("  ✔ Generated: {:?}", h_path);
+
+    let h_short_path = helper_short_plist_path();
+    let _ = fs::write(&h_short_path, &h_plist_content);
+    println!("  ✔ Generated: {:?}", h_short_path);
 
     // 3. Launchctl bootstrap
     println!("==> Bootstrapping services into launchd...");
@@ -302,6 +340,7 @@ pub fn uninstall_services() -> Result<()> {
     println!("==> Uninstalling Grok-Muse LaunchAgents...");
     let d_path = daemon_plist_path();
     let h_path = helper_plist_path();
+    let h_short_path = helper_short_plist_path();
 
     bootout_service(&d_path, DAEMON_LABEL);
     bootout_service(&h_path, HELPER_LABEL);
@@ -313,6 +352,10 @@ pub fn uninstall_services() -> Result<()> {
     if h_path.exists() {
         let _ = fs::remove_file(&h_path);
         println!("  ✔ Removed {:?}", h_path);
+    }
+    if h_short_path.exists() {
+        let _ = fs::remove_file(&h_short_path);
+        println!("  ✔ Removed {:?}", h_short_path);
     }
 
     println!("\n✔ Services successfully stopped and uninstalled from LaunchAgents.");
@@ -403,5 +446,12 @@ mod tests {
         let fake_path = PathBuf::from("/tmp/nonexistent.plist");
         let status = inspect_service("co.anysphere.nonexistent", fake_path);
         assert!(!status.plist_installed);
+    }
+
+    #[test]
+    fn test_helper_short_plist_path() {
+        let short = helper_short_plist_path();
+        assert_eq!(short.file_name().unwrap(), "helper.plist");
+        assert!(short.starts_with(launch_agents_dir()));
     }
 }

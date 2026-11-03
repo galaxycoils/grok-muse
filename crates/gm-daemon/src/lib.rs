@@ -336,7 +336,7 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
         "==> Running Grok-Muse computer-use task: \"{}\"",
         instruction
     );
-    let audit_log = AuditLogger::in_memory();
+    let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
     let budget = Arc::new(BudgetManager::new(config.budget.clone()));
@@ -450,7 +450,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     };
 
     info!("Starting gm-daemon...");
-    let audit_log = AuditLogger::in_memory();
+    let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
     let budget = Arc::new(BudgetManager::new(config.budget.clone()));
@@ -460,7 +460,8 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     let llm_backend = Arc::new(MockLlmBackend::new());
     let llm_client = Arc::new(HybridLlmClient::new(llm_backend, Arc::clone(&budget)));
 
-    let _memory = PersonalMemoryStore::in_memory()?;
+    let _memory = PersonalMemoryStore::default_store()
+        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
 
     let proactive_engine = Arc::new(ProactiveEngine::new(
         QuietGateConfig::default(),
@@ -526,7 +527,8 @@ pub async fn run_service(action: ServiceSubcommand) -> Result<()> {
 }
 
 pub async fn run_dogfood(action: Option<DogfoodSubcommand>, json: bool) -> Result<()> {
-    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    let spend_cap = GmConfig::default().budget.daily_spend_cap_usd;
+    let tracker = gm_goals::DogfoodTracker::default_tracker(spend_cap)?;
     match action {
         Some(DogfoodSubcommand::Rate { notice_id, useful }) => {
             tracker.record_rating(&notice_id, useful, chrono::Utc::now())?;
@@ -566,7 +568,8 @@ pub async fn run_dogfood(action: Option<DogfoodSubcommand>, json: bool) -> Resul
 }
 
 pub async fn run_stats(json: bool) -> Result<()> {
-    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    let spend_cap = GmConfig::default().budget.daily_spend_cap_usd;
+    let tracker = gm_goals::DogfoodTracker::default_tracker(spend_cap)?;
     let metrics = tracker.compute_metrics();
     let perms = check_all_permissions();
     let helper_socket = Path::new("/tmp/grok-muse-helper.sock");
@@ -593,20 +596,61 @@ pub async fn run_stats(json: bool) -> Result<()> {
 
 pub async fn run_review(date_str: Option<String>) -> Result<()> {
     let now = chrono::Utc::now();
-    let date = date_str.unwrap_or_else(|| now.format("%Y-%m-%d").to_string());
+    let target_time = if let Some(ref ds) = date_str {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(ds, "%Y-%m-%d") {
+            d.and_hms_opt(21, 0, 0)
+                .map(|dt| dt.and_utc())
+                .unwrap_or(now)
+        } else {
+            now
+        }
+    } else {
+        now
+    };
+    let date = target_time.format("%Y-%m-%d").to_string();
     println!(
         "==> Running Grok-Muse Nightly Review synthesis for {}...",
         date
     );
 
-    let audit = AuditLogger::in_memory();
-    let memory = PersonalMemoryStore::in_memory()?;
-    let tracker = gm_goals::DogfoodTracker::default_tracker(1.0)?;
+    let audit = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
+    let memory = PersonalMemoryStore::default_store()
+        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let spend_cap = GmConfig::default().budget.daily_spend_cap_usd;
+    let tracker = gm_goals::DogfoodTracker::default_tracker(spend_cap)?;
     let metrics = tracker.compute_metrics();
 
-    let platform = IpcPlatformClient::new("/tmp/grok-muse-helper.sock");
-    let review =
-        gm_goals::run_nightly_review(Some(&platform), &audit, &memory, Some(&metrics), now).await?;
+    let socket_path = Path::new("/tmp/grok-muse-helper.sock");
+    let review = if socket_path.exists() {
+        let platform = IpcPlatformClient::new(socket_path);
+        gm_goals::run_nightly_review(
+            Some(&platform),
+            &audit,
+            &memory,
+            Some(&metrics),
+            target_time,
+        )
+        .await?
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            let platform = gm_platform::MacPlatform::new().ok();
+            gm_goals::run_nightly_review(
+                platform.as_ref(),
+                &audit,
+                &memory,
+                Some(&metrics),
+                target_time,
+            )
+            .await?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let platform: Option<&gm_platform::MockPlatform> = None;
+            gm_goals::run_nightly_review(platform, &audit, &memory, Some(&metrics), target_time)
+                .await?
+        }
+    };
 
     println!("\n{}", review.review_markdown);
     Ok(())
@@ -718,5 +762,6 @@ mod tests {
     #[tokio::test]
     async fn test_review_command() {
         assert!(run_review(Some("2026-11-03".into())).await.is_ok());
+        assert!(run_review(None).await.is_ok());
     }
 }

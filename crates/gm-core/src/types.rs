@@ -363,3 +363,30 @@ impl MailItem {
             .any(|&term| subj.contains(term) || body.contains(term))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mail_item_urgency_heuristics() {
+        let mut mail = MailItem {
+            id: "101".into(),
+            sender: "alice@example.com".into(),
+            subject: "URGENT:\tReview production outage".into(),
+            snippet: "Server CPU is at 100%\nImmediate attention needed".into(),
+            received_time_ms: 1000,
+            is_read: false,
+            is_flagged: false,
+            is_urgent: false,
+        };
+        assert!(mail.is_urgent_heuristic());
+
+        mail.subject = "Regular weekly sync notes".into();
+        mail.snippet = "Here are the notes from Tuesday".into();
+        assert!(!mail.is_urgent_heuristic());
+
+        mail.is_flagged = true;
+        assert!(mail.is_urgent_heuristic());
+    }
+}

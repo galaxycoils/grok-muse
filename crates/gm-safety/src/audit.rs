@@ -37,10 +37,37 @@ impl AuditLogger {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let mut loaded = Vec::new();
+        if p.exists()
+            && let Ok(file) = std::fs::File::open(&p)
+        {
+            let reader = std::io::BufReader::new(file);
+            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty()
+                    && let Ok(entry) = serde_json::from_str::<AuditEntry>(trimmed)
+                {
+                    loaded.push(entry);
+                }
+            }
+        }
+
         Ok(Self {
             log_path: Some(p),
-            in_memory: Arc::new(Mutex::new(Vec::new())),
+            in_memory: Arc::new(Mutex::new(loaded)),
         })
+    }
+
+    pub fn default_logger() -> std::io::Result<Self> {
+        let dir = if let Ok(custom) = std::env::var("GROK_MUSE_DATA_DIR") {
+            PathBuf::from(custom)
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join("Library/Application Support/GrokMuse")
+        } else {
+            PathBuf::from(".")
+        };
+        Self::with_file(dir.join("audit.jsonl"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -102,5 +129,38 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, "model_call");
         assert_eq!(entries[0].tokens, Some(120));
+    }
+
+    #[test]
+    fn test_audit_logging_file_persistence() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("gm_audit_test_{nanos}"));
+        let file_path = temp_dir.join("audit.jsonl");
+
+        let logger1 = AuditLogger::with_file(&file_path).unwrap();
+        logger1.log(
+            "task_done",
+            None,
+            None,
+            Some(50),
+            Some(0.001),
+            Some("Task A completed".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(logger1.entries().len(), 1);
+
+        // Reopen same file
+        let logger2 = AuditLogger::with_file(&file_path).unwrap();
+        let entries2 = logger2.entries();
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(
+            entries2[0].action_summary.as_deref(),
+            Some("Task A completed")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

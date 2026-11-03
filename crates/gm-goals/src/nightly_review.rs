@@ -54,9 +54,15 @@ pub fn synthesize_nightly_review(
         }
     }
 
+    let proactive_spend = dogfood.map(|df| df.total_spend_usd).unwrap_or(0.0);
+    let total_spend_usd = total_spend_usd + proactive_spend;
+
     let mut memories_formed = Vec::new();
     for mem in memories {
-        // Collect facts or preferences
+        // Collect facts or preferences, excluding recursive nightly review summaries
+        if mem.tags.iter().any(|t| t == "nightly_review") {
+            continue;
+        }
         let text = if let Some(ref title) = mem.title {
             format!("{}: {}", title, mem.body)
         } else {
@@ -84,6 +90,9 @@ pub fn synthesize_nightly_review(
                 .map(|l| format!(" [{l}]"))
                 .unwrap_or_default();
             pending_reminders.push(format!("Reminder: {}{list_str}", rem.title));
+            if pending_reminders.len() >= 5 {
+                break;
+            }
         }
     }
 
@@ -205,9 +214,19 @@ pub async fn run_nightly_review<P: Platform>(
     let mut reminders = Vec::new();
 
     if let Some(p) = platform {
-        let now_ms = now.timestamp_millis() as u64;
-        let tomorrow_end_ms = now_ms + (36 * 3600 * 1000);
-        if let Ok(evs) = p.get_calendar_events(now_ms, tomorrow_end_ms).await {
+        let tomorrow_date = (now + chrono::Duration::days(1)).date_naive();
+        let tomorrow_start = tomorrow_date
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default()
+            .and_utc();
+        let tomorrow_end = tomorrow_date
+            .and_hms_opt(23, 59, 59)
+            .unwrap_or_default()
+            .and_utc();
+        let start_ms = tomorrow_start.timestamp_millis() as u64;
+        let end_ms = tomorrow_end.timestamp_millis() as u64;
+
+        if let Ok(evs) = p.get_calendar_events(start_ms, end_ms).await {
             events_tomorrow = evs;
         }
         if let Ok(rems) = p.get_reminders(false).await {
@@ -317,5 +336,46 @@ mod tests {
         assert_eq!(review.interruption_precision_pct, 100.0);
         assert!(review.review_markdown.contains("Grok-Muse Nightly Review"));
         assert!(review.review_markdown.contains("Sprint Planning"));
+    }
+
+    #[tokio::test]
+    async fn test_nightly_review_avoids_recursive_memories() {
+        let audit = AuditLogger::in_memory();
+        let memory = PersonalMemoryStore::in_memory().unwrap();
+
+        // 1. Record normal preference
+        memory
+            .record_preference("Prefers dark mode", &["ui", "preferences"])
+            .unwrap();
+
+        // 2. Record past nightly review summary
+        memory
+            .record_fact(
+                Some("Nightly Review 2026-11-02"),
+                "# 🌙 Grok-Muse Nightly Review — 2026-11-02\n- Past summary",
+                &["nightly_review", "summary", "2026-11-02"],
+            )
+            .unwrap();
+
+        let mock_platform = MockPlatform::new();
+        let now = Utc::now();
+        let review = run_nightly_review(Some(&mock_platform), &audit, &memory, None, now)
+            .await
+            .unwrap();
+
+        // Must include genuine preference
+        assert!(
+            review
+                .memories_formed
+                .iter()
+                .any(|m| m.contains("Prefers dark mode"))
+        );
+        // Must NOT include recursive past review
+        assert!(
+            !review
+                .memories_formed
+                .iter()
+                .any(|m| m.contains("Nightly Review 2026-11-02"))
+        );
     }
 }

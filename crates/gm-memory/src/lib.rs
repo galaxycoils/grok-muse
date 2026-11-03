@@ -26,6 +26,18 @@ impl PersonalMemoryStore {
         })
     }
 
+    pub fn default_store() -> Result<Self> {
+        let dir = if let Ok(custom) = std::env::var("GROK_MUSE_DATA_DIR") {
+            std::path::PathBuf::from(custom)
+        } else if let Ok(home) = std::env::var("HOME") {
+            std::path::PathBuf::from(home).join("Library/Application Support/GrokMuse")
+        } else {
+            std::path::PathBuf::from(".")
+        };
+        std::fs::create_dir_all(&dir).map_err(GmError::Io)?;
+        Self::open(dir.join("memory.sqlite"))
+    }
+
     pub fn record_fact(&self, title: Option<&str>, body: &str, tags: &[&str]) -> Result<Record> {
         let rec = NewRecord {
             kind: RecordKind::Fact,
@@ -95,5 +107,32 @@ mod tests {
                 .body
                 .contains("User prefers meetings after 10 AM")
         );
+    }
+
+    #[test]
+    fn test_personal_memory_sqlite_persistence() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("gm_mem_test_{nanos}"));
+        let db_path = temp_dir.join("memory.sqlite");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mem1 = PersonalMemoryStore::open(&db_path).unwrap();
+        mem1.record_fact(
+            Some("Project note"),
+            "Working on Grok-Muse v2 enhancements",
+            &["project", "muse"],
+        )
+        .unwrap();
+
+        // Reopen same database file
+        let mem2 = PersonalMemoryStore::open(&db_path).unwrap();
+        let results = mem2.search("Grok-Muse", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].body.contains("Grok-Muse v2 enhancements"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

@@ -226,7 +226,6 @@ impl DogfoodTracker {
         let mut topic_counts: HashMap<String, u32> = HashMap::new();
         let mut active_dates: HashSet<String> = HashSet::new();
         let mut daily_spend_map: HashMap<String, f64> = HashMap::new();
-        let mut total_spend_usd = 0.0;
 
         for ev in &events {
             match ev {
@@ -242,7 +241,6 @@ impl DogfoodTracker {
                     let date_str = timestamp.format("%Y-%m-%d").to_string();
                     active_dates.insert(date_str.clone());
                     *daily_spend_map.entry(date_str).or_insert(0.0) += *cost_usd;
-                    total_spend_usd += *cost_usd;
                 }
                 DogfoodEvent::UserFeedback {
                     notice_id,
@@ -271,13 +269,9 @@ impl DogfoodTracker {
                     ratings_map.insert(notice_id.clone(), *useful);
                 }
                 DogfoodEvent::DailySpend {
-                    date,
-                    spend_usd,
-                    timestamp,
-                    ..
+                    date, spend_usd, ..
                 } => {
                     active_dates.insert(date.clone());
-                    active_dates.insert(timestamp.format("%Y-%m-%d").to_string());
                     let entry = daily_spend_map.entry(date.clone()).or_insert(0.0);
                     if *spend_usd > *entry {
                         *entry = *spend_usd;
@@ -297,25 +291,33 @@ impl DogfoodTracker {
         }
         let total_rated = useful_count + not_useful_count;
         let precision_pct = if total_rated == 0 {
-            100.0
+            0.0
         } else {
             (useful_count as f64 / total_rated as f64) * 100.0
         };
 
-        let active_days_count = (active_dates.len() as u32).max(1);
-        let avg_notices_per_day = (total_notices_delivered as f64) / (active_days_count as f64);
+        let active_days_count = active_dates.len() as u32;
+        let avg_notices_per_day = if active_days_count == 0 {
+            0.0
+        } else {
+            (total_notices_delivered as f64) / (active_days_count as f64)
+        };
 
         let max_daily_spend_usd = daily_spend_map
             .values()
             .cloned()
             .fold(0.0f64, |acc, v| if v > acc { v } else { acc });
 
+        let total_spend_usd: f64 = daily_spend_map.values().sum();
+
         // Cap enforced if peak daily spend does not exceed cap (with 0.0001 float margin)
         let spend_cap_enforced = max_daily_spend_usd <= (self.daily_spend_cap_usd + 0.0001);
 
-        // G6 Gate: precision >= 80%, notices/day <= 3, daily spend cap respected
-        let g6_gate_passed =
-            precision_pct >= 80.0 && avg_notices_per_day <= 3.0 && spend_cap_enforced;
+        // G6 Gate: at least 1 rated notice, precision >= 80%, notices/day <= 3, daily spend cap respected
+        let g6_gate_passed = total_rated > 0
+            && precision_pct >= 80.0
+            && avg_notices_per_day <= 3.0
+            && spend_cap_enforced;
 
         DogfoodMetricsSummary {
             total_notices_delivered,
@@ -344,15 +346,21 @@ impl DogfoodTracker {
         out.push_str("             Grok-Muse Dogfood Metrics (G6 Gate)            \n");
         out.push_str("============================================================\n");
 
-        let precision_status = if summary.interruption_precision_pct >= 80.0 {
+        let precision_status = if summary.total_rated_notices == 0 {
+            "[PENDING - 0 ratings]"
+        } else if summary.interruption_precision_pct >= 80.0 {
             "[PASS]"
         } else {
             "[FAIL]"
         };
-        out.push_str(&format!(
-            "Interruption Precision:   {:.1}% (Target: ≥ 80.0%) {}\n",
-            summary.interruption_precision_pct, precision_status
-        ));
+        if summary.total_rated_notices == 0 {
+            out.push_str("Interruption Precision:   N/A (Target: ≥ 80.0%) [PENDING - 0 ratings]\n");
+        } else {
+            out.push_str(&format!(
+                "Interruption Precision:   {:.1}% (Target: ≥ 80.0%) {}\n",
+                summary.interruption_precision_pct, precision_status
+            ));
+        }
 
         let delivery_status = if summary.avg_notices_per_day <= 3.0 {
             "[PASS]"
@@ -413,6 +421,8 @@ impl DogfoodTracker {
         out.push_str("------------------------------------------------------------\n");
         let overall = if summary.g6_gate_passed {
             "PASSED (All G6 criteria satisfied)"
+        } else if summary.total_rated_notices == 0 {
+            "IN PROGRESS (No notices rated yet)"
         } else {
             "ACTION NEEDED (G6 criteria not yet fully met)"
         };
@@ -539,5 +549,17 @@ mod tests {
         assert_eq!(metrics.feedback_done_count, 1);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_dogfood_empty_tracker_not_passed() {
+        let tracker = DogfoodTracker::in_memory();
+        let metrics = tracker.compute_metrics();
+        assert_eq!(metrics.total_notices_delivered, 0);
+        assert_eq!(metrics.total_rated_notices, 0);
+        assert!(!metrics.g6_gate_passed);
+
+        let report = tracker.format_report();
+        assert!(report.contains("IN PROGRESS"));
     }
 }

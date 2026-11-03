@@ -563,7 +563,7 @@ impl Platform for MacPlatform {
 
     async fn get_unread_emails(&self) -> Result<Vec<MailItem>> {
         let output = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(2000),
             tokio::task::spawn_blocking(|| {
                 std::process::Command::new("osascript")
                     .args([
@@ -576,9 +576,22 @@ tell application "Mail"
         set unreadList to {}
         set msgs to (messages of inbox whose read status is false)
         repeat with m in msgs
-            set end of unreadList to (id of m as text) & "\t" & (sender of m as text) & "\t" & (subject of m as text) & "\t" & (flagged status of m as text)
+            set s_id to id of m as text
+            set s_sender to sender of m as text
+            set s_subj to subject of m as text
+            set s_flag to flagged status of m as text
+            set s_snip to ""
+            try
+                set c to content of m as text
+                if length of c > 200 then
+                    set s_snip to text 1 thru 200 of c
+                else
+                    set s_snip to c
+                end if
+            end try
+            set end of unreadList to (s_id & "<|GM_FLD|>" & s_sender & "<|GM_FLD|>" & s_subj & "<|GM_FLD|>" & s_flag & "<|GM_FLD|>" & s_snip)
         end repeat
-        set AppleScript's text item delimiters to linefeed
+        set AppleScript's text item delimiters to "<|GM_REC|>"
         return unreadList as text
     on error
         return ""
@@ -599,25 +612,63 @@ end tell"#,
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() >= 3 {
-                    let id = parts[0].trim().to_string();
-                    let sender = parts[1].trim().to_string();
-                    let subject = parts[2].trim().to_string();
-                    let is_flagged = parts.get(3).map(|s| s.trim() == "true").unwrap_or(false);
-                    let mut mail = MailItem {
-                        id,
-                        sender,
-                        subject,
-                        snippet: String::new(),
-                        received_time_ms: now_ms,
-                        is_read: false,
-                        is_flagged,
-                        is_urgent: false,
-                    };
-                    mail.is_urgent = mail.is_urgent_heuristic();
-                    emails.push(mail);
+
+            if text.contains("<|GM_FLD|>") {
+                for rec in text.split("<|GM_REC|>") {
+                    let rec = rec.trim();
+                    if rec.is_empty() {
+                        continue;
+                    }
+                    let parts: Vec<&str> = rec.split("<|GM_FLD|>").collect();
+                    if parts.len() >= 3 {
+                        let id = parts[0].trim().to_string();
+                        let sender = parts[1].replace(['\r', '\n', '\t'], " ").trim().to_string();
+                        let subject = parts[2].replace(['\r', '\n', '\t'], " ").trim().to_string();
+                        let is_flagged = parts.get(3).map(|s| s.trim() == "true").unwrap_or(false);
+                        let snippet = parts
+                            .get(4)
+                            .map(|s| s.replace(['\r', '\n', '\t'], " ").trim().to_string())
+                            .unwrap_or_default();
+
+                        let mut mail = MailItem {
+                            id,
+                            sender,
+                            subject,
+                            snippet,
+                            received_time_ms: now_ms,
+                            is_read: false,
+                            is_flagged,
+                            is_urgent: false,
+                        };
+                        mail.is_urgent = mail.is_urgent_heuristic();
+                        emails.push(mail);
+                    }
+                }
+            } else {
+                for line in text.lines() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 3 {
+                        let id = parts[0].trim().to_string();
+                        let sender = parts[1].trim().to_string();
+                        let subject = parts[2].trim().to_string();
+                        let is_flagged = parts.get(3).map(|s| s.trim() == "true").unwrap_or(false);
+                        let snippet = parts
+                            .get(4)
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        let mut mail = MailItem {
+                            id,
+                            sender,
+                            subject,
+                            snippet,
+                            received_time_ms: now_ms,
+                            is_read: false,
+                            is_flagged,
+                            is_urgent: false,
+                        };
+                        mail.is_urgent = mail.is_urgent_heuristic();
+                        emails.push(mail);
+                    }
                 }
             }
             return Ok(emails);
@@ -742,5 +793,12 @@ mod tests {
             )
             .await;
         assert!(notif_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mac_platform_get_unread_emails() {
+        let platform = MacPlatform::new().expect("init platform");
+        let res = platform.get_unread_emails().await;
+        assert!(res.is_ok());
     }
 }

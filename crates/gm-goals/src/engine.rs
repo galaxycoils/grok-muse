@@ -226,6 +226,12 @@ impl ProactiveEngine {
                     triage_cost,
                     now,
                 );
+                let _ = self.dogfood_tracker.record_daily_spend(
+                    &now.format("%Y-%m-%d").to_string(),
+                    self.budget.get_daily_spent(),
+                    self.budget.config().daily_spend_cap_usd,
+                    now,
+                );
                 self.notices_history.lock().push(notice.clone());
                 delivered.push(notice);
             }
@@ -329,6 +335,12 @@ impl ProactiveEngine {
                     triage_cost,
                     now,
                 );
+                let _ = self.dogfood_tracker.record_daily_spend(
+                    &now.format("%Y-%m-%d").to_string(),
+                    self.budget.get_daily_spent(),
+                    self.budget.config().daily_spend_cap_usd,
+                    now,
+                );
                 self.notices_history.lock().push(notice.clone());
                 delivered.push(notice);
             }
@@ -354,6 +366,7 @@ impl ProactiveEngine {
         let engine_gate = self.quiet_gate.clone();
         let engine_budget = Arc::clone(&self.budget);
         let engine_history = Arc::clone(&self.notices_history);
+        let engine_tracker = Arc::clone(&self.dogfood_tracker);
         let cal_platform = Arc::clone(&platform);
 
         self.scheduler
@@ -362,6 +375,7 @@ impl ProactiveEngine {
                 let gate = engine_gate.clone();
                 let budget = Arc::clone(&engine_budget);
                 let history = Arc::clone(&engine_history);
+                let tracker = Arc::clone(&engine_tracker);
 
                 tokio::spawn(async move {
                     let now = Utc::now();
@@ -391,9 +405,18 @@ impl ProactiveEngine {
                                     )
                                     .await;
                                 gate.record_delivery_at(&dedup, now);
-                                history.lock().push(ProactiveNotice::new(
-                                    ev.title, body, "calendar", is_urgent,
-                                ));
+                                let notice =
+                                    ProactiveNotice::new(&ev.title, &body, "calendar", is_urgent);
+                                let _ = tracker.record_notice_delivered(
+                                    &notice.id,
+                                    "calendar",
+                                    &notice.title,
+                                    is_urgent,
+                                    &dedup,
+                                    0.001,
+                                    now,
+                                );
+                                history.lock().push(notice);
                             }
                         }
                     }
@@ -432,12 +455,18 @@ impl ProactiveEngine {
                                     let _ =
                                         p.send_notification(&title, Some("Patrol"), &body).await;
                                     gate.record_delivery_at(&dedup, now);
-                                    history.lock().push(ProactiveNotice::new(
-                                        title,
-                                        body,
+                                    let notice =
+                                        ProactiveNotice::new(&title, &body, "reminders", is_urgent);
+                                    let _ = tracker.record_notice_delivered(
+                                        &notice.id,
                                         "reminders",
+                                        &notice.title,
                                         is_urgent,
-                                    ));
+                                        &dedup,
+                                        0.001,
+                                        now,
+                                    );
+                                    history.lock().push(notice);
                                 }
                             }
                         }
