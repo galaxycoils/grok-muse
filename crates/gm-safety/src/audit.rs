@@ -293,6 +293,29 @@ impl AuditReport {
     }
 }
 
+pub fn parse_flexible_timestamp(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let trimmed = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S %z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S %Z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+    None
+}
+
 pub fn synthesize_audit_report(
     entries: &[AuditEntry],
     period: AuditPeriod,
@@ -307,13 +330,10 @@ pub fn synthesize_audit_report(
     let mut filtered_entries = Vec::new();
     let max_time = now + chrono::Duration::minutes(5);
     for entry in entries {
-        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
-            let ts_utc = ts.with_timezone(&Utc);
-            if ts_utc >= start_cutoff && ts_utc <= max_time {
-                filtered_entries.push(entry.clone());
-            }
-        } else {
-            // Include entry if timestamp parsing fails but it exists
+        if let Some(ts_utc) = parse_flexible_timestamp(&entry.timestamp)
+            && ts_utc >= start_cutoff
+            && ts_utc <= max_time
+        {
             filtered_entries.push(entry.clone());
         }
     }
@@ -694,5 +714,61 @@ mod tests {
         assert!(formatted.contains("PASS"));
         assert!(formatted.contains("muse-spark"));
         assert!(formatted.contains("grok-4-vision"));
+    }
+
+    #[test]
+    fn test_synthesize_audit_report_flexible_timestamp_and_corrupt_filtering() {
+        let now = Utc::now();
+        let entries = vec![
+            // 1. Valid RFC3339 within window
+            AuditEntry {
+                timestamp: now.to_rfc3339(),
+                event_type: "task_done".into(),
+                provider: None,
+                model: None,
+                tokens: None,
+                cost_usd: None,
+                action_summary: Some("Task 1".into()),
+                details: serde_json::json!({}),
+            },
+            // 2. Non-RFC3339 format within window (e.g., standard SQL datetime)
+            AuditEntry {
+                timestamp: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                event_type: "task_done".into(),
+                provider: None,
+                model: None,
+                tokens: None,
+                cost_usd: None,
+                action_summary: Some("Task 2".into()),
+                details: serde_json::json!({}),
+            },
+            // 3. Out-of-window entry (60 days ago)
+            AuditEntry {
+                timestamp: (now - chrono::Duration::days(60)).to_rfc3339(),
+                event_type: "task_done".into(),
+                provider: None,
+                model: None,
+                tokens: None,
+                cost_usd: None,
+                action_summary: Some("Old Task".into()),
+                details: serde_json::json!({}),
+            },
+            // 4. Completely unparseable timestamp
+            AuditEntry {
+                timestamp: "corrupted_timestamp_string".into(),
+                event_type: "task_done".into(),
+                provider: None,
+                model: None,
+                tokens: None,
+                cost_usd: None,
+                action_summary: Some("Corrupt Task".into()),
+                details: serde_json::json!({}),
+            },
+        ];
+
+        let report = synthesize_audit_report(&entries, AuditPeriod::Weekly, now);
+        // Only entries 1 and 2 should be included!
+        assert_eq!(report.entries_analyzed, 2);
+        assert_eq!(report.task_metrics.tasks_succeeded, 2);
     }
 }

@@ -152,30 +152,27 @@ pub fn run_memory_upkeep(
 
     // 2. Deduplicate facts
     let mut retained_after_dedup: Vec<Record> = Vec::new();
-    let mut deleted_ids: HashSet<String> = HashSet::new();
+    let mut consumed_ids: HashSet<String> = HashSet::new();
 
     for i in 0..active_records.len() {
         let rec_a = &active_records[i];
-        if deleted_ids.contains(&rec_a.id) {
+        if consumed_ids.contains(&rec_a.id) {
             continue;
         }
 
         if rec_a.kind != RecordKind::Fact && rec_a.kind != RecordKind::Preference {
             retained_after_dedup.push(rec_a.clone());
+            consumed_ids.insert(rec_a.id.clone());
             continue;
         }
 
         let norm_a = normalize_text(&rec_a.body);
         let tokens_a = tokenize(&norm_a);
 
-        let mut primary = rec_a.clone();
-        let mut merged_tags: HashSet<String> = primary.tags.iter().cloned().collect();
+        let mut dup_group = vec![rec_a.clone()];
 
         for rec_b in active_records.iter().skip(i + 1) {
-            if deleted_ids.contains(&rec_b.id) {
-                continue;
-            }
-            if rec_b.kind != primary.kind {
+            if consumed_ids.contains(&rec_b.id) || rec_b.kind != rec_a.kind {
                 continue;
             }
 
@@ -188,38 +185,51 @@ pub fn run_memory_upkeep(
             };
 
             if is_duplicate {
-                // If rec_b has higher importance, switch primary
-                if rec_b.importance > primary.importance {
-                    // Mark old primary as deleted
-                    deleted_ids.insert(primary.id.clone());
-                    let _ = store.delete_record(&primary.id)?;
-                    duplicates_removed += 1;
+                dup_group.push(rec_b.clone());
+            }
+        }
 
-                    for t in &primary.tags {
-                        merged_tags.insert(t.clone());
-                    }
-                    primary = rec_b.clone();
-                } else {
-                    // Delete rec_b
-                    deleted_ids.insert(rec_b.id.clone());
-                    let _ = store.delete_record(&rec_b.id)?;
+        if dup_group.len() == 1 {
+            retained_after_dedup.push(rec_a.clone());
+            consumed_ids.insert(rec_a.id.clone());
+        } else {
+            // Find winner with highest importance (tie-breaker: newest created_at)
+            let winner = dup_group
+                .iter()
+                .max_by(|x, y| {
+                    x.importance
+                        .partial_cmp(&y.importance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| x.created_at.cmp(&y.created_at))
+                })
+                .unwrap()
+                .clone();
+
+            let mut merged_tags: HashSet<String> = winner.tags.iter().cloned().collect();
+
+            for loser in &dup_group {
+                if loser.id != winner.id {
+                    let _ = store.delete_record(&loser.id)?;
                     duplicates_removed += 1;
-                    for t in &rec_b.tags {
+                    for t in &loser.tags {
                         merged_tags.insert(t.clone());
                     }
                 }
             }
-        }
 
-        // Update primary's tags if new tags were merged
-        let mut final_tags: Vec<String> = merged_tags.into_iter().collect();
-        final_tags.sort();
-        if final_tags != primary.tags {
-            let _ = store.update_tags(&primary.id, &final_tags)?;
-            primary.tags = final_tags;
-        }
+            let mut final_tags: Vec<String> = merged_tags.into_iter().collect();
+            final_tags.sort();
+            let mut retained_winner = winner;
+            if final_tags != retained_winner.tags {
+                let _ = store.update_tags(&retained_winner.id, &final_tags)?;
+                retained_winner.tags = final_tags;
+            }
 
-        retained_after_dedup.push(primary);
+            retained_after_dedup.push(retained_winner);
+            for item in &dup_group {
+                consumed_ids.insert(item.id.clone());
+            }
+        }
     }
 
     // 3. Cluster related knowledge

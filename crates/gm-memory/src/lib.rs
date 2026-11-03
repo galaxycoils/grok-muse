@@ -285,4 +285,56 @@ mod tests {
         assert_ne!(remaining[0].id, obs.id);
         assert_eq!(remaining[0].title.as_deref(), Some("Important Key"));
     }
+
+    #[test]
+    fn test_memory_upkeep_deduplication_winner_importance() {
+        let mem = PersonalMemoryStore::in_memory().unwrap();
+        let now = Utc::now();
+
+        // Earlier record with lower importance
+        let r1 = mem
+            .engine
+            .lock()
+            .upsert(NewRecord {
+                kind: RecordKind::Fact,
+                title: Some("Initial Draft".into()),
+                body: "Project roadmap deadline is December 15th".into(),
+                tags: vec!["draft".into(), "v1".into()],
+                importance: 0.3,
+                source: Some("agent".into()),
+            })
+            .unwrap();
+
+        // Later record with higher importance and additional tag
+        let r2 = mem
+            .engine
+            .lock()
+            .upsert(NewRecord {
+                kind: RecordKind::Fact,
+                title: Some("Final Roadmap".into()),
+                body: "Project roadmap deadline is December 15th".into(),
+                tags: vec!["confirmed".into()],
+                importance: 0.95,
+                source: Some("user".into()),
+            })
+            .unwrap();
+
+        let report = mem.perform_upkeep(&UpkeepConfig::default(), now).unwrap();
+
+        assert_eq!(report.records_scanned, 2);
+        assert_eq!(report.duplicates_removed, 1);
+        assert_eq!(report.total_records_retained, 1);
+
+        let remaining = mem.all_records(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        // Winner should be r2 with importance 0.95 and merged tags
+        assert_eq!(remaining[0].id, r2.id);
+        assert_eq!(remaining[0].importance, 0.95);
+        assert!(remaining[0].tags.contains(&"draft".to_string()));
+        assert!(remaining[0].tags.contains(&"v1".to_string()));
+        assert!(remaining[0].tags.contains(&"confirmed".to_string()));
+
+        // r1 was deleted
+        assert_ne!(remaining[0].id, r1.id);
+    }
 }

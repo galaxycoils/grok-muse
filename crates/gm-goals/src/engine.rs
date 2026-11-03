@@ -572,6 +572,39 @@ impl ProactiveEngine {
             });
     }
 
+    /// Schedule automated memory upkeep on the given interval (in seconds, e.g. 3600 for hourly).
+    pub fn schedule_memory_upkeep(
+        &self,
+        memory: Arc<PersonalMemoryStore>,
+        interval_secs: u64,
+        config: Option<UpkeepConfig>,
+    ) {
+        let mem = Arc::clone(&memory);
+        let cfg = config.unwrap_or_default();
+        self.scheduler
+            .register_job("memory_upkeep", interval_secs, move || {
+                let m = Arc::clone(&mem);
+                let c = cfg.clone();
+                tokio::spawn(async move {
+                    let now = Utc::now();
+                    match m.perform_upkeep(&c, now) {
+                        Ok(rep) => {
+                            info!(
+                                "Periodic memory upkeep complete: {} records scanned, {} duplicates removed, {} clusters formed, {} stale expired",
+                                rep.records_scanned,
+                                rep.duplicates_removed,
+                                rep.clusters_formed,
+                                rep.stale_expired
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Periodic memory upkeep failed: {e}");
+                        }
+                    }
+                });
+            });
+    }
+
     /// Tick scheduler for time progression.
     pub fn tick(&self, now: DateTime<Utc>) -> u32 {
         self.scheduler.tick(now)
@@ -962,5 +995,47 @@ mod tests {
             .expect("ideas");
         assert!(!ideas.is_empty());
         assert!(ideas.iter().any(|i| i.title.contains("Deep Work")));
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_scheduled_memory_upkeep() {
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), budget);
+
+        let memory = Arc::new(PersonalMemoryStore::in_memory().unwrap());
+        memory
+            .record_fact(
+                Some("Test fact 1"),
+                "Periodic upkeep deduplication target",
+                &["test"],
+            )
+            .unwrap();
+        memory
+            .record_fact(
+                Some("Test fact 2"),
+                "Periodic upkeep deduplication target",
+                &["test", "duplicate"],
+            )
+            .unwrap();
+
+        // Schedule upkeep every 3600 seconds
+        engine.schedule_memory_upkeep(Arc::clone(&memory), 3600, None);
+
+        let now = Utc::now();
+        // Tick at now registers no run because next_run is at now + 3600s
+        let triggered = engine.tick(now);
+        assert_eq!(triggered, 0);
+
+        // Advance past 3600s
+        let future = now + chrono::Duration::seconds(3605);
+        let triggered_future = engine.tick(future);
+        assert_eq!(triggered_future, 1);
+
+        // Yield to allow the spawned task to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let records = memory.all_records(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].tags.contains(&"duplicate".to_string()));
     }
 }

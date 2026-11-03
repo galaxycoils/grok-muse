@@ -392,15 +392,6 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
     match agent.run_task("cli_do", instruction).await {
         Ok(summary) => {
             println!("Task succeeded: {summary}");
-            audit_log.log(
-                "task_done",
-                None,
-                None,
-                None,
-                None,
-                Some(summary),
-                serde_json::json!({ "instruction": instruction }),
-            );
             Ok(())
         }
         Err(e) => {
@@ -494,8 +485,10 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     let llm_backend = Arc::new(MockLlmBackend::new());
     let llm_client = Arc::new(HybridLlmClient::new(llm_backend, Arc::clone(&budget)));
 
-    let _memory = PersonalMemoryStore::default_store()
-        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let memory = Arc::new(
+        PersonalMemoryStore::default_store()
+            .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap()),
+    );
 
     let proactive_engine = Arc::new(ProactiveEngine::new(
         QuietGateConfig::default(),
@@ -503,6 +496,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     ));
 
     proactive_engine.schedule_patrol(Arc::clone(&platform), 300);
+    proactive_engine.schedule_memory_upkeep(Arc::clone(&memory), 3600, None);
 
     let tick_engine = Arc::clone(&proactive_engine);
     let tick_task = tokio::spawn(async move {
@@ -528,15 +522,6 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
         match agent.run_task("cli_task", &task_instruction).await {
             Ok(summary) => {
                 println!("Task completed: {summary}");
-                audit_log.log(
-                    "task_done",
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(summary),
-                    serde_json::json!({}),
-                );
             }
             Err(e) => {
                 eprintln!("Task failed: {e}");
@@ -904,5 +889,41 @@ mod tests {
     async fn test_ideas_command() {
         assert!(run_ideas(false).await.is_ok());
         assert!(run_ideas(true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_audit_single_task_done_logging() {
+        use gm_core::config::{BudgetConfig, ProvidersConfig};
+        let audit = Arc::new(AuditLogger::in_memory());
+        let mock_platform = Arc::new(gm_platform::MockPlatform::new());
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(
+            Arc::new(MockLlmBackend::new()),
+            budget,
+        ));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::new(&[]);
+
+        let agent = AgentLoop::new(
+            mock_platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_audit(audit.clone());
+
+        let res = agent.run_task("test_t1", "Click test").await;
+        assert!(res.is_ok());
+
+        let entries = audit.entries();
+        let done_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event_type == "task_done")
+            .collect();
+        // Crucial verification: task_done is logged EXACTLY ONCE
+        assert_eq!(done_entries.len(), 1);
     }
 }

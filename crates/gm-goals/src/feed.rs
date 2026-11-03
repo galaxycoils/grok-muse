@@ -79,9 +79,7 @@ pub fn build_feed(
     // 3. Completed tasks from audit log
     for entry in audit.entries() {
         if entry.event_type == "task_done" {
-            let ts = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let ts = gm_safety::parse_flexible_timestamp(&entry.timestamp).unwrap_or_else(Utc::now);
 
             let title = entry
                 .action_summary

@@ -122,7 +122,7 @@ pub async fn generate_ideas<P: Platform>(
             // Find urgent or flagged unread emails
             let urgent_emails: Vec<_> = emails
                 .iter()
-                .filter(|e| e.is_urgent || e.is_flagged)
+                .filter(|e| !e.is_read && (e.is_urgent || e.is_flagged || e.is_urgent_heuristic()))
                 .collect();
             for mail in urgent_emails {
                 ideas.push(ProactiveIdea {
@@ -139,13 +139,14 @@ pub async fn generate_ideas<P: Platform>(
                 });
             }
 
-            if emails.len() >= 5 {
+            let unread_count = emails.iter().filter(|e| !e.is_read).count();
+            if unread_count >= 5 {
                 ideas.push(ProactiveIdea {
                     id: "idea_inbox_triage".into(),
                     title: "Automated Inbox Triage Opportunity".into(),
                     description: format!(
                         "You have {} unread emails. Triage and categorize newsletters vs actionable threads.",
-                        emails.len()
+                        unread_count
                     ),
                     source: IdeaSource::Mail,
                     action_prompt: Some("Open Mail and archive newsletters".into()),
@@ -153,31 +154,33 @@ pub async fn generate_ideas<P: Platform>(
                     created_at: now,
                 });
             }
+        }
 
-            // 3. Reminders check
-            if let Ok(reminders) = plat.get_reminders(false).await {
-                let overdue_or_soon = reminders.iter().filter(|r| {
-                    if let Some(due) = r.due_date_ms {
-                        due <= now_ms + (4 * 3600 * 1000)
-                    } else {
-                        false
-                    }
-                });
-                for r in overdue_or_soon {
-                    ideas.push(ProactiveIdea {
-                        id: format!("idea_rem_{}", r.id),
-                        title: format!("Complete Pending Reminder: '{}'", r.title),
-                        description: format!(
-                            "Priority {} reminder due soon in list '{}'. Complete or reschedule.",
-                            r.priority,
-                            r.list_name.as_deref().unwrap_or("Default")
-                        ),
-                        source: IdeaSource::Calendar,
-                        action_prompt: Some(format!("Mark reminder '{}' as completed", r.title)),
-                        confidence: 0.85,
-                        created_at: now,
-                    });
+        // 3. Reminders check (EventKit - independent from Mail)
+        if let Ok(reminders) = plat.get_reminders(false).await {
+            let overdue_or_soon = reminders.iter().filter(|r| {
+                if !r.is_completed
+                    && let Some(due) = r.due_date_ms
+                {
+                    due <= now_ms + (4 * 3600 * 1000)
+                } else {
+                    false
                 }
+            });
+            for r in overdue_or_soon {
+                ideas.push(ProactiveIdea {
+                    id: format!("idea_rem_{}", r.id),
+                    title: format!("Complete Pending Reminder: '{}'", r.title),
+                    description: format!(
+                        "Priority {} reminder due soon in list '{}'. Complete or reschedule.",
+                        r.priority,
+                        r.list_name.as_deref().unwrap_or("Default")
+                    ),
+                    source: IdeaSource::Calendar,
+                    action_prompt: Some(format!("Mark reminder '{}' as completed", r.title)),
+                    confidence: 0.85,
+                    created_at: now,
+                });
             }
         }
     }
@@ -349,5 +352,32 @@ mod tests {
         assert!(formatted.contains("Proactive Ideas & Suggestions"));
         assert!(formatted.contains("Deep Work Focus Block"));
         assert!(formatted.contains("boss@corp.com"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_ideas_reminders_independent_of_mail() {
+        let platform = MockPlatform::new();
+        let memory = PersonalMemoryStore::in_memory().unwrap();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis() as u64;
+
+        // No calendar events, no emails
+        platform.set_calendar_events(vec![]);
+        platform.set_unread_emails(vec![]);
+
+        // Only a reminder
+        platform.set_reminders(vec![ReminderItem {
+            id: "rem_solo".into(),
+            title: "Taxes filing deadline".into(),
+            due_date_ms: Some(now_ms + 30 * 60 * 1000), // Due in 30 mins
+            is_completed: false,
+            priority: 1,
+            list_name: Some("Finance".into()),
+        }]);
+
+        let ideas = generate_ideas(Some(&platform), &memory, now).await.unwrap();
+        assert_eq!(ideas.len(), 1);
+        assert!(ideas[0].title.contains("Taxes filing deadline"));
+        assert_eq!(ideas[0].source, IdeaSource::Calendar);
     }
 }

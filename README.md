@@ -222,7 +222,8 @@ gm upkeep
 gm upkeep --stale-days 7 --json
 ```
 
-- **Fact Deduplication**: Calculates token Jaccard similarity (≥ 0.85) and normalized string matching. Automatically merges tags from duplicate records and retains the highest-importance entry.
+- **Periodic Background Execution**: In addition to manual runs via `gm upkeep`, `gm-daemon` registers an hourly background maintenance job (`schedule_memory_upkeep`) on the proactive scheduler.
+- **Fact Deduplication**: Calculates token Jaccard similarity (≥ 0.85) and normalized string matching. Automatically merges tags from duplicate records and retains the highest-importance entry without duplicates.
 - **Knowledge Clustering**: Discovers shared themes across records and applies cluster tags (`cluster:<topic>`), linking related notes together.
 - **Stale Observation Pruning**: Automatically purges transient episodes and observations older than the retention threshold with low importance (≤ 0.4).
 
