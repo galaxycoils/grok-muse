@@ -2,7 +2,7 @@ use clap::Parser;
 use gm_agent::{AgentLoop, AgentLoopConfig};
 use gm_core::config::GmConfig;
 use gm_core::error::Result;
-use gm_goals::{ProactiveScheduler, QuietGate, QuietGateConfig};
+use gm_goals::{ProactiveEngine, QuietGateConfig};
 use gm_llm::{BudgetManager, HybridLlmClient, LlmRouter, MockLlmBackend};
 use gm_memory::PersonalMemoryStore;
 use gm_platform::IpcPlatformClient;
@@ -38,19 +38,19 @@ async fn main() -> Result<()> {
     // Connect to cu-helper IPC client
     let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
     let llm_backend = Arc::new(MockLlmBackend::new());
-    let llm_client = Arc::new(HybridLlmClient::new(llm_backend, budget));
+    let llm_client = Arc::new(HybridLlmClient::new(llm_backend, Arc::clone(&budget)));
 
     // Memory store
     let _memory = PersonalMemoryStore::in_memory()?;
 
-    // Proactive engine setup
-    let _quiet_gate = QuietGate::new(QuietGateConfig::default());
-    let scheduler = ProactiveScheduler::new();
+    // Proactive engine setup connecting scheduler, quiet gate, and daily spend cap tracking
+    let proactive_engine = Arc::new(ProactiveEngine::new(
+        QuietGateConfig::default(),
+        Arc::clone(&budget),
+    ));
 
-    // Register proactive patrol job
-    scheduler.register_job("patrol_calendar_reminders", 300, || {
-        info!("Running proactive calendar and reminders patrol");
-    });
+    // Register proactive patrol job connecting EventKit and UserNotifications
+    proactive_engine.schedule_patrol(Arc::clone(&platform), 300);
 
     if let Some(task_instruction) = args.task {
         info!("Running one-shot task: {}", task_instruction);
@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
         }
     } else {
         info!("gm-daemon running in background mode.");
+        tokio::signal::ctrl_c().await.ok();
     }
 
     Ok(())

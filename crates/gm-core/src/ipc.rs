@@ -1,5 +1,8 @@
 use crate::error::{GmError, Result};
-use crate::types::{AxSnapshot, ComputerAction, FrameCapture, PermissionStatus, UserActivity};
+use crate::types::{
+    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, PermissionStatus, ReminderItem,
+    UserActivity,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -24,6 +27,18 @@ pub enum HelperRequest {
     },
     ExecuteAction(ComputerAction),
     CancelActions,
+    GetCalendarEvents {
+        start_time_ms: u64,
+        end_time_ms: u64,
+    },
+    GetReminders {
+        include_completed: bool,
+    },
+    SendNotification {
+        title: String,
+        subtitle: Option<String>,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +54,9 @@ pub enum HelperResponse {
         message: Option<String>,
     },
     Cancelled,
+    CalendarEvents(Vec<CalendarItem>),
+    Reminders(Vec<ReminderItem>),
+    NotificationSent(bool),
     Error(String),
 }
 

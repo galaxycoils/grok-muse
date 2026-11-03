@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use gm_core::error::Result;
-use gm_core::types::{AxSnapshot, ComputerAction, FrameCapture, PermissionStatus, UserActivity};
+use gm_core::types::{
+    AxSnapshot, CalendarItem, ComputerAction, FrameCapture, PermissionStatus, ReminderItem,
+    UserActivity,
+};
 
 #[async_trait]
 pub trait Platform: Send + Sync {
@@ -25,4 +28,22 @@ pub trait Platform: Send + Sync {
 
     /// Emergency cancellation of active/pending actions.
     async fn cancel(&self) -> Result<()>;
+
+    /// Retrieve calendar events in the given time window (epoch ms).
+    async fn get_calendar_events(
+        &self,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Vec<CalendarItem>>;
+
+    /// Retrieve reminder tasks from EventKit.
+    async fn get_reminders(&self, include_completed: bool) -> Result<Vec<ReminderItem>>;
+
+    /// Send a native macOS user alert notification.
+    async fn send_notification(
+        &self,
+        title: &str,
+        subtitle: Option<&str>,
+        body: &str,
+    ) -> Result<bool>;
 }

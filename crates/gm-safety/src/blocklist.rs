@@ -16,7 +16,9 @@ impl Default for BlocklistManager {
             "dashlane",
             "lastpass",
             "authenticator",
+            "passwords",
             "com.apple.keychainaccess",
+            "com.apple.passwords",
         ] {
             set.insert(app.to_string());
         }
@@ -58,6 +60,8 @@ mod tests {
         let mgr = BlocklistManager::default();
         assert!(mgr.is_blocked("1Password", "Vault"));
         assert!(mgr.is_blocked("Safari", "Keychain Access - Passwords"));
+        assert!(mgr.is_blocked("System Settings", "Passwords"));
+        assert!(mgr.is_blocked("Passwords", "Main Window"));
         assert!(!mgr.is_blocked("Notes", "Shopping list"));
     }
 }

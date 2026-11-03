@@ -141,4 +141,59 @@ impl Platform for IpcPlatformClient {
             ))),
         }
     }
+
+    async fn get_calendar_events(
+        &self,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Vec<gm_core::types::CalendarItem>> {
+        match self
+            .send_request(HelperRequest::GetCalendarEvents {
+                start_time_ms,
+                end_time_ms,
+            })
+            .await?
+        {
+            HelperResponse::CalendarEvents(events) => Ok(events),
+            other => Err(GmError::Ipc(format!(
+                "Unexpected response for get_calendar_events: {other:?}"
+            ))),
+        }
+    }
+
+    async fn get_reminders(
+        &self,
+        include_completed: bool,
+    ) -> Result<Vec<gm_core::types::ReminderItem>> {
+        match self
+            .send_request(HelperRequest::GetReminders { include_completed })
+            .await?
+        {
+            HelperResponse::Reminders(rems) => Ok(rems),
+            other => Err(GmError::Ipc(format!(
+                "Unexpected response for get_reminders: {other:?}"
+            ))),
+        }
+    }
+
+    async fn send_notification(
+        &self,
+        title: &str,
+        subtitle: Option<&str>,
+        body: &str,
+    ) -> Result<bool> {
+        match self
+            .send_request(HelperRequest::SendNotification {
+                title: title.to_string(),
+                subtitle: subtitle.map(|s| s.to_string()),
+                body: body.to_string(),
+            })
+            .await?
+        {
+            HelperResponse::NotificationSent(sent) => Ok(sent),
+            other => Err(GmError::Ipc(format!(
+                "Unexpected response for send_notification: {other:?}"
+            ))),
+        }
+    }
 }

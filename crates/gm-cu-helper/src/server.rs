@@ -101,6 +101,33 @@ async fn handle_connection<P: Platform>(mut stream: UnixStream, platform: Arc<P>
                 Ok(_) => HelperResponse::Cancelled,
                 Err(e) => HelperResponse::Error(e.to_string()),
             },
+            HelperRequest::GetCalendarEvents {
+                start_time_ms,
+                end_time_ms,
+            } => match platform
+                .get_calendar_events(start_time_ms, end_time_ms)
+                .await
+            {
+                Ok(events) => HelperResponse::CalendarEvents(events),
+                Err(e) => HelperResponse::Error(e.to_string()),
+            },
+            HelperRequest::GetReminders { include_completed } => {
+                match platform.get_reminders(include_completed).await {
+                    Ok(rems) => HelperResponse::Reminders(rems),
+                    Err(e) => HelperResponse::Error(e.to_string()),
+                }
+            }
+            HelperRequest::SendNotification {
+                title,
+                subtitle,
+                body,
+            } => match platform
+                .send_notification(&title, subtitle.as_deref(), &body)
+                .await
+            {
+                Ok(sent) => HelperResponse::NotificationSent(sent),
+                Err(e) => HelperResponse::Error(e.to_string()),
+            },
         };
 
         let response = IpcMessage {

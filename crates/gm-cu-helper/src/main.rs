@@ -13,6 +13,11 @@ use tracing::info;
 struct Args {
     #[arg(short, long)]
     socket: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Force mock platform instead of native macOS ScreenCaptureKit/AX"
+    )]
+    mock: bool,
 }
 
 #[tokio::main]
@@ -24,9 +29,29 @@ async fn main() -> Result<()> {
 
     info!("Starting gm-cu-helper daemon at {:?}", socket_path);
 
-    // In v1 initial scaffold, instantiate platform (mock/native fallback)
-    let platform = MockPlatform::new();
-    let server = HelperServer::new(platform);
-    server.run(socket_path).await?;
+    if args.mock {
+        info!("Using MockPlatform as requested by --mock flag");
+        let platform = MockPlatform::new();
+        let server = HelperServer::new(platform);
+        server.run(socket_path).await?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        info!("Instantiating native MacPlatform (ScreenCaptureKit + AXUIElement + CGEvent)");
+        let platform = gm_platform::MacPlatform::new()?;
+        let server = HelperServer::new(platform);
+        server.run(socket_path).await?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        info!("Instantiating MockPlatform on non-macOS target");
+        let platform = MockPlatform::new();
+        let server = HelperServer::new(platform);
+        server.run(socket_path).await?;
+    }
+
     Ok(())
 }

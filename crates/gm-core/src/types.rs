@@ -117,6 +117,129 @@ pub enum ComputerAction {
     },
 }
 
+impl ComputerAction {
+    /// Returns true if the action dispatches low-level CGEvent mouse/keyboard inputs.
+    pub fn is_cgevent_action(&self) -> bool {
+        match self {
+            ComputerAction::Click { token, coords, .. } => coords.is_some() || token.is_none(),
+            ComputerAction::Type { .. }
+            | ComputerAction::KeyCombo { .. }
+            | ComputerAction::Scroll { .. }
+            | ComputerAction::Drag { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Returns true if the action can execute directly via background Accessibility API (AXPress).
+    pub fn is_ax_action(&self) -> bool {
+        match self {
+            ComputerAction::Click { token, coords, .. } => token.is_some() && coords.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if this action is expected to visibly modify the target UI window state.
+    pub fn modifies_ui_state(&self) -> bool {
+        matches!(
+            self,
+            ComputerAction::Click { .. }
+                | ComputerAction::Type { .. }
+                | ComputerAction::KeyCombo { .. }
+                | ComputerAction::Scroll { .. }
+                | ComputerAction::Drag { .. }
+        )
+    }
+}
+
+/// Changes detected between two accessibility tree snapshots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AxDiff {
+    pub added_tokens: Vec<String>,
+    pub removed_tokens: Vec<String>,
+    pub changed_elements: Vec<AxElementChange>,
+    pub window_title_changed: Option<(String, String)>,
+    pub app_changed: Option<(String, String)>,
+}
+
+impl AxDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added_tokens.is_empty()
+            && self.removed_tokens.is_empty()
+            && self.changed_elements.is_empty()
+            && self.window_title_changed.is_none()
+            && self.app_changed.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AxElementChange {
+    pub token: String,
+    pub old_label: Option<String>,
+    pub new_label: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+/// Computes the difference between pre-action and post-action accessibility tree snapshots.
+pub fn compute_ax_diff(before: &AxSnapshot, after: &AxSnapshot) -> AxDiff {
+    let mut added_tokens = Vec::new();
+    let mut removed_tokens = Vec::new();
+    let mut changed_elements = Vec::new();
+
+    let before_map: std::collections::HashMap<&str, &AxElement> = before
+        .elements
+        .iter()
+        .map(|e| (e.token.as_str(), e))
+        .collect();
+    let after_map: std::collections::HashMap<&str, &AxElement> = after
+        .elements
+        .iter()
+        .map(|e| (e.token.as_str(), e))
+        .collect();
+
+    for (token, after_el) in &after_map {
+        if let Some(before_el) = before_map.get(token) {
+            if before_el.label != after_el.label || before_el.value != after_el.value {
+                changed_elements.push(AxElementChange {
+                    token: token.to_string(),
+                    old_label: before_el.label.clone(),
+                    new_label: after_el.label.clone(),
+                    old_value: before_el.value.clone(),
+                    new_value: after_el.value.clone(),
+                });
+            }
+        } else {
+            added_tokens.push(token.to_string());
+        }
+    }
+
+    for token in before_map.keys() {
+        if !after_map.contains_key(token) {
+            removed_tokens.push(token.to_string());
+        }
+    }
+
+    let window_title_changed = if before.window_title != after.window_title {
+        Some((before.window_title.clone(), after.window_title.clone()))
+    } else {
+        None
+    };
+
+    let app_changed = if before.app_name != after.app_name {
+        Some((before.app_name.clone(), after.app_name.clone()))
+    } else {
+        None
+    };
+
+    AxDiff {
+        added_tokens,
+        removed_tokens,
+        changed_elements,
+        window_title_changed,
+        app_changed,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
@@ -148,4 +271,35 @@ impl PermissionStatus {
 pub struct UserActivity {
     pub seconds_since_last_event: f64,
     pub is_user_active: bool,
+}
+
+/// Calendar event retrieved from EventKit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarItem {
+    pub id: String,
+    pub title: String,
+    pub start_time_ms: u64,
+    pub end_time_ms: u64,
+    pub location: Option<String>,
+    pub notes: Option<String>,
+    pub is_all_day: bool,
+}
+
+/// Reminder task retrieved from EventKit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReminderItem {
+    pub id: String,
+    pub title: String,
+    pub due_date_ms: Option<u64>,
+    pub is_completed: bool,
+    pub priority: u32,
+    pub list_name: Option<String>,
+}
+
+/// Notification message payload for macOS UserNotifications.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationPayload {
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub body: String,
 }

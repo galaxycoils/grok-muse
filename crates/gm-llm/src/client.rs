@@ -42,6 +42,7 @@ pub trait LlmBackend: Send + Sync {
 
 pub struct MockLlmBackend {
     next_response: Arc<Mutex<Option<String>>>,
+    response_queue: Arc<Mutex<Vec<String>>>,
     fail_first_n_calls: Arc<Mutex<u32>>,
 }
 
@@ -55,12 +56,17 @@ impl MockLlmBackend {
     pub fn new() -> Self {
         Self {
             next_response: Arc::new(Mutex::new(None)),
+            response_queue: Arc::new(Mutex::new(Vec::new())),
             fail_first_n_calls: Arc::new(Mutex::new(0)),
         }
     }
 
     pub fn set_response(&self, content: impl Into<String>) {
         *self.next_response.lock() = Some(content.into());
+    }
+
+    pub fn queue_response(&self, content: impl Into<String>) {
+        self.response_queue.lock().push(content.into());
     }
 
     pub fn set_fail_calls(&self, count: u32) {
@@ -84,9 +90,20 @@ impl LlmBackend for MockLlmBackend {
             )));
         }
 
-        let content = self.next_response.lock().clone().unwrap_or_else(|| {
-            "{\"action\":\"done\",\"params\":{\"summary\":\"mock completed\"}}".into()
-        });
+        let queued = {
+            let mut q = self.response_queue.lock();
+            if !q.is_empty() {
+                Some(q.remove(0))
+            } else {
+                None
+            }
+        };
+
+        let content = queued
+            .or_else(|| self.next_response.lock().clone())
+            .unwrap_or_else(|| {
+                "{\"action\":\"done\",\"params\":{\"summary\":\"mock completed\"}}".into()
+            });
 
         Ok(ChatCompletionResponse {
             id: "mock_resp_1".into(),
@@ -95,6 +112,120 @@ impl LlmBackend for MockLlmBackend {
             prompt_tokens: 50,
             completion_tokens: 20,
             estimated_cost_usd: 0.001,
+        })
+    }
+}
+
+pub struct ReqwestLlmBackend {
+    client: reqwest::Client,
+    meta_api_key: Option<String>,
+    xai_api_key: Option<String>,
+}
+
+impl Default for ReqwestLlmBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReqwestLlmBackend {
+    pub fn new() -> Self {
+        let secrets = crate::secrets::KeychainSecrets::default();
+        let meta_api_key = secrets.get_meta_key().ok();
+        let xai_api_key = secrets.get_xai_key().ok();
+        Self::with_keys(meta_api_key, xai_api_key)
+    }
+
+    pub fn with_keys(meta_key: Option<String>, xai_key: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            meta_api_key: meta_key,
+            xai_api_key: xai_key,
+        }
+    }
+
+    pub fn with_secrets(secrets: &crate::secrets::KeychainSecrets) -> Self {
+        let meta_api_key = secrets.get_meta_key().ok();
+        let xai_api_key = secrets.get_xai_key().ok();
+        Self::with_keys(meta_api_key, xai_api_key)
+    }
+}
+
+#[async_trait]
+impl LlmBackend for ReqwestLlmBackend {
+    async fn complete(
+        &self,
+        target: &ModelTarget,
+        messages: &[ChatMessage],
+    ) -> Result<ChatCompletionResponse> {
+        let api_key = match target.provider {
+            crate::router::ProviderKind::Meta => self.meta_api_key.clone().or_else(|| {
+                crate::secrets::KeychainSecrets::default()
+                    .get_meta_key()
+                    .ok()
+            }),
+            crate::router::ProviderKind::Xai => self.xai_api_key.clone().or_else(|| {
+                crate::secrets::KeychainSecrets::default()
+                    .get_xai_key()
+                    .ok()
+            }),
+        };
+
+        let Some(key) = api_key else {
+            return Err(GmError::Config(format!(
+                "No API key configured for provider '{:?}'. Please configure it in macOS Keychain or via environment variable.",
+                target.provider
+            )));
+        };
+
+        let url = format!("{}/chat/completions", target.api_base.trim_end_matches('/'));
+
+        let body = serde_json::json!({
+            "model": target.model,
+            "messages": messages,
+            "temperature": 0.2,
+        });
+
+        let req = self.client.post(&url).json(&body).bearer_auth(key);
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| GmError::Provider(format!("HTTP request failed to {url}: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GmError::Provider(format!(
+                "API returned error {status}: {text}"
+            )));
+        }
+
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| GmError::Provider(format!("Failed to parse response JSON: {e}")))?;
+
+        let content = val["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+        let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+        let total_tokens = prompt_tokens + completion_tokens;
+        let estimated_cost_usd = (total_tokens as f64) * 0.000002;
+
+        Ok(ChatCompletionResponse {
+            id: val["id"].as_str().unwrap_or("resp").to_string(),
+            content,
+            model: target.model.clone(),
+            prompt_tokens,
+            completion_tokens,
+            estimated_cost_usd,
         })
     }
 }
