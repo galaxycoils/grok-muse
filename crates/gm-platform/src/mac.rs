@@ -65,6 +65,7 @@ unsafe extern "C" {
         out_json_str: *mut *mut c_char,
     ) -> c_int;
     fn gm_mac_get_reminders(include_completed: c_int, out_json_str: *mut *mut c_char) -> c_int;
+    fn gm_mac_menu_click(path_items: *const *const c_char, path_len: c_int) -> c_int;
     fn gm_mac_send_notification(
         title: *const c_char,
         subtitle: *const c_char,
@@ -314,6 +315,16 @@ impl Platform for MacPlatform {
                     debug!("AXPress on '{tok}' returned code {ret}, falling back to CGEvent click");
                 }
 
+                // If falling back to CGEvent click, enforce user coexistence
+                let mut activity = self.user_activity().await?;
+                while activity.seconds_since_last_event < 1.5 {
+                    if self.cancelled.load(Ordering::SeqCst) {
+                        return Err(GmError::Platform("Action execution cancelled".into()));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    activity = self.user_activity().await?;
+                }
+
                 // Fallback: resolve target point from token or coordinates
                 let mut target_pt = coords.unwrap_or((100.0, 100.0));
                 if let Some(tok) = token {
@@ -426,6 +437,17 @@ impl Platform for MacPlatform {
 
             ComputerAction::Menu { path } => {
                 debug!("Menu action requested for path: {:?}", path);
+                let mut c_items: Vec<CString> = Vec::with_capacity(path.len());
+                for item in path {
+                    if let Ok(c) = CString::new(item.as_str()) {
+                        c_items.push(c);
+                    }
+                }
+                let ptrs: Vec<*const c_char> = c_items.iter().map(|c| c.as_ptr()).collect();
+                let ret = unsafe { gm_mac_menu_click(ptrs.as_ptr(), ptrs.len() as c_int) };
+                if ret != 0 {
+                    debug!("Menu click returned code {ret}");
+                }
             }
 
             ComputerAction::AskUser { question } => {

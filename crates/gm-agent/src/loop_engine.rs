@@ -18,6 +18,7 @@ pub struct AgentLoopConfig {
     pub user_active_pause_seconds: f64,
     pub max_action_retries: u32,
     pub trajectory_dir: Option<PathBuf>,
+    pub capture_frames: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -27,6 +28,7 @@ impl Default for AgentLoopConfig {
             user_active_pause_seconds: 1.5,
             max_action_retries: 3,
             trajectory_dir: None,
+            capture_frames: false,
         }
     }
 }
@@ -68,6 +70,7 @@ impl<P: Platform> AgentLoop<P> {
 
         let mut step = 0;
         let mut consecutive_no_change_retries = 0;
+        let mut last_action_feedback: Option<String> = None;
 
         while step < self.config.max_steps {
             step += 1;
@@ -85,7 +88,14 @@ impl<P: Platform> AgentLoop<P> {
             // 2. Snapshot AX tree
             let raw_snapshot = self.platform.ax_snapshot(None).await?;
 
-            // 3. Blocklist check on frontmost window
+            // 3. Optional frame capture for multimodal grounding or trajectory recording
+            let frame = if self.config.capture_frames {
+                self.platform.capture(Some(1280), Some(70)).await.ok()
+            } else {
+                None
+            };
+
+            // 4. Blocklist check on frontmost window
             if self
                 .blocklist
                 .is_blocked(&raw_snapshot.app_name, &raw_snapshot.window_title)
@@ -96,18 +106,23 @@ impl<P: Platform> AgentLoop<P> {
                 )));
             }
 
-            // 4. Redaction of secure fields
+            // 5. Redaction of secure fields
             let sanitized_snapshot = sanitize_ax_snapshot(raw_snapshot);
 
-            // 5. Wrap screen text as untrusted data
+            // 6. Wrap screen text as untrusted data
             let snapshot_json = serde_json::to_string(&sanitized_snapshot)?;
             let untrusted = UntrustedData::new(snapshot_json, "screen_ax_tree");
             let untrusted_block = format_untrusted_context(untrusted.inner(), untrusted.source());
 
-            // 6. Route and execute LLM step
+            // 7. Route and execute LLM step
             let (primary, fallback) = self.router.route(TaskType::CuAxStep);
+            let feedback_block = if let Some(ref fb) = last_action_feedback {
+                format!("\n\n{fb}")
+            } else {
+                String::new()
+            };
             let prompt = format!(
-                "Goal: {instruction}\n\nCurrent window state:\n{untrusted_block}\n\nPick the next action in JSON format."
+                "Goal: {instruction}\n\nCurrent window state:\n{untrusted_block}{feedback_block}\n\nPick the next action in JSON format."
             );
             let messages = vec![
                 ChatMessage {
@@ -136,7 +151,7 @@ impl<P: Platform> AgentLoop<P> {
                 }
             };
 
-            // 7. Blocklist check on action target app
+            // 8. Blocklist check on action target app
             match &action {
                 ComputerAction::FocusApp { app_name }
                     if self.blocklist.is_blocked(app_name, "") =>
@@ -155,7 +170,7 @@ impl<P: Platform> AgentLoop<P> {
                 _ => {}
             }
 
-            // 8. Resolve target label from snapshot for safety classification
+            // 9. Resolve target label from snapshot for safety classification
             let target_label: Option<String> = match &action {
                 ComputerAction::Click { token, coords, .. } => {
                     let mut found = None;
@@ -180,7 +195,7 @@ impl<P: Platform> AgentLoop<P> {
                 _ => None,
             };
 
-            // 9. Safety tier check
+            // 10. Safety tier check
             let tier = ActionTier::classify(&action, target_label.as_deref());
             if tier.requires_confirmation() {
                 info!(
@@ -192,23 +207,26 @@ impl<P: Platform> AgentLoop<P> {
                 )));
             }
 
-            // 10. User coexistence check:
+            // 11. User coexistence check:
             // Pause CGEvent actions if user input occurred within the last N seconds,
             // while allowing background AX actions to proceed immediately without pausing.
             if action.is_cgevent_action() {
                 let mut activity = self.platform.user_activity().await?;
-                while activity.seconds_since_last_event < self.config.user_active_pause_seconds {
+                if activity.seconds_since_last_event < self.config.user_active_pause_seconds {
                     info!(
                         "User input active ({:.2}s ago); pausing CGEvent action {:?}",
                         activity.seconds_since_last_event, action
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    if self.kill_switch.is_triggered() {
-                        return Err(GmError::SafetyViolation(
-                            "Execution stopped by Kill Switch".into(),
-                        ));
+                    while activity.seconds_since_last_event < self.config.user_active_pause_seconds
+                    {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        if self.kill_switch.is_triggered() {
+                            return Err(GmError::SafetyViolation(
+                                "Execution stopped by Kill Switch".into(),
+                            ));
+                        }
+                        activity = self.platform.user_activity().await?;
                     }
-                    activity = self.platform.user_activity().await?;
                 }
             } else if action.is_ax_action() {
                 info!(
@@ -217,12 +235,12 @@ impl<P: Platform> AgentLoop<P> {
                 );
             }
 
-            // 11. Dispatch action or terminate
+            // 12. Dispatch action or terminate
             match &action {
                 ComputerAction::Done { summary } => {
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        None,
+                        frame,
                         Some(sanitized_snapshot),
                         action.clone(),
                         None,
@@ -235,7 +253,7 @@ impl<P: Platform> AgentLoop<P> {
                 ComputerAction::AskUser { question } => {
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        None,
+                        frame,
                         Some(sanitized_snapshot),
                         action.clone(),
                         None,
@@ -248,14 +266,14 @@ impl<P: Platform> AgentLoop<P> {
                 other => {
                     self.platform.act(other).await?;
 
-                    // 12. Verify-after-act: capture post-action snapshot and compute diff
+                    // 13. Verify-after-act: capture post-action snapshot and compute diff
                     let raw_post = self.platform.ax_snapshot(None).await?;
                     let sanitized_post = sanitize_ax_snapshot(raw_post);
                     let diff = compute_ax_diff(&sanitized_snapshot, &sanitized_post);
 
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        None,
+                        frame,
                         Some(sanitized_snapshot.clone()),
                         action.clone(),
                         Some(diff.clone()),
@@ -266,6 +284,10 @@ impl<P: Platform> AgentLoop<P> {
                     // Check if UI state was expected to change but diff was empty
                     if action.modifies_ui_state() && diff.is_empty() {
                         consecutive_no_change_retries += 1;
+                        last_action_feedback = Some(format!(
+                            "Warning: Previous action {:?} produced no observable UI change (retry {}/{}). Try a different element or approach.",
+                            action, consecutive_no_change_retries, self.config.max_action_retries
+                        ));
                         warn!(
                             "Verify-after-act: action {:?} produced no UI changes (retry {}/{})",
                             action, consecutive_no_change_retries, self.config.max_action_retries
@@ -283,6 +305,7 @@ impl<P: Platform> AgentLoop<P> {
                     } else {
                         // Progress observed or state changed, reset retries
                         consecutive_no_change_retries = 0;
+                        last_action_feedback = None;
                     }
                 }
             }
@@ -449,6 +472,7 @@ mod tests {
             user_active_pause_seconds: 1.0,
             max_action_retries: 2,
             trajectory_dir: None,
+            capture_frames: false,
         };
 
         let agent = AgentLoop::new(
@@ -488,6 +512,7 @@ mod tests {
             user_active_pause_seconds: 0.1,
             max_action_retries: 2, // Bound is 2 retries
             trajectory_dir: None,
+            capture_frames: false,
         };
 
         let agent = AgentLoop::new(platform, llm, router, kill_switch, blocklist, config);

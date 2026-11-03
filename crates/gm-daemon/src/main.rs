@@ -52,6 +52,16 @@ async fn main() -> Result<()> {
     // Register proactive patrol job connecting EventKit and UserNotifications
     proactive_engine.schedule_patrol(Arc::clone(&platform), 300);
 
+    // Spawn proactive scheduler tick task so background patrol jobs actually execute
+    let tick_engine = Arc::clone(&proactive_engine);
+    let tick_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            tick_engine.tick(chrono::Utc::now());
+        }
+    });
+
     if let Some(task_instruction) = args.task {
         info!("Running one-shot task: {}", task_instruction);
         let agent = AgentLoop::new(
@@ -78,6 +88,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 eprintln!("Task failed: {e}");
+                tick_task.abort();
                 return Err(e);
             }
         }
@@ -86,5 +97,6 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await.ok();
     }
 
+    tick_task.abort();
     Ok(())
 }

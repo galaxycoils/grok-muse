@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use gm_core::error::Result;
 use gm_core::types::*;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -10,6 +11,7 @@ pub struct MockPlatform {
     permissions: Arc<Mutex<PermissionStatus>>,
     user_activity: Arc<Mutex<UserActivity>>,
     latest_snapshot: Arc<Mutex<Option<AxSnapshot>>>,
+    snapshot_queue: Arc<Mutex<VecDeque<AxSnapshot>>>,
     latest_frame: Arc<Mutex<Option<FrameCapture>>>,
     executed_actions: Arc<Mutex<Vec<ComputerAction>>>,
     cancelled_count: Arc<Mutex<u32>>,
@@ -38,6 +40,7 @@ impl MockPlatform {
                 is_user_active: false,
             })),
             latest_snapshot: Arc::new(Mutex::new(None)),
+            snapshot_queue: Arc::new(Mutex::new(VecDeque::new())),
             latest_frame: Arc::new(Mutex::new(None)),
             executed_actions: Arc::new(Mutex::new(Vec::new())),
             cancelled_count: Arc::new(Mutex::new(0)),
@@ -57,6 +60,10 @@ impl MockPlatform {
 
     pub fn set_snapshot(&self, snapshot: AxSnapshot) {
         *self.latest_snapshot.lock() = Some(snapshot);
+    }
+
+    pub fn queue_snapshot(&self, snapshot: AxSnapshot) {
+        self.snapshot_queue.lock().push_back(snapshot);
     }
 
     pub fn set_frame(&self, frame: FrameCapture) {
@@ -113,6 +120,11 @@ impl Platform for MockPlatform {
     }
 
     async fn ax_snapshot(&self, _window_id: Option<u32>) -> Result<AxSnapshot> {
+        if let Some(next) = self.snapshot_queue.lock().pop_front() {
+            *self.latest_snapshot.lock() = Some(next.clone());
+            return Ok(next);
+        }
+
         if let Some(snapshot) = self.latest_snapshot.lock().clone() {
             Ok(snapshot)
         } else {
@@ -137,35 +149,49 @@ impl Platform for MockPlatform {
 
     async fn act(&self, action: &ComputerAction) -> Result<()> {
         self.executed_actions.lock().push(action.clone());
-        if let ComputerAction::Click {
-            token: Some(tok), ..
-        } = action
-        {
-            let mut snap = self.latest_snapshot.lock();
-            if let Some(ref mut s) = *snap {
-                for el in &mut s.elements {
-                    if &el.token == tok {
-                        el.value = Some("clicked".into());
+        match action {
+            ComputerAction::Click {
+                token: Some(tok), ..
+            } => {
+                let mut snap = self.latest_snapshot.lock();
+                if let Some(ref mut s) = *snap {
+                    for el in &mut s.elements {
+                        if &el.token == tok {
+                            el.value = Some("clicked".into());
+                        }
                     }
+                } else {
+                    *snap = Some(AxSnapshot {
+                        window_id: 1,
+                        app_name: "MockApp".into(),
+                        window_title: "Mock Window".into(),
+                        bounds: Rect::new(0.0, 0.0, 800.0, 600.0),
+                        elements: vec![AxElement {
+                            token: tok.clone(),
+                            role: "AXButton".into(),
+                            label: Some("Submit".into()),
+                            value: Some("clicked".into()),
+                            frame: Rect::new(100.0, 100.0, 80.0, 30.0),
+                            is_enabled: true,
+                            is_secure: false,
+                        }],
+                        timestamp_ms: 1001,
+                    });
                 }
-            } else {
-                *snap = Some(AxSnapshot {
-                    window_id: 1,
-                    app_name: "MockApp".into(),
-                    window_title: "Mock Window".into(),
-                    bounds: Rect::new(0.0, 0.0, 800.0, 600.0),
-                    elements: vec![AxElement {
-                        token: tok.clone(),
-                        role: "AXButton".into(),
-                        label: Some("Submit".into()),
-                        value: Some("clicked".into()),
-                        frame: Rect::new(100.0, 100.0, 80.0, 30.0),
-                        is_enabled: true,
-                        is_secure: false,
-                    }],
-                    timestamp_ms: 1001,
-                });
             }
+            ComputerAction::FocusApp { app_name } => {
+                let mut snap = self.latest_snapshot.lock();
+                if let Some(ref mut s) = *snap {
+                    s.app_name = app_name.clone();
+                }
+            }
+            ComputerAction::LaunchApp { bundle_id } => {
+                let mut snap = self.latest_snapshot.lock();
+                if let Some(ref mut s) = *snap {
+                    s.app_name = bundle_id.clone();
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

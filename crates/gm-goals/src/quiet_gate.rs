@@ -20,6 +20,13 @@ impl Default for QuietGateConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NoticeAction {
+    Done,
+    Later(Option<DateTime<Utc>>),
+    Stop,
+}
+
 #[derive(Debug, Clone)]
 pub struct QuietGate {
     config: QuietGateConfig,
@@ -27,6 +34,7 @@ pub struct QuietGate {
     sent_notices_today: Arc<Mutex<u32>>,
     last_sent_date: Arc<Mutex<Option<chrono::NaiveDate>>>,
     recent_hashes: Arc<Mutex<HashSet<String>>>,
+    done_hashes: Arc<Mutex<HashSet<String>>>,
     snoozed_until: Arc<Mutex<Option<DateTime<Utc>>>>,
     topic_snooze: Arc<Mutex<std::collections::HashMap<String, DateTime<Utc>>>>,
 }
@@ -39,6 +47,7 @@ impl QuietGate {
             sent_notices_today: Arc::new(Mutex::new(0)),
             last_sent_date: Arc::new(Mutex::new(None)),
             recent_hashes: Arc::new(Mutex::new(HashSet::new())),
+            done_hashes: Arc::new(Mutex::new(HashSet::new())),
             snoozed_until: Arc::new(Mutex::new(None)),
             topic_snooze: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
@@ -60,6 +69,29 @@ impl QuietGate {
         self.topic_snooze.lock().insert(topic.to_lowercase(), until);
     }
 
+    /// Handles distinct feedback actions: Done (permanent suppression), Later (snooze), Stop (topic opt-out).
+    pub fn handle_feedback(
+        &self,
+        topic: &str,
+        dedup_hash: &str,
+        action: NoticeAction,
+        current_time: DateTime<Utc>,
+    ) {
+        match action {
+            NoticeAction::Done => {
+                self.done_hashes.lock().insert(dedup_hash.to_string());
+                self.recent_hashes.lock().insert(dedup_hash.to_string());
+            }
+            NoticeAction::Later(until_opt) => {
+                let until = until_opt.unwrap_or_else(|| current_time + chrono::Duration::hours(1));
+                self.snooze_topic(topic, until);
+            }
+            NoticeAction::Stop => {
+                self.opt_out_topic(topic);
+            }
+        }
+    }
+
     /// Evaluates whether a notice is allowed to be delivered right now.
     pub fn can_deliver(
         &self,
@@ -68,36 +100,52 @@ impl QuietGate {
         is_urgent: bool,
         current_time: DateTime<Utc>,
     ) -> (bool, Option<&'static str>) {
-        // 1. Topic opt-out check
+        // Date rollover check
+        let current_date = current_time.date_naive();
+        {
+            let mut last_date = self.last_sent_date.lock();
+            let mut sent_today = self.sent_notices_today.lock();
+            if *last_date != Some(current_date) {
+                *last_date = Some(current_date);
+                *sent_today = 0;
+            }
+        }
+
+        // 1. Permanent done suppression
+        if self.done_hashes.lock().contains(dedup_hash) {
+            return (false, Some("Notification permanently dismissed (done)"));
+        }
+
+        // 2. Topic opt-out check
         if self.opted_out_topics.lock().contains(&topic.to_lowercase()) {
             return (false, Some("Topic opted out"));
         }
 
-        // 2. Dedup check
+        // 3. Dedup check
         if self.recent_hashes.lock().contains(dedup_hash) {
             return (false, Some("Duplicate notification suppressed"));
         }
 
-        // 3. Urgency bypass skips quiet hours, snoozes, and daily caps
+        // 4. Urgency bypass skips quiet hours, snoozes, and daily caps
         if is_urgent {
             return (true, None);
         }
 
-        // 4. Global snooze check
+        // 5. Global snooze check
         if let Some(until) = *self.snoozed_until.lock()
             && current_time < until
         {
             return (false, Some("Notifications snoozed"));
         }
 
-        // 5. Topic snooze check
+        // 6. Topic snooze check
         if let Some(until) = self.topic_snooze.lock().get(&topic.to_lowercase())
             && current_time < *until
         {
             return (false, Some("Topic snoozed"));
         }
 
-        // 6. Quiet hours check
+        // 7. Quiet hours check
         let hour = current_time.hour();
         let in_quiet_hours = if self.config.quiet_start_hour > self.config.quiet_end_hour {
             // Overnight window e.g. 22 to 8
@@ -110,28 +158,31 @@ impl QuietGate {
             return (false, Some("Quiet hours active"));
         }
 
-        // 7. Daily notification cap check (using NaiveDate for robust date rollover)
-        let current_date = current_time.date_naive();
-        let mut last_date = self.last_sent_date.lock();
-        let mut sent_today = self.sent_notices_today.lock();
-
-        if *last_date != Some(current_date) {
-            *last_date = Some(current_date);
-            *sent_today = 0;
-            self.recent_hashes.lock().clear();
-        }
-
-        if *sent_today >= self.config.max_daily_notices {
+        // 8. Daily notification cap check
+        let sent_today = *self.sent_notices_today.lock();
+        if sent_today >= self.config.max_daily_notices {
             return (false, Some("Daily notification cap reached"));
         }
 
         (true, None)
     }
 
-    /// Mark a notice as delivered
-    pub fn record_delivery(&self, dedup_hash: &str) {
-        *self.sent_notices_today.lock() += 1;
+    /// Mark a notice as delivered at a specific timestamp.
+    pub fn record_delivery_at(&self, dedup_hash: &str, current_time: DateTime<Utc>) {
+        let current_date = current_time.date_naive();
+        let mut last_date = self.last_sent_date.lock();
+        let mut sent_today = self.sent_notices_today.lock();
+        if *last_date != Some(current_date) {
+            *last_date = Some(current_date);
+            *sent_today = 0;
+        }
+        *sent_today += 1;
         self.recent_hashes.lock().insert(dedup_hash.to_string());
+    }
+
+    /// Mark a notice as delivered at current time.
+    pub fn record_delivery(&self, dedup_hash: &str) {
+        self.record_delivery_at(dedup_hash, Utc::now());
     }
 }
 
@@ -190,5 +241,38 @@ mod tests {
         // Advancing to Dec 3 should properly reset sent_today even though day is 3 in both
         let (allowed, _) = gate.can_deliver("calendar", "h_dec", false, dec_3);
         assert!(allowed);
+    }
+
+    #[test]
+    fn test_quiet_gate_done_later_stop_feedback() {
+        let gate = QuietGate::new(QuietGateConfig::default());
+        let daytime = Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap();
+
+        // 1. Test Done action
+        gate.handle_feedback("calendar", "event_42", NoticeAction::Done, daytime);
+        let (allowed, reason) = gate.can_deliver("calendar", "event_42", false, daytime);
+        assert!(!allowed);
+        assert_eq!(reason, Some("Notification permanently dismissed (done)"));
+
+        // 2. Test Later (snooze) action
+        let (allowed_before, _) = gate.can_deliver("reminders", "rem_99", false, daytime);
+        assert!(allowed_before);
+        gate.handle_feedback(
+            "reminders",
+            "rem_99",
+            NoticeAction::Later(Some(daytime + chrono::Duration::hours(2))),
+            daytime,
+        );
+        let during_snooze = daytime + chrono::Duration::hours(1);
+        let (allowed_snooze, reason_snooze) =
+            gate.can_deliver("reminders", "rem_99_new", false, during_snooze);
+        assert!(!allowed_snooze);
+        assert_eq!(reason_snooze, Some("Topic snoozed"));
+
+        // 3. Test Stop (opt-out) action
+        gate.handle_feedback("marketing", "mkt_1", NoticeAction::Stop, daytime);
+        let (allowed_stop, reason_stop) = gate.can_deliver("marketing", "mkt_2", false, daytime);
+        assert!(!allowed_stop);
+        assert_eq!(reason_stop, Some("Topic opted out"));
     }
 }

@@ -72,6 +72,9 @@ impl EvalRunner {
         let mock_backend = Arc::new(MockLlmBackend::new());
         for step in &fixture.steps {
             mock_backend.queue_response(step.model_response.clone());
+            if let Some(ref post) = step.post_snapshot {
+                platform.queue_snapshot(post.clone());
+            }
         }
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
@@ -91,6 +94,7 @@ impl EvalRunner {
                 user_active_pause_seconds: 0.1,
                 max_action_retries: 3,
                 trajectory_dir: None,
+                capture_frames: false,
             },
         );
 

@@ -292,14 +292,21 @@ int gm_mac_encode_jpeg(const uint8_t *rgba_bytes, uint32_t width, uint32_t heigh
 }
 
 // Token-to-AXUIElement cache for AX-first action dispatch
+static os_unfair_lock g_ax_map_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary *g_ax_elements_map = nil;
 
 int gm_mac_ax_press(const char *token) {
     if (!token) return -1;
     @autoreleasepool {
-        if (!g_ax_elements_map) return -2;
+        os_unfair_lock_lock(&g_ax_map_lock);
+        if (!g_ax_elements_map) {
+            os_unfair_lock_unlock(&g_ax_map_lock);
+            return -2;
+        }
         NSString *tok = [NSString stringWithUTF8String:token];
         id val = g_ax_elements_map[tok];
+        os_unfair_lock_unlock(&g_ax_map_lock);
+
         if (!val) return -3;
         
         AXUIElementRef el = (__bridge AXUIElementRef)val;
@@ -360,9 +367,11 @@ static void traverse_element(AXUIElementRef element, NSMutableArray *elements_ar
     NSString *token = [NSString stringWithFormat:@"el_%d", (*token_counter)++];
     
     // Store in token element map
+    os_unfair_lock_lock(&g_ax_map_lock);
     if (g_ax_elements_map) {
         g_ax_elements_map[token] = (__bridge id)element;
     }
+    os_unfair_lock_unlock(&g_ax_map_lock);
     
     NSMutableDictionary *el_dict = [NSMutableDictionary dictionary];
     el_dict[@"token"] = token;
@@ -400,11 +409,13 @@ static void traverse_element(AXUIElementRef element, NSMutableArray *elements_ar
 
 int gm_mac_inspect_front_window(uint32_t target_window_id, char **out_json_str) {
     @autoreleasepool {
+        os_unfair_lock_lock(&g_ax_map_lock);
         if (!g_ax_elements_map) {
             g_ax_elements_map = [[NSMutableDictionary alloc] init];
         } else {
             [g_ax_elements_map removeAllObjects];
         }
+        os_unfair_lock_unlock(&g_ax_map_lock);
         
         pid_t pid = 0;
         NSString *appName = nil;
@@ -877,21 +888,131 @@ int gm_mac_get_reminders(int include_completed, char **out_json_str) {
     }
 }
 
+int gm_mac_menu_click(const char **path_items, int path_len) {
+    if (!path_items || path_len == 0) return -1;
+    @autoreleasepool {
+        NSRunningApplication *frontApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!frontApp) return -2;
+
+        AXUIElementRef appRef = AXUIElementCreateApplication(frontApp.processIdentifier);
+        if (!appRef) return -3;
+
+        CFTypeRef menuBarRef = NULL;
+        if (AXUIElementCopyAttributeValue(appRef, kAXMenuBarAttribute, &menuBarRef) != kAXErrorSuccess || !menuBarRef) {
+            CFRelease(appRef);
+            return -4;
+        }
+
+        AXUIElementRef currentElement = (AXUIElementRef)menuBarRef;
+        for (int i = 0; i < path_len; i++) {
+            NSString *target = [NSString stringWithUTF8String:path_items[i]];
+            CFTypeRef childrenRef = NULL;
+            if (AXUIElementCopyAttributeValue(currentElement, kAXChildrenAttribute, &childrenRef) != kAXErrorSuccess || !childrenRef) {
+                CFRelease(currentElement);
+                CFRelease(appRef);
+                return -5;
+            }
+
+            AXUIElementRef foundChild = NULL;
+            CFArrayRef children = (CFArrayRef)childrenRef;
+            CFIndex count = CFArrayGetCount(children);
+            for (CFIndex j = 0; j < count; j++) {
+                AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, j);
+                CFTypeRef titleRef = NULL;
+                if (AXUIElementCopyAttributeValue(child, kAXTitleAttribute, &titleRef) == kAXErrorSuccess && titleRef) {
+                    if (CFGetTypeID(titleRef) == CFStringGetTypeID()) {
+                        NSString *title = (__bridge NSString *)titleRef;
+                        if ([title caseInsensitiveCompare:target] == NSOrderedSame) {
+                            foundChild = (AXUIElementRef)CFRetain(child);
+                            CFRelease(titleRef);
+                            break;
+                        }
+                    }
+                    CFRelease(titleRef);
+                }
+            }
+            CFRelease(childrenRef);
+
+            if (!foundChild) {
+                CFRelease(currentElement);
+                CFRelease(appRef);
+                return -6;
+            }
+
+            if (i == path_len - 1) {
+                AXUIElementPerformAction(foundChild, kAXPressAction);
+                CFRelease(foundChild);
+                CFRelease(currentElement);
+                CFRelease(appRef);
+                return 0;
+            } else {
+                AXUIElementPerformAction(foundChild, kAXPressAction);
+                CFRelease(currentElement);
+                currentElement = foundChild;
+            }
+        }
+        CFRelease(currentElement);
+        CFRelease(appRef);
+        return 0;
+    }
+}
+
 int gm_mac_send_notification(const char *title, const char *subtitle, const char *body) {
     @autoreleasepool {
         NSString *nsTitle = title ? [NSString stringWithUTF8String:title] : @"Grok-Muse";
         NSString *nsSub = subtitle ? [NSString stringWithUTF8String:subtitle] : @"";
         NSString *nsBody = body ? [NSString stringWithUTF8String:body] : @"";
-        
-        NSString *escBody = [nsBody stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-        NSString *escTitle = [nsTitle stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-        
+
+        // 1. Try native UserNotifications framework if in an app bundle
+        if ([NSBundle mainBundle].bundleIdentifier != nil) {
+            @try {
+                UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+                UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+                content.title = nsTitle;
+                if (nsSub.length > 0) content.subtitle = nsSub;
+                content.body = nsBody;
+                content.sound = [UNNotificationSound defaultSound];
+
+                UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO];
+                NSString *reqId = [[NSUUID UUID] UUIDString];
+                UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:reqId content:content trigger:trigger];
+
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                __block BOOL delivered = NO;
+                [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound) completionHandler:^(BOOL granted, NSError * _Nullable authErr) {
+                    (void)authErr;
+                    if (granted) {
+                        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable reqErr) {
+                            if (!reqErr) delivered = YES;
+                            dispatch_semaphore_signal(sem);
+                        }];
+                    } else {
+                        dispatch_semaphore_signal(sem);
+                    }
+                }];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
+                if (delivered) return 0;
+            } @catch (NSException *ex) {
+                // Fall through to AppleScript
+            }
+        }
+
+        // 2. Fallback to NSAppleScript with robust string escaping
+        NSString *escBody = [[[nsBody stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                                     stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]
+                                     stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+        NSString *escTitle = [[[nsTitle stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                                       stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]
+                                       stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+
         NSMutableString *scriptStr = [NSMutableString stringWithFormat:@"display notification \"%@\" with title \"%@\"", escBody, escTitle];
         if (nsSub.length > 0) {
-            NSString *escSub = [nsSub stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+            NSString *escSub = [[[nsSub stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                                       stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]
+                                       stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
             [scriptStr appendFormat:@" subtitle \"%@\"", escSub];
         }
-        
+
         NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:scriptStr];
         NSDictionary *errorInfo = nil;
         [appleScript executeAndReturnError:&errorInfo];

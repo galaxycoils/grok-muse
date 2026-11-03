@@ -85,7 +85,8 @@ impl TrajectoryRecorder {
                 }
             })
             .collect::<String>();
-        let jsonl_path = directory.join(format!("{safe_filename}.jsonl"));
+        let timestamp = started_at.format("%Y%m%d_%H%M%S_%3f");
+        let jsonl_path = directory.join(format!("{safe_filename}_{timestamp}.jsonl"));
 
         let _ = std::fs::create_dir_all(&directory);
 
@@ -211,6 +212,13 @@ impl TrajectoryReplayer {
     }
 
     pub fn load_from_jsonl_str(content: &str) -> Result<Self> {
+        let trimmed = content.trim();
+        if trimmed.starts_with('{')
+            && trimmed.contains("\"steps\"")
+            && let Ok(traj) = serde_json::from_str::<Trajectory>(trimmed)
+        {
+            return Ok(Self { trajectory: traj });
+        }
         Self::load_from_reader(std::io::Cursor::new(content))
     }
 
@@ -238,6 +246,8 @@ impl TrajectoryReplayer {
                 final_summary = footer.final_summary;
             } else if let Ok(step) = serde_json::from_str::<TrajectoryStep>(trimmed) {
                 steps.push(step);
+            } else {
+                warn!("Unrecognized line format in trajectory file: {}", trimmed);
             }
         }
 

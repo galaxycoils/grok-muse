@@ -71,51 +71,87 @@ impl ProactiveEngine {
 
         let mut candidate_notices = Vec::new();
 
-        // Process calendar events (upcoming in next 60 minutes)
+        // Process calendar events (upcoming in next 60 minutes or active)
         for event in events {
-            let starts_in_ms = event.start_time_ms.saturating_sub(now_ms);
-            let starts_in_mins = starts_in_ms / (60 * 1000);
+            if event.end_time_ms <= now_ms {
+                // Event already ended, skip
+                continue;
+            }
 
-            if starts_in_mins <= 60 {
-                let loc_str = event
-                    .location
-                    .as_deref()
-                    .map(|l| format!(" at {l}"))
-                    .unwrap_or_default();
-                let title = format!("Upcoming: {}", event.title);
-                let body = format!("Event starts in {starts_in_mins}m{loc_str}");
-                let is_urgent = starts_in_mins <= 15; // Urgent if starting in <= 15m
+            let loc_str = event
+                .location
+                .as_deref()
+                .map(|l| format!(" at {l}"))
+                .unwrap_or_default();
 
+            if event.start_time_ms <= now_ms {
+                // Currently in progress
+                let title = format!("Happening Now: {}", event.title);
+                let body = format!("Event in progress{loc_str}");
                 candidate_notices.push((
                     title,
                     body,
                     "calendar".to_string(),
-                    is_urgent,
+                    false,
                     format!("cal_{}_{}", event.id, event.start_time_ms),
                 ));
+            } else {
+                let starts_in_ms = event.start_time_ms - now_ms;
+                let starts_in_mins = starts_in_ms / (60 * 1000);
+
+                if starts_in_mins <= 60 {
+                    let title = format!("Upcoming: {}", event.title);
+                    let body = format!("Event starts in {starts_in_mins}m{loc_str}");
+                    let is_urgent = starts_in_mins <= 15; // Urgent if starting in <= 15m
+
+                    candidate_notices.push((
+                        title,
+                        body,
+                        "calendar".to_string(),
+                        is_urgent,
+                        format!("cal_{}_{}", event.id, event.start_time_ms),
+                    ));
+                }
             }
         }
 
         // Process reminders (overdue or due within 60 minutes)
         for reminder in reminders {
-            if let Some(due_ms) = reminder.due_date_ms
-                && due_ms <= now_ms
-            {
-                let title = format!("Overdue Reminder: {}", reminder.title);
-                let body = reminder
-                    .list_name
-                    .as_deref()
-                    .map(|l| format!("In list '{l}'"))
-                    .unwrap_or_else(|| "Reminder is overdue".into());
-                let is_urgent = reminder.priority <= 1; // High priority
+            if let Some(due_ms) = reminder.due_date_ms {
+                if due_ms <= now_ms {
+                    let title = format!("Overdue Reminder: {}", reminder.title);
+                    let body = reminder
+                        .list_name
+                        .as_deref()
+                        .map(|l| format!("In list '{l}'"))
+                        .unwrap_or_else(|| "Reminder is overdue".into());
+                    let is_urgent = reminder.priority <= 1; // High priority
 
-                candidate_notices.push((
-                    title,
-                    body,
-                    "reminders".to_string(),
-                    is_urgent,
-                    format!("rem_overdue_{due_ms}_{}", reminder.id),
-                ));
+                    candidate_notices.push((
+                        title,
+                        body,
+                        "reminders".to_string(),
+                        is_urgent,
+                        format!("rem_overdue_{due_ms}_{}", reminder.id),
+                    ));
+                } else if due_ms <= now_ms + (60 * 60 * 1000) {
+                    let due_in_mins = (due_ms - now_ms) / (60 * 1000);
+                    let title = format!("Upcoming Reminder: {}", reminder.title);
+                    let body = reminder
+                        .list_name
+                        .as_deref()
+                        .map(|l| format!("Due in {due_in_mins}m in '{l}'"))
+                        .unwrap_or_else(|| format!("Due in {due_in_mins}m"));
+                    let is_urgent = due_in_mins <= 15 || reminder.priority <= 1;
+
+                    candidate_notices.push((
+                        title,
+                        body,
+                        "reminders".to_string(),
+                        is_urgent,
+                        format!("rem_due_{due_ms}_{}", reminder.id),
+                    ));
+                }
             }
         }
 
@@ -149,7 +185,7 @@ impl ProactiveEngine {
                 .await?;
 
             if sent {
-                self.quiet_gate.record_delivery(&dedup_hash);
+                self.quiet_gate.record_delivery_at(&dedup_hash, now);
 
                 let notice = ProactiveNotice::new(title, body, topic, is_urgent);
                 self.notices_history.lock().push(notice.clone());
@@ -158,6 +194,21 @@ impl ProactiveEngine {
         }
 
         Ok(delivered)
+    }
+
+    /// Handle feedback actions on proactive notices with quiet gate semantics.
+    pub fn handle_notice_action(
+        &self,
+        notice_id: &str,
+        topic: &str,
+        dedup_hash: &str,
+        action: crate::quiet_gate::NoticeAction,
+        now: DateTime<Utc>,
+    ) {
+        self.quiet_gate
+            .handle_feedback(topic, dedup_hash, action, now);
+        let useful = !matches!(action, crate::quiet_gate::NoticeAction::Stop);
+        self.rate_notice(notice_id, useful);
     }
 
     /// Schedule automated EventKit patrol runs on the given interval (in seconds).
@@ -178,10 +229,18 @@ impl ProactiveEngine {
                     let now_ms = now.timestamp_millis() as u64;
                     let end_ms = now_ms + (24 * 3600 * 1000);
 
+                    // 1. Calendar
                     if let Ok(events) = p.get_calendar_events(now_ms, end_ms).await {
                         for ev in events {
+                            if ev.end_time_ms <= now_ms {
+                                continue;
+                            }
                             let dedup = format!("cal_{}_{}", ev.id, ev.start_time_ms);
-                            let is_urgent = ev.start_time_ms <= now_ms + 15 * 60 * 1000;
+                            let starts_in_ms = ev.start_time_ms.saturating_sub(now_ms);
+                            let is_urgent = starts_in_ms <= 15 * 60 * 1000;
+                            let starts_in_mins = starts_in_ms / (60 * 1000);
+                            let body = format!("Event starts in {starts_in_mins}m");
+
                             if gate.can_deliver("calendar", &dedup, is_urgent, now).0
                                 && budget.record_spend(0.001).is_ok()
                             {
@@ -189,16 +248,58 @@ impl ProactiveEngine {
                                     .send_notification(
                                         &format!("Upcoming: {}", ev.title),
                                         Some("Patrol"),
-                                        "Event starting soon",
+                                        &body,
                                     )
                                     .await;
-                                gate.record_delivery(&dedup);
+                                gate.record_delivery_at(&dedup, now);
                                 history.lock().push(ProactiveNotice::new(
-                                    ev.title,
-                                    "Event starting soon",
-                                    "calendar",
-                                    is_urgent,
+                                    ev.title, body, "calendar", is_urgent,
                                 ));
+                            }
+                        }
+                    }
+
+                    // 2. Reminders
+                    if let Ok(rems) = p.get_reminders(false).await {
+                        for rem in rems {
+                            if let Some(due_ms) = rem.due_date_ms {
+                                let (is_candidate, is_urgent, title, body, dedup) =
+                                    if due_ms <= now_ms {
+                                        (
+                                            true,
+                                            rem.priority <= 1,
+                                            format!("Overdue: {}", rem.title),
+                                            rem.list_name
+                                                .unwrap_or_else(|| "Reminder is overdue".into()),
+                                            format!("rem_overdue_{due_ms}_{}", rem.id),
+                                        )
+                                    } else if due_ms <= now_ms + (60 * 60 * 1000) {
+                                        let mins = (due_ms - now_ms) / (60 * 1000);
+                                        (
+                                            true,
+                                            mins <= 15 || rem.priority <= 1,
+                                            format!("Upcoming Reminder: {}", rem.title),
+                                            format!("Due in {mins}m"),
+                                            format!("rem_due_{due_ms}_{}", rem.id),
+                                        )
+                                    } else {
+                                        (false, false, String::new(), String::new(), String::new())
+                                    };
+
+                                if is_candidate
+                                    && gate.can_deliver("reminders", &dedup, is_urgent, now).0
+                                    && budget.record_spend(0.001).is_ok()
+                                {
+                                    let _ =
+                                        p.send_notification(&title, Some("Patrol"), &body).await;
+                                    gate.record_delivery_at(&dedup, now);
+                                    history.lock().push(ProactiveNotice::new(
+                                        title,
+                                        body,
+                                        "reminders",
+                                        is_urgent,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -324,5 +425,57 @@ mod tests {
             .await
             .expect("patrol quiet hours");
         assert_eq!(delivered.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_upcoming_reminders_and_notice_action() {
+        let mock_platform = Arc::new(MockPlatform::new());
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), budget);
+
+        let now = Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap();
+        let now_ms = now.timestamp_millis() as u64;
+
+        // Reminder due in 25 minutes
+        mock_platform.set_reminders(vec![ReminderItem {
+            id: "rem_upcoming".into(),
+            title: "Dentist Appointment".into(),
+            due_date_ms: Some(now_ms + 25 * 60 * 1000),
+            is_completed: false,
+            priority: 2,
+            list_name: Some("Personal".into()),
+        }]);
+
+        let delivered = engine
+            .patrol_calendar_and_reminders(&*mock_platform, 24, now)
+            .await
+            .expect("patrol upcoming");
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0]
+                .title
+                .contains("Upcoming Reminder: Dentist Appointment")
+        );
+
+        // Test user dismissing with Done action
+        let notice = &delivered[0];
+        let dedup_hash = format!("rem_due_{}_{}", now_ms + 25 * 60 * 1000, "rem_upcoming");
+        engine.handle_notice_action(
+            &notice.id,
+            "reminders",
+            &dedup_hash,
+            crate::quiet_gate::NoticeAction::Done,
+            now,
+        );
+
+        // Verify that notice was rated useful and subsequent patrol suppresses it permanently
+        let history = engine.get_history();
+        assert_eq!(history[0].useful_rating, Some(true));
+
+        let delivered_again = engine
+            .patrol_calendar_and_reminders(&*mock_platform, 24, now)
+            .await
+            .expect("patrol after done");
+        assert_eq!(delivered_again.len(), 0);
     }
 }

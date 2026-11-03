@@ -147,6 +147,9 @@ impl ComputerAction {
                 | ComputerAction::KeyCombo { .. }
                 | ComputerAction::Scroll { .. }
                 | ComputerAction::Drag { .. }
+                | ComputerAction::FocusApp { .. }
+                | ComputerAction::LaunchApp { .. }
+                | ComputerAction::Menu { .. }
         )
     }
 }
@@ -178,6 +181,10 @@ pub struct AxElementChange {
     pub new_label: Option<String>,
     pub old_value: Option<String>,
     pub new_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_changed: Option<(Rect, Rect)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_changed: Option<(bool, bool)>,
 }
 
 /// Computes the difference between pre-action and post-action accessibility tree snapshots.
@@ -199,13 +206,28 @@ pub fn compute_ax_diff(before: &AxSnapshot, after: &AxSnapshot) -> AxDiff {
 
     for (token, after_el) in &after_map {
         if let Some(before_el) = before_map.get(token) {
-            if before_el.label != after_el.label || before_el.value != after_el.value {
+            let label_changed = before_el.label != after_el.label;
+            let value_changed = before_el.value != after_el.value;
+            let frame_diff = if before_el.frame != after_el.frame {
+                Some((before_el.frame, after_el.frame))
+            } else {
+                None
+            };
+            let enabled_diff = if before_el.is_enabled != after_el.is_enabled {
+                Some((before_el.is_enabled, after_el.is_enabled))
+            } else {
+                None
+            };
+
+            if label_changed || value_changed || frame_diff.is_some() || enabled_diff.is_some() {
                 changed_elements.push(AxElementChange {
                     token: token.to_string(),
                     old_label: before_el.label.clone(),
                     new_label: after_el.label.clone(),
                     old_value: before_el.value.clone(),
                     new_value: after_el.value.clone(),
+                    frame_changed: frame_diff,
+                    enabled_changed: enabled_diff,
                 });
             }
         } else {

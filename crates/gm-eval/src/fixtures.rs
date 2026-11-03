@@ -137,17 +137,27 @@ pub fn get_standard_eval_fixtures() -> Vec<EvalFixture> {
             )
         } else {
             // Multi-step offline replay: Step 1 = AX Click, Step 2 = Done
+            let mut post_snapshot = initial_snapshot.clone();
+            for el in &mut post_snapshot.elements {
+                if el.token == "action_target" {
+                    el.value = Some("clicked".into());
+                } else if el.token == "status_label" {
+                    el.label = Some("Processing".into());
+                    el.value = Some("Processing".into());
+                }
+            }
+
             let step1 = EvalFixtureStep {
-                    step_index: 1,
-                    model_response: "{\"action\":\"Click\",\"params\":{\"token\":\"action_target\",\"coords\":null,\"button\":null,\"click_count\":null}}".to_string(),
-                    expected_action: ComputerAction::Click {
-                        token: Some("action_target".into()),
-                        coords: None,
-                        button: None,
-                        click_count: None,
-                    },
-                    post_snapshot: Some(initial_snapshot.clone()),
-                };
+                step_index: 1,
+                model_response: "{\"action\":\"Click\",\"params\":{\"token\":\"action_target\",\"coords\":null,\"button\":null,\"click_count\":null}}".to_string(),
+                expected_action: ComputerAction::Click {
+                    token: Some("action_target".into()),
+                    coords: None,
+                    button: None,
+                    click_count: None,
+                },
+                post_snapshot: Some(post_snapshot),
+            };
 
             let step2 = EvalFixtureStep {
                 step_index: 2,

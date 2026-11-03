@@ -704,6 +704,7 @@ dependencies = [
 name = "gm-daemon"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "gm-agent",
  "gm-core",
