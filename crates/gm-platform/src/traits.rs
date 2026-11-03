@@ -1,0 +1,28 @@
+use async_trait::async_trait;
+use gm_core::error::Result;
+use gm_core::types::{AxSnapshot, ComputerAction, FrameCapture, PermissionStatus, UserActivity};
+
+#[async_trait]
+pub trait Platform: Send + Sync {
+    /// Retrieve current OS accessibility/screen recording permissions.
+    async fn permissions(&self) -> Result<PermissionStatus>;
+
+    /// Retrieve user idle/activity metrics.
+    async fn user_activity(&self) -> Result<UserActivity>;
+
+    /// Capture latest screen frame.
+    async fn capture(
+        &self,
+        max_long_edge: Option<u32>,
+        quality: Option<u8>,
+    ) -> Result<FrameCapture>;
+
+    /// Snapshot frontmost window accessibility tree.
+    async fn ax_snapshot(&self, window_id: Option<u32>) -> Result<AxSnapshot>;
+
+    /// Dispatch computer action.
+    async fn act(&self, action: &ComputerAction) -> Result<()>;
+
+    /// Emergency cancellation of active/pending actions.
+    async fn cancel(&self) -> Result<()>;
+}

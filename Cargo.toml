@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gm-core",
+    "crates/gm-platform",
+    "crates/gm-cu-helper",
+    "crates/gm-llm",
+    "crates/gm-safety",
+    "crates/gm-memory",
+    "crates/gm-goals",
+    "crates/gm-agent",
+    "crates/gm-daemon",
+    "crates/gm-ui",
+    "crates/gm-eval",
+    "xtask",
+]
+exclude = ["target"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Grok-Muse Contributors"]
+description = "Grok-Muse Hybrid Agent: fast computer-use + proactive personal agent"
+
+[workspace.dependencies]
+# Internal crates
+gm-core = { path = "crates/gm-core" }
+gm-platform = { path = "crates/gm-platform" }
+gm-safety = { path = "crates/gm-safety" }
+gm-memory = { path = "crates/gm-memory" }
+gm-llm = { path = "crates/gm-llm" }
+gm-goals = { path = "crates/gm-goals" }
+gm-agent = { path = "crates/gm-agent" }
+
+# Darius path dependencies
+darius-core = { path = "../Darius/crates/darius-core" }
+darius-safety = { path = "../Darius/crates/darius-safety" }
+darius-memory = { path = "../Darius/crates/darius-memory" }
+darius-daemon = { path = "../Darius/crates/darius-daemon" }
+darius-tools = { path = "../Darius/crates/darius-tools" }
+
+# Shared external dependencies
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+futures = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }

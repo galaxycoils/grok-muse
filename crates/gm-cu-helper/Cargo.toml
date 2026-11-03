@@ -1,0 +1,22 @@
+[package]
+name = "gm-cu-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gm-cu-helper"
+path = "src/main.rs"
+
+[dependencies]
+gm-core = { workspace = true }
+gm-platform = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS native bindings can be added here or via objc2

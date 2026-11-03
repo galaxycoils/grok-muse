@@ -1,0 +1,25 @@
+[package]
+name = "gm-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gm-daemon"
+path = "src/main.rs"
+
+[dependencies]
+gm-core = { workspace = true }
+gm-platform = { workspace = true }
+gm-llm = { workspace = true }
+gm-safety = { workspace = true }
+gm-memory = { workspace = true }
+gm-goals = { workspace = true }
+gm-agent = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }

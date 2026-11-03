@@ -1,0 +1,19 @@
+[package]
+name = "gm-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gm-core = { workspace = true }
+darius-daemon = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
