@@ -1,4 +1,6 @@
 use crate::dogfood::DogfoodTracker;
+use crate::feed::{FeedItem, build_feed};
+use crate::ideas::{ProactiveIdea, generate_ideas};
 use crate::nightly_review::{NightlyReviewSummary, run_nightly_review};
 use crate::notice::ProactiveNotice;
 use crate::quiet_gate::{QuietGate, QuietGateConfig};
@@ -6,7 +8,9 @@ use crate::scheduler::ProactiveScheduler;
 use chrono::{DateTime, Utc};
 use gm_core::error::Result;
 use gm_llm::BudgetManager;
+use gm_memory::{MemoryUpkeepReport, PersonalMemoryStore, UpkeepConfig};
 use gm_platform::Platform;
+use gm_safety::AuditLogger;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -79,6 +83,51 @@ impl ProactiveEngine {
         } else {
             false
         }
+    }
+
+    /// Executes periodic memory upkeep: deduplicating facts, clustering related knowledge,
+    /// and expiring stale transient observations.
+    pub async fn run_memory_upkeep(
+        &self,
+        memory: &PersonalMemoryStore,
+        config: Option<&UpkeepConfig>,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryUpkeepReport> {
+        let default_config = UpkeepConfig::default();
+        let cfg = config.unwrap_or(&default_config);
+        info!("Executing ProactiveEngine memory upkeep...");
+        let report = memory.perform_upkeep(cfg, now)?;
+        info!(
+            "Memory upkeep complete: {} records scanned, {} duplicates removed, {} clusters formed, {} stale expired",
+            report.records_scanned,
+            report.duplicates_removed,
+            report.clusters_formed,
+            report.stale_expired
+        );
+        Ok(report)
+    }
+
+    /// Aggregates recent personal memory observations, proactive patrol insights, and completed tasks
+    /// into a unified chronological feed stream.
+    pub fn get_feed(
+        &self,
+        memory: &PersonalMemoryStore,
+        audit: &AuditLogger,
+        limit: usize,
+    ) -> Result<Vec<FeedItem>> {
+        let history = self.get_history();
+        build_feed(memory, &history, audit, limit)
+    }
+
+    /// Synthesizes proactive recommendations derived from calendar context, unread email threads,
+    /// pending reminders, and personal memory facts.
+    pub async fn generate_ideas<P: Platform>(
+        &self,
+        platform: Option<&P>,
+        memory: &PersonalMemoryStore,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ProactiveIdea>> {
+        generate_ideas(platform, memory, now).await
     }
 
     /// Evaluates calendar and reminder state via EventKit, generates candidate notices,
@@ -800,5 +849,118 @@ mod tests {
         // Verify that nightly review was persisted in memory store
         let search_results = memory.search("Nightly Review", 5).unwrap();
         assert!(!search_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_memory_upkeep() {
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), budget);
+
+        let memory = PersonalMemoryStore::in_memory().unwrap();
+        let now = Utc::now();
+
+        // Add 2 duplicate facts and 1 distinct fact
+        memory
+            .record_fact(
+                Some("Preference A"),
+                "User prefers standing desk in morning",
+                &["health"],
+            )
+            .unwrap();
+        memory
+            .record_fact(
+                Some("Preference A duplicate"),
+                "User prefers standing desk in morning.",
+                &["health", "workspace"],
+            )
+            .unwrap();
+        memory
+            .record_fact(
+                Some("Health reminder"),
+                "User drinks 2L of water daily",
+                &["health"],
+            )
+            .unwrap();
+
+        let report = engine
+            .run_memory_upkeep(&memory, None, now)
+            .await
+            .expect("memory upkeep");
+
+        assert_eq!(report.records_scanned, 3);
+        assert_eq!(report.duplicates_removed, 1);
+        assert!(report.clusters_formed >= 1);
+        assert_eq!(report.total_records_retained, 2);
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_feed_and_ideas() {
+        use gm_core::types::CalendarItem;
+
+        let mock_platform = Arc::new(MockPlatform::new());
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), budget);
+
+        let memory = PersonalMemoryStore::in_memory().unwrap();
+        let audit = AuditLogger::in_memory();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis() as u64;
+
+        // Add calendar events with a gap
+        mock_platform.set_calendar_events(vec![
+            CalendarItem {
+                id: "c1".into(),
+                title: "Planning".into(),
+                start_time_ms: now_ms + (10 * 60 * 1000),
+                end_time_ms: now_ms + (40 * 60 * 1000),
+                location: None,
+                notes: None,
+                is_all_day: false,
+            },
+            CalendarItem {
+                id: "c2".into(),
+                title: "Review".into(),
+                start_time_ms: now_ms + (200 * 60 * 1000), // 160 min gap
+                end_time_ms: now_ms + (230 * 60 * 1000),
+                location: None,
+                notes: None,
+                is_all_day: false,
+            },
+        ]);
+
+        memory
+            .record_fact(
+                Some("Sprint goal"),
+                "Complete Phase v3 extensions",
+                &["project"],
+            )
+            .unwrap();
+
+        audit.log(
+            "task_done",
+            None,
+            None,
+            None,
+            None,
+            Some("Evaluated 25 tasks".into()),
+            serde_json::json!({ "instruction": "Run eval" }),
+        );
+
+        // Test feed
+        let feed = engine.get_feed(&memory, &audit, 10).expect("feed");
+        assert_eq!(feed.len(), 2);
+        assert!(feed.iter().any(|item| item.title.contains("Sprint goal")));
+        assert!(
+            feed.iter()
+                .any(|item| item.title.contains("Evaluated 25 tasks"))
+        );
+
+        // Test ideas
+        let ideas = engine
+            .generate_ideas(Some(&*mock_platform), &memory, now)
+            .await
+            .expect("ideas");
+        assert!(!ideas.is_empty());
+        assert!(ideas.iter().any(|i| i.title.contains("Deep Work")));
     }
 }

@@ -4,7 +4,7 @@ use gm_core::types::{ComputerAction, compute_ax_diff};
 use gm_llm::{ChatMessage, HybridLlmClient, LlmRouter, TaskType};
 use gm_platform::Platform;
 use gm_safety::{
-    ActionTier, BlocklistManager, KillSwitch, UntrustedData, format_untrusted_context,
+    ActionTier, AuditLogger, BlocklistManager, KillSwitch, UntrustedData, format_untrusted_context,
     sanitize_ax_snapshot,
 };
 use std::path::PathBuf;
@@ -40,6 +40,23 @@ pub struct AgentLoop<P: Platform> {
     kill_switch: KillSwitch,
     blocklist: BlocklistManager,
     config: AgentLoopConfig,
+    audit: Option<Arc<AuditLogger>>,
+}
+
+fn action_type_name(action: &ComputerAction) -> &'static str {
+    match action {
+        ComputerAction::Click { .. } => "Click",
+        ComputerAction::Type { .. } => "Type",
+        ComputerAction::KeyCombo { .. } => "KeyCombo",
+        ComputerAction::Scroll { .. } => "Scroll",
+        ComputerAction::Drag { .. } => "Drag",
+        ComputerAction::Menu { .. } => "Menu",
+        ComputerAction::FocusApp { .. } => "FocusApp",
+        ComputerAction::LaunchApp { .. } => "LaunchApp",
+        ComputerAction::Wait { .. } => "Wait",
+        ComputerAction::Done { .. } => "Done",
+        ComputerAction::AskUser { .. } => "AskUser",
+    }
 }
 
 impl<P: Platform> AgentLoop<P> {
@@ -58,10 +75,61 @@ impl<P: Platform> AgentLoop<P> {
             kill_switch,
             blocklist,
             config,
+            audit: None,
         }
     }
 
+    pub fn with_audit(mut self, audit: Arc<AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
     pub async fn run_task(&self, task_id: &str, instruction: &str) -> Result<String> {
+        if let Some(audit) = &self.audit {
+            audit.log(
+                "task_start",
+                None,
+                None,
+                None,
+                None,
+                Some(instruction.to_string()),
+                serde_json::json!({ "task_id": task_id, "instruction": instruction }),
+            );
+        }
+
+        let res = self.run_task_loop(task_id, instruction).await;
+        match &res {
+            Ok(summary) => {
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "task_done",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(summary.clone()),
+                        serde_json::json!({ "task_id": task_id, "instruction": instruction }),
+                    );
+                }
+            }
+            Err(e) => {
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "task_failed",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(format!("{e}")),
+                        serde_json::json!({ "task_id": task_id, "instruction": instruction }),
+                    );
+                }
+            }
+        }
+        res
+    }
+
+    async fn run_task_loop(&self, task_id: &str, instruction: &str) -> Result<String> {
         let recorder = if let Some(ref dir) = self.config.trajectory_dir {
             TrajectoryRecorder::with_directory(task_id, instruction, dir.clone())
         } else {
@@ -79,6 +147,17 @@ impl<P: Platform> AgentLoop<P> {
             // 1. Kill switch check (<100ms requirement)
             if self.kill_switch.is_triggered() {
                 warn!("Agent loop halted by kill switch!");
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "kill_switch",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("Execution stopped by Kill Switch".into()),
+                        serde_json::json!({ "task_id": task_id, "step": step }),
+                    );
+                }
                 self.platform.cancel().await?;
                 return Err(GmError::SafetyViolation(
                     "Execution stopped by Kill Switch".into(),
@@ -100,6 +179,24 @@ impl<P: Platform> AgentLoop<P> {
                 .blocklist
                 .is_blocked(&raw_snapshot.app_name, &raw_snapshot.window_title)
             {
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "safety_intercept",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(format!(
+                            "Active app '{}' is blocklisted for safety",
+                            raw_snapshot.app_name
+                        )),
+                        serde_json::json!({
+                            "blocklist": true,
+                            "app": raw_snapshot.app_name,
+                            "tier": "Irreversible"
+                        }),
+                    );
+                }
                 return Err(GmError::SafetyViolation(format!(
                     "Active app '{}' is blocklisted for safety",
                     raw_snapshot.app_name
@@ -139,6 +236,19 @@ impl<P: Platform> AgentLoop<P> {
                 .llm
                 .execute_routed(&primary, fallback.as_ref(), &messages)
                 .await?;
+
+            if let Some(audit) = &self.audit {
+                let total_tokens = (response.prompt_tokens + response.completion_tokens) as u32;
+                audit.log(
+                    "model_call",
+                    Some(format!("{:?}", primary.provider).to_lowercase()),
+                    Some(primary.model.clone()),
+                    Some(total_tokens),
+                    Some(response.estimated_cost_usd),
+                    None,
+                    serde_json::json!({ "task_id": task_id, "step": step }),
+                );
+            }
 
             // Parse action
             let action: ComputerAction = match serde_json::from_str(&response.content) {
@@ -202,6 +312,23 @@ impl<P: Platform> AgentLoop<P> {
                     "Irreversible action {:?} requires explicit user approval",
                     action
                 );
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "safety_intercept",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(format!(
+                            "Irreversible action '{action:?}' requires user confirmation"
+                        )),
+                        serde_json::json!({
+                            "action_type": action_type_name(&action),
+                            "tier": "Irreversible",
+                            "blocklist": false,
+                        }),
+                    );
+                }
                 return Err(GmError::SafetyViolation(format!(
                     "Irreversible action '{action:?}' requires user confirmation"
                 )));
@@ -264,6 +391,20 @@ impl<P: Platform> AgentLoop<P> {
                     return Ok(question.clone());
                 }
                 other => {
+                    if let Some(audit) = &self.audit {
+                        audit.log(
+                            "cu_action",
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(format!("{other:?}")),
+                            serde_json::json!({
+                                "action_type": action_type_name(other),
+                                "tier": format!("{tier:?}"),
+                            }),
+                        );
+                    }
                     self.platform.act(other).await?;
 
                     // 13. Verify-after-act: capture post-action snapshot and compute diff
@@ -524,5 +665,39 @@ mod tests {
         let msg = res.unwrap();
         assert!(msg.contains("produced no observable UI changes"));
         assert!(msg.contains("How should I proceed?"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_with_audit_logging() {
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        mock_backend.set_response(
+            "{\"action\":\"Done\",\"params\":{\"summary\":\"Task finished successfully\"}}",
+        );
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+        let audit = Arc::new(AuditLogger::in_memory());
+
+        let agent = AgentLoop::new(
+            platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_audit(audit.clone());
+
+        let res = agent.run_task("test_audit_task", "Test instruction").await;
+        assert!(res.is_ok());
+
+        let entries = audit.entries();
+        assert!(entries.iter().any(|e| e.event_type == "task_start"));
+        assert!(entries.iter().any(|e| e.event_type == "model_call"));
+        assert!(entries.iter().any(|e| e.event_type == "task_done"));
     }
 }

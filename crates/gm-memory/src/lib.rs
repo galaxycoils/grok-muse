@@ -1,3 +1,6 @@
+pub mod upkeep;
+pub use upkeep::*;
+
 pub use darius_memory::{MemoryEngine, NewRecord, Record, RecordKind, SearchQuery};
 use gm_core::error::{GmError, Result};
 use parking_lot::Mutex;
@@ -68,6 +71,56 @@ impl PersonalMemoryStore {
             .map_err(|e| GmError::Platform(e.to_string()))
     }
 
+    pub fn record_observation(
+        &self,
+        title: Option<&str>,
+        body: &str,
+        tags: &[&str],
+        importance: f32,
+    ) -> Result<Record> {
+        let rec = NewRecord {
+            kind: RecordKind::Episode,
+            title: title.map(|s| s.to_string()),
+            body: body.to_string(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            importance,
+            source: Some("observation".into()),
+        };
+        self.engine
+            .lock()
+            .upsert(rec)
+            .map_err(|e| GmError::Platform(e.to_string()))
+    }
+
+    pub fn delete_record(&self, id: &str) -> Result<bool> {
+        self.engine
+            .lock()
+            .delete(id)
+            .map_err(|e| GmError::Platform(e.to_string()))
+    }
+
+    pub fn update_tags(&self, id: &str, tags: &[String]) -> Result<bool> {
+        self.engine
+            .lock()
+            .update_tags(id, tags)
+            .map_err(|e| GmError::Platform(e.to_string()))
+    }
+
+    pub fn all_records(&self, limit: usize) -> Result<Vec<Record>> {
+        self.engine
+            .lock()
+            .all_records(limit)
+            .map_err(|e| GmError::Platform(e.to_string()))
+    }
+
+    pub fn perform_upkeep(
+        &self,
+        config: &UpkeepConfig,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MemoryUpkeepReport> {
+        run_memory_upkeep(self, config, now)
+    }
+
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Record>> {
         let text = if query_str.trim().is_empty() {
             None
@@ -89,6 +142,7 @@ impl PersonalMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn test_personal_memory() {
@@ -134,5 +188,101 @@ mod tests {
         assert!(results[0].body.contains("Grok-Muse v2 enhancements"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_memory_upkeep_deduplication_and_clustering() {
+        let mem = PersonalMemoryStore::in_memory().unwrap();
+        let now = Utc::now();
+
+        // 1. Insert duplicate facts with slightly different wording / same core
+        mem.record_fact(
+            Some("User Focus"),
+            "User prefers quiet work mornings before 11 AM",
+            &["focus", "schedule"],
+        )
+        .unwrap();
+
+        mem.record_fact(
+            Some("Focus Time"),
+            "User prefers quiet work mornings before 11 AM.",
+            &["focus", "productivity"],
+        )
+        .unwrap();
+
+        // 2. Insert related records sharing the 'project' theme
+        mem.record_fact(
+            Some("Project Alpha Roadmap"),
+            "Project Alpha milestone 1 scheduled for next Friday",
+            &["project", "alpha"],
+        )
+        .unwrap();
+
+        mem.record_fact(
+            Some("Project Alpha Tech Stack"),
+            "Project Alpha backend is built in Rust with async tokio",
+            &["project", "alpha", "rust"],
+        )
+        .unwrap();
+
+        // 3. Perform upkeep
+        let report = mem.perform_upkeep(&UpkeepConfig::default(), now).unwrap();
+
+        assert_eq!(report.records_scanned, 4);
+        assert_eq!(report.duplicates_removed, 1);
+        assert!(report.clusters_formed >= 1);
+        assert_eq!(report.total_records_retained, 3);
+
+        // Verify remaining focus record merged the tags
+        let focus_records = mem.search("quiet work mornings", 5).unwrap();
+        assert_eq!(focus_records.len(), 1);
+        let tags = &focus_records[0].tags;
+        assert!(tags.iter().any(|t| t == "productivity"));
+        assert!(tags.iter().any(|t| t == "schedule"));
+
+        let formatted = report.format_summary();
+        assert!(formatted.contains("Duplicate Facts Removed:  1"));
+        assert!(formatted.contains("Active Knowledge Clusters"));
+    }
+
+    #[test]
+    fn test_memory_upkeep_stale_observation_expiry() {
+        let mem = PersonalMemoryStore::in_memory().unwrap();
+
+        // Record a low-importance observation
+        let obs = mem
+            .record_observation(
+                Some("Window Check"),
+                "User had Safari open at tab 3",
+                &["observation", "transient"],
+                0.2,
+            )
+            .unwrap();
+
+        // Record a high-importance fact
+        mem.record_fact(
+            Some("Important Key"),
+            "Production server is accessible via VPN",
+            &["security"],
+        )
+        .unwrap();
+
+        // Upkeep with current time (not expired yet)
+        let report_now = mem
+            .perform_upkeep(&UpkeepConfig::default(), Utc::now())
+            .unwrap();
+        assert_eq!(report_now.stale_expired, 0);
+
+        // Advance simulated time by 20 days (beyond 14 days threshold)
+        let future_time = Utc::now() + Duration::days(20);
+        let report_future = mem
+            .perform_upkeep(&UpkeepConfig::default(), future_time)
+            .unwrap();
+
+        assert_eq!(report_future.stale_expired, 1);
+        let remaining = mem.all_records(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].id, obs.id);
+        assert_eq!(remaining[0].title.as_deref(), Some("Important Key"));
     }
 }

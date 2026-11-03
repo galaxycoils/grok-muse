@@ -1,7 +1,9 @@
 pub mod dogfood;
 pub mod engine;
+pub mod feed;
 pub mod followup;
 pub mod goal;
+pub mod ideas;
 pub mod nightly_review;
 pub mod notice;
 pub mod quiet_gate;
@@ -9,8 +11,10 @@ pub mod scheduler;
 
 pub use dogfood::*;
 pub use engine::*;
+pub use feed::*;
 pub use followup::*;
 pub use goal::*;
+pub use ideas::*;
 pub use nightly_review::*;
 pub use notice::*;
 pub use quiet_gate::*;

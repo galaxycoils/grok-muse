@@ -1,30 +1,280 @@
 # Grok-Muse Hybrid Agent
 
-Fast computer-use + proactive personal agent for macOS.
+> **Fast computer-use + proactive personal agent for macOS.**  
+> Built in Rust with native macOS ScreenCaptureKit, Accessibility APIs, CoreGraphics, EventKit, and hybrid LLM routing (Meta Muse + xAI Grok).
 
-## Architecture
+---
 
-- **`gm-core`**: Core domain types, IPC protocol definitions, configuration.
-- **`gm-platform`**: `Platform` trait (`capture`, `ax_snapshot`, `act`, `windows`, `user_idle`, `permissions`), macOS backend, and mock implementation.
-- **`gm-cu-helper`**: Native macOS helper daemon holding TCC privileges (Screen Recording, Accessibility) implementing `Platform` over Unix domain socket IPC.
-- **`gm-llm`**: OpenAI-compatible client, hybrid routing (Meta Muse + xAI Grok), spend budgets, failover.
-- **`gm-safety`**: Approval tiers, emergency kill-switch, untrusted data separation, redaction, audit logging.
-- **`gm-memory`**: Proactive agent memory, SQLite FTS integration.
-- **`gm-goals`**: Goal engine, follow-up tracker, quiet gate, cron scheduler.
-- **`gm-agent`**: Multi-step computer-use loop, verify-after-act, trajectory recorder.
-- **`gm-daemon`**: Unprivileged central background daemon.
-- **`gm-ui`**: Desktop shell (tray, global hotkeys, action overlay, interactive chat).
-- **`gm-eval`**: 25-task macOS evaluation harness and offline record/replay fixtures.
-- **`xtask`**: Workspace build tasks, codesigning, notarization, benchmark gates.
+## 📑 Table of Contents
+1. [Goal State & Metrics (G1–G8)](#goal-state--metrics-g1g8)
+2. [System Architecture](#system-architecture)
+3. [Workspace Crates](#workspace-crates)
+4. [Installation & Packaging (DMG)](#installation--packaging-dmg)
+5. [LaunchAgent Service Management](#launchagent-service-management)
+6. [macOS Onboarding & Permissions](#macos-onboarding--permissions)
+7. [Keychain Secret Management](#keychain-secret-management)
+8. [CLI Command Reference](#cli-command-reference)
+9. [Proactive Engine & Quiet Gate](#proactive-engine--quiet-gate)
+10. [Memory Upkeep Engine](#memory-upkeep-engine)
+11. [Desktop Shell & Keyboard Shortcuts](#desktop-shell--keyboard-shortcuts)
+12. [Benchmarking & Evaluation (`xtask`)](#benchmarking--evaluation-xtask)
+13. [Continuous Integration (CI)](#continuous-integration-ci)
 
-## Development
+---
+
+## Goal State & Metrics (G1–G8)
+
+| Metric | Target | Description & Measurement |
+|---|---|---|
+| **G1 Native** | Zero Electron/Chromium | Signed App Bundle = daemon + CU helper (`.app`) + native AppKit UI (`gm-ui`). |
+| **G2 Footprint** | `< 50 MB` idle RSS | Whole process tree idle RSS measured via `footprint`/`ps` (< 120 MB with UI open). |
+| **G3 Hot Path** | `< 2 ms` capture, `< 30 ms` AX | ScreenCaptureKit frame fetch < 2ms, AX snapshot < 30ms, JPEG q=70 < 15ms, action dispatch < 5ms. |
+| **G4 Agent Step** | `< 1.5 s` median | Fast route median step latency including routed model inference. |
+| **G5 Quality** | `≥ 70%` success, **0** unconfirmed | 25-task macOS eval suite (Finder, Safari, Notes, Mail, Settings, Electron, Canvas). |
+| **G6 Proactive** | `≥ 80%` useful, `≤ 3`/day | Dogfood precision rating, daily notification cap, daily spend cap ($0.50). |
+| **G7 Safety** | Approval tiers, `< 100 ms` kill | Read / Reversible / Irreversible tiers, untrusted screen text, password redaction, append-only audit. |
+| **G8 Routing** | Hybrid router & failover | Muse Spark / Wonder + Grok 4.x Vision behind single OpenAI-compatible interface with budget enforcement. |
+
+---
+
+## System Architecture
+
+```text
+ ┌─────────────────────────────────────────────────────────────┐
+ │           gm-ui: AppKit Desktop Shell (Tray & UI)           │
+ │      • Status Item Tray Menu     • Floating Action Overlay  │
+ │      • Floating Chat Window      • Global Hotkey Monitors   │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ UDS JSON-RPC (/tmp/grok-muse.sock)
+ ┌──────────────────────────────▼──────────────────────────────┐
+ │                  gm-daemon (Unprivileged)                   │
+ │   ┌─────────────────┐ ┌────────────────┐ ┌────────────────┐ │
+ │   │ Agent Loop      │ │ Proactive      │ │ LLM Router     │ │
+ │   │ • Verify/Retry  │ │ • Quiet Gate   │ │ • Muse Spark   │ │
+ │   │ • Trajectories  │ │ • Dogfood Log  │ │ • Grok 4.x     │ │
+ │   └────────┬────────┘ └───────┬────────┘ └────────┬───────┘ │
+ │            │                  │                   │         │
+ │   ┌────────▼────────┐ ┌───────▼────────┐ ┌────────▼───────┐ │
+ │   │ Personal Memory │ │ Audit Logger   │ │ Budget Manager │ │
+ │   │ (SQLite FTS5)   │ │ (audit.jsonl)  │ │ (Job/Day Caps) │ │
+ │   └─────────────────┘ └────────────────┘ └────────────────┘ │
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ UDS JSON-RPC (/tmp/grok-muse-helper.sock)
+ ┌──────────────────────────────▼──────────────────────────────┐
+ │       GrokMuseCUHelper.app (Privileged, Signed Bundle)      │
+ │      • ScreenCaptureKit: Zero-copy in-memory/file frame     │
+ │      • Accessibility (AXUIElement): Window tree & tokens    │
+ │      • Input (CGEvent / AXPress): Low-latency action dispatch│
+ │      • EventKit: Native Calendar events & Reminders         │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Workspace Crates
+
+- **[`crates/gm-core`](crates/gm-core)**: Shared domain types (`AxSnapshot`, `ComputerAction`, `MailItem`, `CalendarItem`), IPC protocol, config schemas.
+- **[`crates/gm-platform`](crates/gm-platform)**: `Platform` trait (`capture`, `ax_snapshot`, `act`, `windows`, `user_idle`, `permissions`), native `MacPlatform`, and offline `MockPlatform`.
+- **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Privileged macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
+- **[`crates/gm-llm`](crates/gm-llm)**: OpenAI-compatible wire client, provider router (Meta Muse + xAI Grok), budget governor, Keychain secret integration.
+- **[`crates/gm-safety`](crates/gm-safety)**: Approval tier classifier, emergency kill switch, secure text field redaction, blocklist manager, append-only `AuditLogger`, weekly/monthly report synthesis.
+- **[`crates/gm-memory`](crates/gm-memory)**: SQLite FTS memory store, deduplication, knowledge clustering, and stale observation pruning.
+- **[`crates/gm-goals`](crates/gm-goals)**: Goal state machine, proactive scheduler, quiet gate, calendar/mail patrol, nightly review, feed stream, and ideas generator.
+- **[`crates/gm-agent`](crates/gm-agent)**: Autonomous computer-use loop, verify-after-act diffing, user-coexistence detection, trajectory recorder.
+- **[`crates/gm-daemon`](crates/gm-daemon)**: Unprivileged background daemon and primary CLI library.
+- **[`crates/gm-ui`](crates/gm-ui)**: AppKit desktop shell (tray, floating windows, action overlay, global hotkeys).
+- **[`crates/gm-eval`](crates/gm-eval)**: 25-task macOS evaluation runner and deterministic offline replay fixtures.
+- **[`xtask`](xtask)**: Release packaging (`.dmg`), hardened runtime signing, and automated benchmark gates.
+
+---
+
+## Installation & Packaging (DMG)
+
+### Building the DMG
+```bash
+# Build binaries, bundle .app packages, codesign, and create target/dist/Grok-Muse.dmg
+cargo run --package xtask -- dmg
+```
+
+### Installing on macOS
+1. Open `target/dist/Grok-Muse.dmg`.
+2. Drag `GrokMuse.app` to `/Applications`.
+3. Launch `Grok-Muse` or run the CLI onboarding:
+   ```bash
+   gm onboard
+   ```
+4. Follow the interactive prompts to grant required permissions in **macOS System Settings**.
+
+---
+
+## LaunchAgent Service Management
+
+Grok-Muse registers separate LaunchAgents for `gm-daemon` and `gm-cu-helper` to maintain independent lifecycles without requiring persistent Terminal windows:
 
 ```bash
-# Check all crates
-cargo check --workspace
+# Install and bootstrap user LaunchAgents
+gm service install
 
-# Run tests
-cargo test --workspace
-# or
-cargo nextest run
+# Check LaunchAgent registration and active PID status
+gm service status
+
+# Uninstall and stop LaunchAgents
+gm service uninstall
 ```
+
+Plists are installed in `~/Library/LaunchAgents/`:
+- `co.anysphere.grok-muse.daemon.plist`
+- `co.anysphere.grok-muse.helper.plist`
+
+---
+
+## macOS Onboarding & Permissions
+
+Grok-Muse provides automated inspection and deep links into macOS System Settings for all required privacy permissions:
+
+```bash
+# Check all permissions and print live status table
+gm permissions
+
+# Output permission status as JSON
+gm permissions --json
+
+# Automatically open System Settings for any missing permissions
+gm permissions --open-missing
+
+# Open a specific privacy pane
+gm permissions --open screen          # Screen Recording
+gm permissions --open accessibility   # Accessibility (AX)
+gm permissions --open calendar        # Calendars
+gm permissions --open reminders       # Reminders
+```
+
+---
+
+## Keychain Secret Management
+
+API keys for Meta Model API (Muse) and xAI API (Grok) are stored securely in the native **macOS Keychain** (`kSecClassGenericPassword`), avoiding plaintext keys in config files:
+
+- **Service Name:** `grok-muse`
+- **Account Names:** `meta_api_key`, `xai_api_key`
+
+### Adding Secrets via macOS CLI
+```bash
+# Store Meta Muse API key
+security add-generic-password -s "grok-muse" -a "meta_api_key" -w "your-meta-key" -U
+
+# Store xAI Grok API key
+security add-generic-password -s "grok-muse" -a "xai_api_key" -w "your-xai-key" -U
+```
+
+### Environment Fallbacks (CI / Headless)
+If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse automatically falls back to environment variables:
+- `GROK_MUSE_META_KEY` or `META_API_KEY`
+- `GROK_MUSE_XAI_KEY` or `XAI_API_KEY`
+
+---
+
+## CLI Command Reference
+
+| Command | Arguments | Description |
+|---|---|---|
+| `gm do` | `"<instruction>"` | Execute an autonomous computer-use task via AX and visual fallback. |
+| `gm daemon` | `[--config <path>]` | Start the background orchestrator and proactive scheduler. |
+| `gm status` | — | Display system health, IPC connectivity, and TCC permissions. |
+| `gm kill` | — | Trigger the emergency kill switch (< 100 ms halt). |
+| `gm permissions` | `[--open-missing] [--open <pane>] [--json]` | Inspect and request macOS TCC privacy permissions. |
+| `gm onboard` | `[--check-only]` | First-run onboarding verification and setup. |
+| `gm service` | `<install\|status\|uninstall>` | Manage LaunchAgent background services. |
+| `gm dogfood` | `summary \| rate \| feedback` | Proactive notice rating and G6 dogfood gate tracking. |
+| `gm stats` | `[--json]` | Output unified health, permissions, and metrics. |
+| `gm review` | `[--date YYYY-MM-DD]` | Synthesize structured nightly review markdown. |
+| `gm audit` | `[--period <weekly\|monthly>] [--json]` | Synthesize safety compliance, spend by provider, CU actions, and task success. |
+| `gm upkeep` | `[--stale-days <N>] [--json]` | Run memory upkeep (deduplicate facts, cluster topics, expire stale observations). |
+| `gm feed` | `[--limit <N>] [--json]` | Terminal timeline stream of recent observations, patrol insights, and tasks. |
+| `gm ideas` | `[--json]` | Proactive recommendations from calendar gaps, unread threads, and memory. |
+
+---
+
+## Proactive Engine & Quiet Gate
+
+The proactive engine continuously monitors local state while enforcing strict quiet gate rules to protect user attention:
+
+1. **Quiet Hours**: Suppresses all non-urgent notices between **22:00 and 08:00** local time.
+2. **Daily Notice Cap**: Enforces a strict maximum of **3 interruptions per day** (dogfood G6 gate).
+3. **Daily Spend Cap**: Hard cap of **$0.50 USD per day** across proactive patrol jobs.
+4. **Distinct User Feedback Semantics**:
+   - `done`: Item resolved; permanently suppressed from dedup.
+   - `later`: Snoozed for 4 hours.
+   - `stop`: Topic opt-out; permanently mutes this topic.
+5. **Urgency Bypass**: Flagged or critical items (e.g., server outages, imminent meetings) bypass quiet hours.
+
+---
+
+## Memory Upkeep Engine
+
+Personal memory is stored in SQLite with full-text search (FTS5). The upkeep engine runs periodically to keep knowledge clean and relevant:
+
+```bash
+# Run on-demand memory upkeep
+gm upkeep
+
+# Custom retention period for transient observations
+gm upkeep --stale-days 7 --json
+```
+
+- **Fact Deduplication**: Calculates token Jaccard similarity (≥ 0.85) and normalized string matching. Automatically merges tags from duplicate records and retains the highest-importance entry.
+- **Knowledge Clustering**: Discovers shared themes across records and applies cluster tags (`cluster:<topic>`), linking related notes together.
+- **Stale Observation Pruning**: Automatically purges transient episodes and observations older than the retention threshold with low importance (≤ 0.4).
+
+---
+
+## Desktop Shell & Keyboard Shortcuts
+
+Launch the native AppKit desktop shell:
+```bash
+gm-ui tray
+```
+
+### Global Keyboard Shortcuts
+- **`Cmd + Shift + Space`**: Instant Summon Assistant (floating chat window).
+- **`Cmd + Alt + Escape`**: Emergency Kill Switch (immediately stops all agent actions).
+
+### Visual Action Overlay
+A high-contrast, floating HUD overlay positioned on the frontmost screen indicating active agent state:
+- 🔵 **Active**: Currently executing AX or pixel actions.
+- 🟡 **Paused**: User coexistence pause active (user input detected within last 1.5s).
+- 🛑 **Stopped**: Emergency kill switch activated.
+
+---
+
+## Benchmarking & Evaluation (`xtask`)
+
+Grok-Muse includes an `xtask` binary implementing rigorous quality and performance gates:
+
+```bash
+# 1. Benchmark G3 local hot-path budgets (< 2ms capture, < 30ms AX, < 15ms JPEG, < 5ms dispatch)
+cargo run --package xtask -- bench-hotpath
+
+# 2. Benchmark G2 idle RSS footprint (< 50MB idle tree)
+cargo run --package xtask -- bench-rss
+
+# 3. Run G5 25-task evaluation suite (Finder, Safari, Notes, Mail, Settings, Electron, Canvas)
+cargo run --package xtask -- eval
+```
+
+---
+
+## Continuous Integration (CI)
+
+Grok-Muse is continuously tested on both **macOS (`macos-14`)** and **Linux (`ubuntu-latest`)** via GitHub Actions:
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo nextest run --workspace` (or `cargo test --workspace`)
+- `cargo run -p xtask -- eval` (25-task evaluation gate)
+- `cargo run -p xtask -- bench-hotpath` (native hot-path budgets on macOS)
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

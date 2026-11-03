@@ -92,6 +92,39 @@ pub enum Commands {
         #[arg(long)]
         date: Option<String>,
     },
+    /// Synthesize weekly or monthly safety, spend, CU actions, and task success audit report
+    Audit {
+        /// Audit aggregation period: weekly or monthly
+        #[arg(long, default_value = "weekly")]
+        period: String,
+        /// Output audit metrics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run memory upkeep to deduplicate facts, cluster knowledge, and prune stale observations
+    Upkeep {
+        /// Days after which transient observations expire (default: 14)
+        #[arg(long)]
+        stale_days: Option<i64>,
+        /// Output report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream recent observations, patrol insights, and completed tasks
+    Feed {
+        /// Number of feed items to retrieve
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Output feed as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Proactive suggestions derived from calendar, unread threads, and personal memory
+    Ideas {
+        /// Output suggestions as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -353,7 +386,8 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
         kill_switch,
         blocklist,
         AgentLoopConfig::default(),
-    );
+    )
+    .with_audit(Arc::new(audit_log.clone()));
 
     match agent.run_task("cli_do", instruction).await {
         Ok(summary) => {
@@ -488,7 +522,8 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
             kill_switch,
             blocklist,
             AgentLoopConfig::default(),
-        );
+        )
+        .with_audit(Arc::new(audit_log.clone()));
 
         match agent.run_task("cli_task", &task_instruction).await {
             Ok(summary) => {
@@ -656,6 +691,86 @@ pub async fn run_review(date_str: Option<String>) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_audit(period_str: &str, json: bool) -> Result<()> {
+    let period = period_str
+        .parse::<gm_safety::AuditPeriod>()
+        .map_err(GmError::Config)?;
+    let logger = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
+    let report = logger.generate_report(period, chrono::Utc::now());
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.format_report());
+    }
+    Ok(())
+}
+
+pub async fn run_upkeep(stale_days: Option<i64>, json: bool) -> Result<()> {
+    let memory = PersonalMemoryStore::default_store()
+        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let mut config = gm_memory::UpkeepConfig::default();
+    if let Some(days) = stale_days {
+        config.stale_observation_days = days;
+    }
+    let report = memory.perform_upkeep(&config, chrono::Utc::now())?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.format_summary());
+    }
+    Ok(())
+}
+
+pub async fn run_feed(limit: usize, json: bool) -> Result<()> {
+    let memory = PersonalMemoryStore::default_store()
+        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let audit = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
+
+    let engine = ProactiveEngine::new(
+        QuietGateConfig::default(),
+        Arc::new(BudgetManager::new(GmConfig::default().budget)),
+    );
+    let feed = engine.get_feed(&memory, &audit, limit)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&feed)?);
+    } else {
+        print!("{}", gm_goals::format_feed(&feed));
+    }
+    Ok(())
+}
+
+pub async fn run_ideas(json: bool) -> Result<()> {
+    let memory = PersonalMemoryStore::default_store()
+        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let socket_path = Path::new("/tmp/grok-muse-helper.sock");
+
+    let ideas = if socket_path.exists() {
+        let platform = IpcPlatformClient::new(socket_path);
+        gm_goals::generate_ideas(Some(&platform), &memory, chrono::Utc::now()).await?
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            let platform = gm_platform::MacPlatform::new().ok();
+            gm_goals::generate_ideas(platform.as_ref(), &memory, chrono::Utc::now()).await?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let platform: Option<&gm_platform::MockPlatform> = None;
+            gm_goals::generate_ideas(platform, &memory, chrono::Utc::now()).await?
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&ideas)?);
+    } else {
+        print!("{}", gm_goals::format_ideas(&ideas));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +878,31 @@ mod tests {
     async fn test_review_command() {
         assert!(run_review(Some("2026-11-03".into())).await.is_ok());
         assert!(run_review(None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_audit_command() {
+        assert!(run_audit("weekly", false).await.is_ok());
+        assert!(run_audit("weekly", true).await.is_ok());
+        assert!(run_audit("monthly", false).await.is_ok());
+        assert!(run_audit("invalid_period", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_upkeep_command() {
+        assert!(run_upkeep(None, false).await.is_ok());
+        assert!(run_upkeep(Some(30), true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_feed_command() {
+        assert!(run_feed(10, false).await.is_ok());
+        assert!(run_feed(5, true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ideas_command() {
+        assert!(run_ideas(false).await.is_ok());
+        assert!(run_ideas(true).await.is_ok());
     }
 }

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master", "main" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master", "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +17,16 @@ jobs:
         os: [macos-14, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Grok-Muse
+        uses: actions/checkout@v4
+        with:
+          path: grok-muse
+
+      - name: Checkout Darius
+        uses: actions/checkout@v4
+        with:
+          repository: galaxycoils/darius
+          path: Darius
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,13 +38,22 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Check formatting
+        working-directory: grok-muse
         run: cargo fmt --all --check
 
       - name: Clippy check
+        working-directory: grok-muse
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run nextest
+        working-directory: grok-muse
         run: cargo nextest run --workspace
 
       - name: Run G5 eval suite gate
+        working-directory: grok-muse
         run: cargo run -p xtask -- eval
+
+      - name: Benchmark G3 local hot-path budgets (macOS only)
+        if: runner.os == 'macOS'
+        working-directory: grok-muse
+        run: cargo run -p xtask -- bench-hotpath
