@@ -143,7 +143,7 @@ pub enum Commands {
         /// Force download even if current version is up to date
         #[arg(long)]
         force: bool,
-        /// Target GitHub repository (default: grok-muse/grok-muse)
+        /// Target GitHub repository (default: galaxycoils/grok-muse)
         #[arg(long)]
         repo: Option<String>,
         /// Output update status as JSON

@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-pub const DEFAULT_REPO: &str = "grok-muse/grok-muse";
+pub const DEFAULT_REPO: &str = "galaxycoils/grok-muse";
 
 /// Result of checking for updates against GitHub Releases.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
