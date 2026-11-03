@@ -15,6 +15,15 @@ use tracing::{debug, info, warn};
 unsafe extern "C" {
     fn gm_mac_check_screen_recording_permission() -> c_int;
     fn gm_mac_check_ax_permission() -> c_int;
+    fn gm_mac_check_calendar_permission() -> c_int;
+    fn gm_mac_check_reminders_permission() -> c_int;
+    fn gm_mac_request_screen_recording_permission() -> c_int;
+    fn gm_mac_request_ax_permission() -> c_int;
+    fn gm_mac_request_calendar_permission() -> c_int;
+    fn gm_mac_request_reminders_permission() -> c_int;
+    fn gm_mac_open_system_settings_pane(pane_name: *const c_char) -> c_int;
+    fn gm_mac_install_global_hotkeys(callback: extern "C" fn(c_int)) -> c_int;
+    fn gm_mac_uninstall_global_hotkeys();
     fn gm_mac_seconds_since_last_input() -> c_double;
     fn gm_mac_start_stream() -> c_int;
     fn gm_mac_get_latest_frame(
@@ -140,6 +149,54 @@ impl MacPlatform {
         unsafe { gm_mac_free_frame(out_ptr) };
         Ok(jpeg_bytes)
     }
+
+    pub fn check_screen_recording() -> bool {
+        unsafe { gm_mac_check_screen_recording_permission() == 1 }
+    }
+
+    pub fn check_accessibility() -> bool {
+        unsafe { gm_mac_check_ax_permission() == 1 }
+    }
+
+    pub fn check_calendar() -> bool {
+        unsafe { gm_mac_check_calendar_permission() == 1 }
+    }
+
+    pub fn check_reminders() -> bool {
+        unsafe { gm_mac_check_reminders_permission() == 1 }
+    }
+
+    pub fn request_screen_recording() -> bool {
+        unsafe { gm_mac_request_screen_recording_permission() == 1 }
+    }
+
+    pub fn request_accessibility() -> bool {
+        unsafe { gm_mac_request_ax_permission() == 1 }
+    }
+
+    pub fn request_calendar() -> bool {
+        unsafe { gm_mac_request_calendar_permission() == 1 }
+    }
+
+    pub fn request_reminders() -> bool {
+        unsafe { gm_mac_request_reminders_permission() == 1 }
+    }
+
+    pub fn open_system_settings_pane(pane_name: &str) -> bool {
+        if let Ok(c_pane) = CString::new(pane_name) {
+            unsafe { gm_mac_open_system_settings_pane(c_pane.as_ptr()) == 0 }
+        } else {
+            false
+        }
+    }
+
+    pub fn install_global_hotkeys(callback: extern "C" fn(c_int)) -> bool {
+        unsafe { gm_mac_install_global_hotkeys(callback) == 0 }
+    }
+
+    pub fn uninstall_global_hotkeys() {
+        unsafe { gm_mac_uninstall_global_hotkeys() }
+    }
 }
 
 impl Drop for MacPlatform {
@@ -155,12 +212,14 @@ impl Platform for MacPlatform {
     async fn permissions(&self) -> Result<PermissionStatus> {
         let sc_ok = unsafe { gm_mac_check_screen_recording_permission() } == 1;
         let ax_ok = unsafe { gm_mac_check_ax_permission() } == 1;
+        let cal_ok = unsafe { gm_mac_check_calendar_permission() } == 1;
+        let rem_ok = unsafe { gm_mac_check_reminders_permission() } == 1;
 
         Ok(PermissionStatus {
             screen_recording: sc_ok,
             accessibility: ax_ok,
-            calendar: true,
-            reminders: true,
+            calendar: cal_ok,
+            reminders: rem_ok,
         })
     }
 

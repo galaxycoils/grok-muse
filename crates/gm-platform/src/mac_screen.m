@@ -8,6 +8,7 @@
 #import <ImageIO/ImageIO.h>
 #import <EventKit/EventKit.h>
 #import <UserNotifications/UserNotifications.h>
+#import <Carbon/Carbon.h>
 #include <os/lock.h>
 
 // Stream frame storage
@@ -72,6 +73,147 @@ int gm_mac_check_screen_recording_permission(void) {
 
 int gm_mac_check_ax_permission(void) {
     return AXIsProcessTrusted() ? 1 : 0;
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+int gm_mac_check_calendar_permission(void) {
+    EKAuthorizationStatus status = [EKEventStore authorizationStatusForEntityType:EKEntityTypeEvent];
+    return (status >= 3) ? 1 : 0;
+}
+
+int gm_mac_check_reminders_permission(void) {
+    EKAuthorizationStatus status = [EKEventStore authorizationStatusForEntityType:EKEntityTypeReminder];
+    return (status >= 3) ? 1 : 0;
+}
+
+int gm_mac_request_screen_recording_permission(void) {
+    return CGRequestScreenCaptureAccess() ? 1 : 0;
+}
+
+int gm_mac_request_ax_permission(void) {
+    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options) ? 1 : 0;
+}
+
+int gm_mac_request_calendar_permission(void) {
+    @autoreleasepool {
+        EKEventStore *store = [[EKEventStore alloc] init];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block int result = 0;
+        if (@available(macOS 14.0, *)) {
+            [store requestFullAccessToEventsWithCompletion:^(BOOL granted, NSError * _Nullable error) {
+                (void)error;
+                result = granted ? 1 : 0;
+                dispatch_semaphore_signal(sem);
+            }];
+        } else {
+            [store requestAccessToEntityType:EKEntityTypeEvent completion:^(BOOL granted, NSError * _Nullable error) {
+                (void)error;
+                result = granted ? 1 : 0;
+                dispatch_semaphore_signal(sem);
+            }];
+        }
+        dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC));
+        dispatch_semaphore_wait(sem, timeout);
+        return result;
+    }
+}
+
+int gm_mac_request_reminders_permission(void) {
+    @autoreleasepool {
+        EKEventStore *store = [[EKEventStore alloc] init];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block int result = 0;
+        if (@available(macOS 14.0, *)) {
+            [store requestFullAccessToRemindersWithCompletion:^(BOOL granted, NSError * _Nullable error) {
+                (void)error;
+                result = granted ? 1 : 0;
+                dispatch_semaphore_signal(sem);
+            }];
+        } else {
+            [store requestAccessToEntityType:EKEntityTypeReminder completion:^(BOOL granted, NSError * _Nullable error) {
+                (void)error;
+                result = granted ? 1 : 0;
+                dispatch_semaphore_signal(sem);
+            }];
+        }
+        dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC));
+        dispatch_semaphore_wait(sem, timeout);
+        return result;
+    }
+}
+
+#pragma clang diagnostic pop
+
+int gm_mac_open_system_settings_pane(const char *pane_name) {
+    @autoreleasepool {
+        if (!pane_name) return -1;
+        NSString *pane = [NSString stringWithUTF8String:pane_name];
+        NSString *urlStr = [NSString stringWithFormat:@"x-apple.systempreferences:com.apple.preference.security?%@", pane];
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url) return -1;
+        BOOL ok = [[NSWorkspace sharedWorkspace] openURL:url];
+        return ok ? 0 : -1;
+    }
+}
+
+// Global hotkeys (Carbon EventHotKey)
+static EventHandlerRef g_carbon_hotkey_handler = NULL;
+static void (*g_carbon_hotkey_callback)(int) = NULL;
+static EventHotKeyRef g_summon_hotkey_ref = NULL;
+static EventHotKeyRef g_kill_hotkey_ref = NULL;
+
+static OSStatus GmCarbonHotkeyHandler(EventHandlerCallRef nextHandler, EventRef theEvent, void *userData) {
+    (void)nextHandler;
+    (void)userData;
+    EventHotKeyID hotKeyID;
+    OSStatus err = GetEventParameter(theEvent, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(hotKeyID), NULL, &hotKeyID);
+    if (err == noErr && g_carbon_hotkey_callback) {
+        g_carbon_hotkey_callback((int)hotKeyID.id);
+    }
+    return noErr;
+}
+
+int gm_mac_install_global_hotkeys(void (*callback)(int hotkey_id)) {
+    g_carbon_hotkey_callback = callback;
+    if (g_carbon_hotkey_handler) {
+        return 0; // Already installed
+    }
+    EventTypeSpec eventType;
+    eventType.eventClass = kEventClassKeyboard;
+    eventType.eventKind = kEventHotKeyPressed;
+    OSStatus status = InstallApplicationEventHandler(&GmCarbonHotkeyHandler, 1, &eventType, NULL, &g_carbon_hotkey_handler);
+    if (status != noErr) {
+        return (int)status;
+    }
+    
+    // Register Summon: Cmd + Shift + Space (Space keycode is 49 = 0x31)
+    EventHotKeyID summonID = { 'GMUS', 1 };
+    RegisterEventHotKey(49, cmdKey | shiftKey, summonID, GetApplicationEventTarget(), 0, &g_summon_hotkey_ref);
+    
+    // Register Kill Switch: Cmd + Option + Escape (Escape keycode is 53 = 0x35)
+    EventHotKeyID killID = { 'GMUS', 2 };
+    RegisterEventHotKey(53, cmdKey | optionKey, killID, GetApplicationEventTarget(), 0, &g_kill_hotkey_ref);
+    
+    return 0;
+}
+
+void gm_mac_uninstall_global_hotkeys(void) {
+    if (g_summon_hotkey_ref) {
+        UnregisterEventHotKey(g_summon_hotkey_ref);
+        g_summon_hotkey_ref = NULL;
+    }
+    if (g_kill_hotkey_ref) {
+        UnregisterEventHotKey(g_kill_hotkey_ref);
+        g_kill_hotkey_ref = NULL;
+    }
+    if (g_carbon_hotkey_handler) {
+        RemoveEventHandler(g_carbon_hotkey_handler);
+        g_carbon_hotkey_handler = NULL;
+    }
+    g_carbon_hotkey_callback = NULL;
 }
 
 double gm_mac_seconds_since_last_input(void) {

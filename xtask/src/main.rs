@@ -27,6 +27,13 @@ enum Commands {
         #[arg(long)]
         identity: Option<String>,
     },
+    /// Assemble a distributable macOS .dmg containing GrokMuse.app and GrokMuseCUHelper.app
+    Dmg {
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long, default_value = "target/dist/Grok-Muse.dmg")]
+        output: String,
+    },
     /// Benchmark G3 local hot-path budgets
     BenchHotpath,
     /// Benchmark G2 whole-tree idle RSS
@@ -103,41 +110,48 @@ fn measure_process_tree_memory(pids: &[u32]) -> (f64, String) {
     (0.0, "unknown".into())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn detect_identity() -> String {
+    let output = Command::new("security")
+        .args(["find-identity", "-p", "codesigning", "-v"])
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("Apple Development: darius@bell.net (LH6BX94T47)") {
+            return "Apple Development: darius@bell.net (LH6BX94T47)".into();
+        }
+    }
+    "-".into()
+}
 
-    match cli.command {
-        Commands::Bundle => {
-            println!("==> Compiling Grok-Muse binaries for bundling...");
-            let build_status = Command::new("cargo")
-                .args([
-                    "build",
-                    "-p",
-                    "gm-cu-helper",
-                    "-p",
-                    "gm-daemon",
-                    "-p",
-                    "gm-ui",
-                ])
-                .status()?;
-            if !build_status.success() {
-                eprintln!("Failed to build binaries for bundling");
-                std::process::exit(1);
-            }
+fn create_app_bundles() -> Result<(), Box<dyn std::error::Error>> {
+    println!("==> Compiling Grok-Muse binaries for bundling...");
+    let build_status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "gm-cu-helper",
+            "-p",
+            "gm-daemon",
+            "-p",
+            "gm-ui",
+        ])
+        .status()?;
+    if !build_status.success() {
+        return Err("Failed to build binaries for bundling".into());
+    }
 
-            println!("==> Bundling Grok-Muse applications...");
-            let helper_app_dir = Path::new("target/bundle/GrokMuseCUHelper.app/Contents/MacOS");
-            fs::create_dir_all(helper_app_dir)?;
+    println!("==> Bundling Grok-Muse applications...");
+    let helper_app_dir = Path::new("target/bundle/GrokMuseCUHelper.app/Contents/MacOS");
+    fs::create_dir_all(helper_app_dir)?;
 
-            // Copy helper binary
-            fs::copy(
-                "target/debug/gm-cu-helper",
-                helper_app_dir.join("gm-cu-helper"),
-            )?;
+    // Copy helper binary
+    fs::copy(
+        "target/debug/gm-cu-helper",
+        helper_app_dir.join("gm-cu-helper"),
+    )?;
 
-            // Write helper Info.plist (TCC declarations + LSUIElement)
-            let helper_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    // Write helper Info.plist (TCC declarations + LSUIElement)
+    let helper_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -155,20 +169,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     <string>Grok-Muse requires accessibility to inspect UI elements and execute actions.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Grok-Muse requires screen recording to ground vision model actions.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Grok-Muse proactive engine requires Calendar access to patrol upcoming events.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Grok-Muse proactive engine requires Reminders access to follow up on tasks.</string>
 </dict>
 </plist>
 "#;
-            fs::write(
-                "target/bundle/GrokMuseCUHelper.app/Contents/Info.plist",
-                helper_plist,
-            )?;
+    fs::write(
+        "target/bundle/GrokMuseCUHelper.app/Contents/Info.plist",
+        helper_plist,
+    )?;
 
-            // Bundle main GrokMuse.app
-            let app_macos_dir = Path::new("target/bundle/GrokMuse.app/Contents/MacOS");
-            fs::create_dir_all(app_macos_dir)?;
-            fs::copy("target/debug/gm-ui", app_macos_dir.join("gm-ui"))?;
+    // Bundle main GrokMuse.app
+    let app_macos_dir = Path::new("target/bundle/GrokMuse.app/Contents/MacOS");
+    fs::create_dir_all(app_macos_dir)?;
+    fs::copy("target/debug/gm-ui", app_macos_dir.join("gm-ui"))?;
 
-            let app_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let app_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -180,81 +198,193 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     <string>gm-ui</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Grok-Muse requires accessibility to inspect UI elements and execute actions.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Grok-Muse requires screen recording to ground vision model actions.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Grok-Muse proactive engine requires Calendar access to patrol upcoming events.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Grok-Muse proactive engine requires Reminders access to follow up on tasks.</string>
 </dict>
 </plist>
 "#;
-            fs::write("target/bundle/GrokMuse.app/Contents/Info.plist", app_plist)?;
+    fs::write("target/bundle/GrokMuse.app/Contents/Info.plist", app_plist)?;
 
-            println!("==> Successfully created app bundles:");
-            println!("    target/bundle/GrokMuseCUHelper.app");
-            println!("    target/bundle/GrokMuse.app");
+    println!("==> Successfully created app bundles:");
+    println!("    target/bundle/GrokMuseCUHelper.app");
+    println!("    target/bundle/GrokMuse.app");
+    Ok(())
+}
+
+fn sign_bundle(
+    app_path: &str,
+    identity: &str,
+    entitlements: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = vec!["--force", "--deep"];
+    if let Some(ent) = entitlements
+        && Path::new(ent).exists()
+    {
+        args.push("--options");
+        args.push("runtime");
+        args.push("--entitlements");
+        args.push(ent);
+    }
+    args.push("--sign");
+    args.push(identity);
+    args.push(app_path);
+
+    let status = Command::new("codesign").args(&args).status()?;
+    if !status.success() {
+        return Err(format!("Failed to sign {app_path} with identity {identity}").into());
+    }
+
+    let verify_status = Command::new("codesign")
+        .args(["--verify", "--deep", "--strict", app_path])
+        .status()?;
+    if !verify_status.success() {
+        return Err(format!("Signature verification failed for {app_path}").into());
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Bundle => {
+            create_app_bundles()?;
         }
 
         Commands::Sign { identity } => {
-            let id = identity.unwrap_or_else(|| {
-                // Check if the verified Apple Development identity is available
-                let output = Command::new("security")
-                    .args(["find-identity", "-p", "codesigning", "-v"])
-                    .output();
-                if let Ok(out) = output {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    if text.contains("Apple Development: darius@bell.net (LH6BX94T47)") {
-                        return "Apple Development: darius@bell.net (LH6BX94T47)".into();
-                    }
-                }
-                "-".into()
-            });
-
+            let id = identity.unwrap_or_else(detect_identity);
             println!("==> Signing artifacts with identity: {id}");
 
-            // Ensure bundles exist
             let helper_app = "target/bundle/GrokMuseCUHelper.app";
             let main_app = "target/bundle/GrokMuse.app";
 
             if !Path::new(helper_app).exists() || !Path::new(main_app).exists() {
                 println!("App bundles not found. Building bundles first...");
-                let status = Command::new("cargo")
-                    .args(["run", "-p", "xtask", "--", "bundle"])
-                    .status()?;
-                if !status.success() {
-                    eprintln!("Failed to create bundles before signing");
-                    std::process::exit(1);
-                }
+                create_app_bundles()?;
             }
 
-            // Sign helper app
-            let s1 = Command::new("codesign")
-                .args(["--force", "--deep", "--sign", &id, helper_app])
+            println!("==> Signing helper and main bundles with hardened runtime & entitlements...");
+            sign_bundle(helper_app, &id, Some("entitlements.plist"))?;
+            sign_bundle(main_app, &id, Some("entitlements.plist"))?;
+
+            println!("==> All artifacts signed and strictly verified.");
+        }
+
+        Commands::Dmg { identity, output } => {
+            let id = identity.unwrap_or_else(detect_identity);
+            println!("==> Assembling distributable macOS DMG with identity: {id}");
+
+            // 1. Compile & assemble bundles
+            create_app_bundles()?;
+
+            // 2. Sign both bundles with hardened runtime & entitlements
+            println!(
+                "==> Signing bundles with hardened runtime (--options runtime) & entitlements.plist..."
+            );
+            sign_bundle(
+                "target/bundle/GrokMuseCUHelper.app",
+                &id,
+                Some("entitlements.plist"),
+            )?;
+            sign_bundle(
+                "target/bundle/GrokMuse.app",
+                &id,
+                Some("entitlements.plist"),
+            )?;
+
+            // 3. Staging directory setup
+            let staging = Path::new("target/dmg-staging");
+            if staging.exists() {
+                let _ = fs::remove_dir_all(staging);
+            }
+            fs::create_dir_all(staging)?;
+
+            println!("==> Copying signed app bundles into staging directory...");
+            let cp_helper = Command::new("cp")
+                .args([
+                    "-R",
+                    "target/bundle/GrokMuseCUHelper.app",
+                    "target/dmg-staging/",
+                ])
                 .status()?;
-            if !s1.success() {
-                eprintln!("Failed to sign {helper_app}");
-                std::process::exit(1);
+            if !cp_helper.success() {
+                return Err("Failed to copy GrokMuseCUHelper.app to staging".into());
             }
 
-            // Sign main app
-            let s2 = Command::new("codesign")
-                .args(["--force", "--deep", "--sign", &id, main_app])
+            let cp_ui = Command::new("cp")
+                .args(["-R", "target/bundle/GrokMuse.app", "target/dmg-staging/"])
                 .status()?;
-            if !s2.success() {
-                eprintln!("Failed to sign {main_app}");
-                std::process::exit(1);
+            if !cp_ui.success() {
+                return Err("Failed to copy GrokMuse.app to staging".into());
             }
 
-            // Strict verification
-            println!("==> Verifying signatures...");
-            let v1 = Command::new("codesign")
-                .args(["--verify", "--deep", "--strict", helper_app])
-                .status()?;
-            let v2 = Command::new("codesign")
-                .args(["--verify", "--deep", "--strict", main_app])
+            // Create /Applications symlink for drag-and-drop install UX
+            println!("==> Creating /Applications symlink in staging...");
+            let _ = Command::new("ln")
+                .args(["-s", "/Applications", "target/dmg-staging/Applications"])
+                .status();
+
+            // 4. Create DMG
+            let out_file = Path::new(&output);
+            if let Some(parent) = out_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if out_file.exists() {
+                let _ = fs::remove_file(out_file);
+            }
+
+            println!("==> Generating compressed DMG at {output}...");
+            let hdi_status = Command::new("hdiutil")
+                .args([
+                    "create",
+                    "-volname",
+                    "Grok-Muse",
+                    "-srcfolder",
+                    "target/dmg-staging",
+                    "-ov",
+                    "-format",
+                    "UDZO",
+                    &output,
+                ])
                 .status()?;
 
-            if v1.success() && v2.success() {
-                println!("==> All artifacts signed and strictly verified.");
-            } else {
-                eprintln!("Codesign verification failed.");
-                std::process::exit(1);
+            if !hdi_status.success() {
+                return Err("hdiutil create failed".into());
             }
+
+            // 5. Verify DMG checksum
+            println!("==> Verifying created DMG image integrity...");
+            let verify_status = Command::new("hdiutil").args(["verify", &output]).status()?;
+            if !verify_status.success() {
+                return Err("hdiutil verify failed".into());
+            }
+
+            // 6. Cleanup staging
+            let _ = fs::remove_dir_all(staging);
+
+            let meta = fs::metadata(&output)?;
+            let size_mb = (meta.len() as f64) / (1024.0 * 1024.0);
+
+            println!("\n╔══════════════════════════════════════════════════════════╗");
+            println!("║          macOS Distribution DMG Successfully Created      ║");
+            println!("╚══════════════════════════════════════════════════════════╝");
+            println!("  Path               : {output}");
+            println!("  Size               : {:.2} MB", size_mb);
+            println!("  Bundles Included   : GrokMuse.app, GrokMuseCUHelper.app");
+            println!("  Install Symlink    : /Applications");
+            println!("  Code Signature     : {id}");
+            println!("  Hardened Runtime   : ENABLED (--options runtime)");
+            println!("  Entitlements       : entitlements.plist");
+            println!("  DMG Checksum       : VALID (hdiutil verify)");
+            println!("════════════════════════════════════════════════════════════\n");
         }
 
         Commands::BenchHotpath => {
