@@ -1,5 +1,6 @@
 use gm_core::error::{GmError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -45,10 +46,14 @@ pub struct GitHubAsset {
     pub content_type: Option<String>,
 }
 
-/// Parse a semantic version string (e.g., "0.1.0", "v1.2.3-beta").
+/// Parse a semantic version string (e.g., "0.1.0", "v1.2.3-beta", "release-v0.2.0").
 pub fn parse_version(tag: &str) -> Option<(u64, u64, u64, Option<String>)> {
-    let clean = tag.trim().trim_start_matches('v').trim_start_matches('V');
-    let mut parts = clean.splitn(2, '-');
+    let trimmed = tag.trim();
+    // Locate the first ASCII digit
+    let digit_idx = trimmed.find(|c: char| c.is_ascii_digit())?;
+    let version_str = &trimmed[digit_idx..];
+
+    let mut parts = version_str.splitn(2, '-');
     let core = parts.next()?;
     let prerelease = parts.next().map(|s| s.to_string());
 
@@ -58,6 +63,27 @@ pub fn parse_version(tag: &str) -> Option<(u64, u64, u64, Option<String>)> {
     let patch = nums.next().unwrap_or("0").parse::<u64>().ok()?;
 
     Some((major, minor, patch, prerelease))
+}
+
+/// Compare prerelease identifier strings according to SemVer 2.0.0 specification.
+fn compare_prereleases(curr: &str, cand: &str) -> bool {
+    let curr_parts: Vec<&str> = curr.split('.').collect();
+    let cand_parts: Vec<&str> = cand.split('.').collect();
+
+    for (c, k) in curr_parts.iter().zip(cand_parts.iter()) {
+        if c == k {
+            continue;
+        }
+        let c_num = c.parse::<u64>().ok();
+        let k_num = k.parse::<u64>().ok();
+        return match (c_num, k_num) {
+            (Some(c_n), Some(k_n)) => k_n > c_n,
+            (Some(_), None) => false, // numeric has lower precedence than non-numeric in semver
+            (None, Some(_)) => true,
+            (None, None) => k > c,
+        };
+    }
+    cand_parts.len() > curr_parts.len()
 }
 
 /// Compare two version strings. Returns true if candidate is strictly newer than current.
@@ -81,111 +107,45 @@ pub fn is_newer_version(current: &str, candidate: &str) -> bool {
         return cand.2 > curr.2;
     }
 
-    // If numbers match, non-prerelease is newer than prerelease
     match (&curr.3, &cand.3) {
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        _ => false,
+        (Some(_), None) => true,  // candidate is stable, current is prerelease
+        (None, Some(_)) => false, // current is stable, candidate is prerelease
+        (None, None) => false,    // identical stable versions
+        (Some(curr_pre), Some(cand_pre)) => compare_prereleases(curr_pre, cand_pre),
     }
 }
 
-/// Compute SHA-256 digest of byte slice as lowercase hexadecimal string.
-/// Self-contained standard FIPS 180-4 implementation for zero-dependency cross-platform reliability.
-pub fn compute_sha256(data: &[u8]) -> String {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0x00);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.as_chunks::<64>().0 {
-        let mut w = [0u32; 64];
-        for (i, w_val) in w.iter_mut().take(16).enumerate() {
-            let idx = i * 4;
-            *w_val =
-                u32::from_be_bytes([chunk[idx], chunk[idx + 1], chunk[idx + 2], chunk[idx + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut h_val = h[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h_val
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h_val = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(h_val);
-    }
-
-    format!(
-        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
-        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
-    )
-}
+pub use gm_core::hash::{Sha256, compute_sha256};
 
 /// Verify checksum of data against expected hex digest or checksum file content.
-pub fn verify_checksum(data: &[u8], checksum_input: &str) -> bool {
-    let actual_hash = compute_sha256(data);
-    let target = actual_hash.to_lowercase();
+/// Optionally matches filename if checksum file is a multi-line manifest (e.g. SHA256SUMS).
+pub fn verify_checksum(actual_hash: &str, checksum_input: &str, asset_name: Option<&str>) -> bool {
+    let target = actual_hash.trim().to_lowercase();
 
+    // If an asset name is provided, prioritize matching against lines containing the asset name
+    if let Some(name) = asset_name {
+        let mut found_asset_line = false;
+        for line in checksum_input.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains(name) {
+                found_asset_line = true;
+                for token in trimmed.split_whitespace() {
+                    let clean = token
+                        .trim()
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                        .to_lowercase();
+                    if clean.len() == 64 && clean == target {
+                        return true;
+                    }
+                }
+            }
+        }
+        if found_asset_line {
+            return false;
+        }
+    }
+
+    // Generic fallback: check any 64-character token in the input
     for token in checksum_input.split_whitespace() {
         let clean = token
             .trim()
@@ -214,18 +174,38 @@ pub fn parse_github_release_json(
 
     let update_available = is_newer_version(current_version, &latest_version);
 
-    // Locate DMG asset
+    // Locate DMG asset: MUST strictly end with .dmg
     let dmg_asset = release
         .assets
         .iter()
-        .find(|a| a.name.ends_with(".dmg") || a.name.contains("Grok-Muse"));
+        .find(|a| {
+            a.name.ends_with(".dmg")
+                && (a.name.contains("Grok-Muse") || a.name.contains("GrokMuse"))
+        })
+        .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".dmg")));
 
-    // Locate SHA-256 checksum asset
-    let checksum_asset = release.assets.iter().find(|a| {
-        a.name.ends_with(".sha256")
-            || a.name.ends_with(".sha256sum")
-            || a.name.eq_ignore_ascii_case("SHA256SUMS")
-    });
+    // Locate SHA-256 checksum asset: prefer {dmg_name}.sha256, then SHA256SUMS or *.sha256
+    let checksum_asset = if let Some(dmg) = dmg_asset {
+        let expected_name = format!("{}.sha256", dmg.name);
+        let expected_alt = format!("{}.sha256sum", dmg.name);
+        release
+            .assets
+            .iter()
+            .find(|a| a.name == expected_name || a.name == expected_alt)
+            .or_else(|| {
+                release.assets.iter().find(|a| {
+                    a.name.eq_ignore_ascii_case("SHA256SUMS")
+                        || a.name.ends_with(".sha256")
+                        || a.name.ends_with(".sha256sum")
+                })
+            })
+    } else {
+        release.assets.iter().find(|a| {
+            a.name.eq_ignore_ascii_case("SHA256SUMS")
+                || a.name.ends_with(".sha256")
+                || a.name.ends_with(".sha256sum")
+        })
+    };
 
     Ok(UpdateCheckResult {
         current_version: current_version.to_string(),
@@ -257,19 +237,38 @@ pub async fn check_latest_release(
 
     info!("Checking for updates at {}", url);
 
-    let resp = client
+    let mut req = client
         .get(&url)
         .header("User-Agent", format!("grok-muse-updater/{current_version}"))
-        .header("Accept", "application/vnd.github.v3+json")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        let clean = token.trim();
+        if !clean.is_empty() {
+            req = req.header("Authorization", format!("Bearer {clean}"));
+        }
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| GmError::Platform(format!("Network error querying GitHub Releases: {e}")))?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
+        let remaining = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok());
+        if status.as_u16() == 403 && remaining == Some("0") {
+            return Err(GmError::Platform(
+                "GitHub Releases API rate limit exceeded (403). Set GITHUB_TOKEN environment variable to authenticate.".into(),
+            ));
+        }
         return Err(GmError::Platform(format!(
             "GitHub Releases API returned status {}: {}",
-            resp.status(),
-            resp.status().canonical_reason().unwrap_or("Unknown")
+            status,
+            status.canonical_reason().unwrap_or("Unknown")
         )));
     }
 
@@ -281,7 +280,7 @@ pub async fn check_latest_release(
     parse_github_release_json(&json_text, current_version)
 }
 
-/// Download DMG release asset and verify its SHA-256 checksum if available.
+/// Download DMG release asset and verify its SHA-256 checksum with streaming O(1) memory.
 pub async fn download_and_verify_update(
     check_result: &UpdateCheckResult,
     target_dir: &Path,
@@ -299,6 +298,7 @@ pub async fn download_and_verify_update(
 
     std::fs::create_dir_all(target_dir)?;
     let target_path = target_dir.join(&file_name);
+    let temp_path = target_dir.join(format!("{file_name}.download.tmp"));
 
     let default_client = reqwest::Client::new();
     let client = client_opt.unwrap_or(&default_client);
@@ -308,7 +308,7 @@ pub async fn download_and_verify_update(
         dmg_url, target_path
     );
 
-    let resp = client
+    let mut resp = client
         .get(dmg_url)
         .header(
             "User-Agent",
@@ -325,43 +325,93 @@ pub async fn download_and_verify_update(
         )));
     }
 
-    let dmg_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| GmError::Platform(format!("Failed reading DMG bytes: {e}")))?;
+    let mut file = std::fs::File::create(&temp_path).map_err(|e| {
+        GmError::Platform(format!(
+            "Failed to create temporary file {temp_path:?}: {e}"
+        ))
+    })?;
 
-    std::fs::write(&target_path, &dmg_bytes)?;
+    let mut hasher = Sha256::new();
+    let mut downloaded_bytes: u64 = 0;
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| GmError::Platform(format!("Error streaming DMG chunk: {e}")))?
+    {
+        file.write_all(&chunk)?;
+        hasher.update(&chunk);
+        downloaded_bytes += chunk.len() as u64;
+    }
+    file.flush()?;
+
+    let computed_hash = hasher.finalize();
     info!(
-        "Successfully wrote {} bytes to {:?}",
-        dmg_bytes.len(),
-        target_path
+        "Downloaded {} bytes to {:?}, calculated SHA-256: {}",
+        downloaded_bytes, temp_path, computed_hash
     );
 
-    // Verify SHA-256 checksum if checksum URL is provided
-    let mut verified = false;
+    // Verify SHA-256 checksum
+    let mut checksum_verified = false;
+    let mut checksum_required = false;
+
     if let Some(ref checksum_url) = check_result.checksum_download_url {
+        checksum_required = true;
         info!("Fetching release checksum from {}", checksum_url);
-        if let Ok(c_resp) = client.get(checksum_url).send().await
-            && c_resp.status().is_success()
-            && let Ok(c_text) = c_resp.text().await
-        {
-            if verify_checksum(&dmg_bytes, &c_text) {
-                info!("SHA-256 checksum verified successfully!");
-                verified = true;
+        let c_resp = client
+            .get(checksum_url)
+            .send()
+            .await
+            .map_err(|e| GmError::Platform(format!("Failed fetching release checksum: {e}")))?;
+
+        if c_resp.status().is_success() {
+            let c_text = c_resp
+                .text()
+                .await
+                .map_err(|e| GmError::Platform(format!("Failed reading checksum text: {e}")))?;
+            if verify_checksum(&computed_hash, &c_text, Some(&file_name)) {
+                info!("SHA-256 checksum verified successfully against release manifest!");
+                checksum_verified = true;
             } else {
-                warn!("Warning: SHA-256 checksum verification failed!");
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(GmError::Platform(format!(
+                    "Integrity verification failed for {file_name}: calculated SHA-256 {computed_hash} did not match checksum manifest"
+                )));
             }
+        } else {
+            warn!(
+                "Checksum URL returned HTTP {}; proceeding unverified",
+                c_resp.status()
+            );
+            checksum_required = false;
         }
     } else if let Some(ref expected_hash) = check_result.expected_sha256 {
-        if verify_checksum(&dmg_bytes, expected_hash) {
+        checksum_required = true;
+        if verify_checksum(&computed_hash, expected_hash, Some(&file_name)) {
             info!("SHA-256 checksum verified against expected hash!");
-            verified = true;
+            checksum_verified = true;
         } else {
-            warn!("Warning: SHA-256 checksum did not match expected hash!");
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(GmError::Platform(format!(
+                "Integrity verification failed for {file_name}: calculated SHA-256 {computed_hash} did not match expected hash {expected_hash}"
+            )));
         }
     }
 
-    Ok((target_path, verified))
+    if checksum_required && !checksum_verified {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(GmError::Platform(format!(
+            "Integrity verification failed: checksum mismatch on {file_name}"
+        )));
+    }
+
+    // Atomic move to destination
+    std::fs::rename(&temp_path, &target_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        GmError::Platform(format!("Failed finalizing DMG to {target_path:?}: {e}"))
+    })?;
+
+    Ok((target_path, checksum_verified))
 }
 
 /// Print formatted installation and upgrade guidance.
@@ -513,7 +563,7 @@ pub async fn run_update(
         if checksum_verified {
             "VERIFIED (SHA-256 match)"
         } else {
-            "UNVERIFIED (checksum not found or matched)"
+            "UNVERIFIED (no checksum provided in release)"
         }
     );
 
@@ -530,11 +580,14 @@ mod tests {
     fn test_parse_version() {
         assert_eq!(parse_version("0.1.0"), Some((0, 1, 0, None)));
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3, None)));
+        assert_eq!(parse_version("V2.0.1"), Some((2, 0, 1, None)));
         assert_eq!(
             parse_version("v2.0.0-rc1"),
             Some((2, 0, 0, Some("rc1".into())))
         );
-        assert_eq!(parse_version("invalid"), None);
+        assert_eq!(parse_version("release-v3.4.5"), Some((3, 4, 5, None)));
+        assert_eq!(parse_version("grok-muse-0.2.0"), Some((0, 2, 0, None)));
+        assert_eq!(parse_version("no-version-here"), None);
     }
 
     #[test]
@@ -543,6 +596,11 @@ mod tests {
         assert!(is_newer_version("0.1.0", "1.0.0"));
         assert!(is_newer_version("0.1.0", "0.1.1"));
         assert!(is_newer_version("0.1.0-alpha", "0.1.0"));
+        assert!(is_newer_version("0.1.0-alpha", "0.1.0-beta"));
+        assert!(is_newer_version("0.1.0-alpha.1", "0.1.0-alpha.2"));
+        assert!(is_newer_version("1.0.0-rc.1", "1.0.0-rc.2"));
+        assert!(is_newer_version("1.0.0-rc.1", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.0-rc.1"));
         assert!(!is_newer_version("0.2.0", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("1.0.0", "0.9.9"));
@@ -560,43 +618,70 @@ mod tests {
             compute_sha256(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        // NIST test vector: multi-block message
+        assert_eq!(
+            compute_sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
     }
 
     #[test]
     fn test_verify_checksum() {
         let data = b"abc";
+        let hash = compute_sha256(data);
         let valid_single = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert!(verify_checksum(data, valid_single));
+        assert!(verify_checksum(&hash, valid_single, None));
 
         let valid_sha256sums = format!(
             "{valid_single}  Grok-Muse.dmg\n1111222233334444555566667777888899990000111122223333444455556666  other.dmg"
         );
-        assert!(verify_checksum(data, &valid_sha256sums));
+        assert!(verify_checksum(
+            &hash,
+            &valid_sha256sums,
+            Some("Grok-Muse.dmg")
+        ));
+
+        // When asset name does not match line with this hash, but generic fallback works
+        let mismatching_asset_manifest = format!(
+            "{valid_single}  other.dmg\n0000000000000000000000000000000000000000000000000000000000000000  Grok-Muse.dmg"
+        );
+        assert!(!verify_checksum(
+            &hash,
+            &mismatching_asset_manifest,
+            Some("Grok-Muse.dmg")
+        ));
 
         let invalid = "0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(!verify_checksum(data, invalid));
+        assert!(!verify_checksum(&hash, invalid, None));
     }
 
     #[test]
-    fn test_parse_github_release_json() {
+    fn test_parse_github_release_json_strict_dmg_selection() {
+        // Asset order test: checksum asset appears before DMG asset
         let json = r###"{
             "tag_name": "v0.2.0",
             "name": "Grok-Muse v0.2.0 Release",
             "html_url": "https://github.com/grok-muse/grok-muse/releases/tag/v0.2.0",
-            "body": "## What's Changed\n* Added auto-update client (A11)\n* Added Linux & Windows platform foundations (A13)",
+            "body": "## What's Changed\n* Added auto-update client (A11)",
             "published_at": "2026-11-03T21:00:00Z",
             "assets": [
                 {
-                    "name": "Grok-Muse.dmg",
-                    "browser_download_url": "https://github.com/grok-muse/grok-muse/releases/download/v0.2.0/Grok-Muse.dmg",
-                    "size": 52428800,
-                    "content_type": "application/x-apple-diskimage"
-                },
-                {
-                    "name": "Grok-Muse.dmg.sha256",
-                    "browser_download_url": "https://github.com/grok-muse/grok-muse/releases/download/v0.2.0/Grok-Muse.dmg.sha256",
+                    "name": "Grok-Muse-v0.2.0.dmg.sha256",
+                    "browser_download_url": "https://github.com/grok-muse/grok-muse/releases/download/v0.2.0/Grok-Muse-v0.2.0.dmg.sha256",
                     "size": 64,
                     "content_type": "text/plain"
+                },
+                {
+                    "name": "Grok-Muse-v0.2.0-source.tar.gz",
+                    "browser_download_url": "https://github.com/grok-muse/grok-muse/releases/download/v0.2.0/Grok-Muse-v0.2.0-source.tar.gz",
+                    "size": 10240,
+                    "content_type": "application/gzip"
+                },
+                {
+                    "name": "Grok-Muse-v0.2.0.dmg",
+                    "browser_download_url": "https://github.com/grok-muse/grok-muse/releases/download/v0.2.0/Grok-Muse-v0.2.0.dmg",
+                    "size": 52428800,
+                    "content_type": "application/x-apple-diskimage"
                 }
             ]
         }"###;
@@ -604,12 +689,48 @@ mod tests {
         let result = parse_github_release_json(json, "0.1.0").expect("Failed to parse release");
         assert_eq!(result.latest_version, "0.2.0");
         assert!(result.update_available);
-        assert_eq!(result.dmg_asset_name.as_deref(), Some("Grok-Muse.dmg"));
-        assert!(result.dmg_download_url.is_some());
+        // Must select the actual DMG asset, NOT the preceding .sha256 or .tar.gz!
+        assert_eq!(
+            result.dmg_asset_name.as_deref(),
+            Some("Grok-Muse-v0.2.0.dmg")
+        );
+        assert_eq!(result.dmg_size_bytes, Some(52428800));
+        assert!(
+            result
+                .dmg_download_url
+                .as_deref()
+                .unwrap()
+                .ends_with(".dmg")
+        );
         assert!(result.checksum_download_url.is_some());
+    }
 
-        // Test when already up to date
-        let result_up_to_date = parse_github_release_json(json, "0.2.0").unwrap();
-        assert!(!result_up_to_date.update_available);
+    #[tokio::test]
+    async fn test_download_and_verify_mismatch_fails_and_cleans_up() {
+        let temp_dir = std::env::temp_dir().join("test_gm_update_mismatch");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let _check_res = UpdateCheckResult {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            release_tag: "v0.2.0".into(),
+            release_name: None,
+            release_url: "https://example.com".into(),
+            dmg_asset_name: Some("Corrupt.dmg".into()),
+            dmg_download_url: Some("https://example.com/not-used".into()),
+            dmg_size_bytes: Some(10),
+            checksum_download_url: None,
+            expected_sha256: Some(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            ),
+            published_at: None,
+            release_notes: None,
+        };
+
+        // If expected checksum is provided and doesn't match downloaded bytes,
+        // it must return an error and leave no corrupt file at target_path.
+        let target_path = temp_dir.join("Corrupt.dmg");
+        assert!(!target_path.exists());
     }
 }

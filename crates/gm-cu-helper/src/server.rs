@@ -25,15 +25,15 @@ impl<P: Platform + 'static> HelperServer<P> {
 
     pub async fn run(&self, socket_path: impl AsRef<Path>) -> Result<()> {
         let path = socket_path.as_ref();
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         #[cfg(unix)]
         {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
             let listener = UnixListener::bind(path)?;
             info!("Helper server listening on {:?}", path);
 
@@ -60,14 +60,18 @@ impl<P: Platform + 'static> HelperServer<P> {
             let pipe_name = path.to_string_lossy();
             info!("Helper server listening on named pipe {}", pipe_name);
 
+            let mut is_first = true;
             loop {
-                let server = tokio::net::windows::named_pipe::ServerOptions::new()
-                    .create(path.as_os_str())
-                    .map_err(|e| {
-                        gm_core::error::GmError::Platform(format!(
-                            "Failed to create named pipe {pipe_name}: {e}"
-                        ))
-                    })?;
+                let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+                if is_first {
+                    options.first_pipe_instance(true);
+                    is_first = false;
+                }
+                let server = options.create(path.as_os_str()).map_err(|e| {
+                    gm_core::error::GmError::Platform(format!(
+                        "Failed to create named pipe {pipe_name}: {e}"
+                    ))
+                })?;
 
                 server.connect().await.map_err(|e| {
                     gm_core::error::GmError::Platform(format!(

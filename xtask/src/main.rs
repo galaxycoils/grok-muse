@@ -30,11 +30,18 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Bundle helper and daemon into macOS .app structure
-    Bundle,
+    Bundle {
+        /// Build release binaries instead of debug
+        #[arg(long)]
+        release: bool,
+    },
     /// Sign binaries with detected or self-signed identity
     Sign {
         #[arg(long)]
         identity: Option<String>,
+        /// Bundle release binaries instead of debug if building bundles
+        #[arg(long)]
+        release: bool,
     },
     /// Assemble a distributable macOS .dmg containing GrokMuse.app and GrokMuseCUHelper.app
     Dmg {
@@ -92,6 +99,9 @@ enum Commands {
         /// Skip code signing prior to installation
         #[arg(long)]
         no_sign: bool,
+        /// Build and install release binaries instead of debug
+        #[arg(long)]
+        release: bool,
     },
 }
 
@@ -193,37 +203,44 @@ fn detect_identity() -> String {
     "-".into()
 }
 
-fn create_app_bundles() -> Result<(), Box<dyn std::error::Error>> {
+fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(workspace_root) = manifest_dir.parent() {
         let _ = std::env::set_current_dir(workspace_root);
     }
 
-    println!("==> Compiling Grok-Muse binaries for bundling...");
-    let build_status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "gm-cu-helper",
-            "-p",
-            "gm-daemon",
-            "-p",
-            "gm-ui",
-            "--bin",
-            "gm",
-        ])
-        .status()?;
+    println!("==> Compiling Grok-Muse binaries for bundling (release={release})...");
+    let mut args = vec![
+        "build",
+        "-p",
+        "gm-cu-helper",
+        "-p",
+        "gm-daemon",
+        "-p",
+        "gm-ui",
+        "--bin",
+        "gm",
+    ];
+    if release {
+        args.push("--release");
+    }
+    let build_status = Command::new("cargo").args(&args).status()?;
     if !build_status.success() {
         return Err("Failed to build binaries for bundling".into());
     }
 
-    println!("==> Bundling Grok-Muse applications...");
+    let bin_dir = if release {
+        "target/release"
+    } else {
+        "target/debug"
+    };
+    println!("==> Bundling Grok-Muse applications from {bin_dir}...");
     let helper_app_dir = Path::new("target/bundle/GrokMuseCUHelper.app/Contents/MacOS");
     fs::create_dir_all(helper_app_dir)?;
 
     // Copy helper binary
     fs::copy(
-        "target/debug/gm-cu-helper",
+        format!("{bin_dir}/gm-cu-helper"),
         helper_app_dir.join("gm-cu-helper"),
     )?;
 
@@ -261,9 +278,12 @@ fn create_app_bundles() -> Result<(), Box<dyn std::error::Error>> {
     // Bundle main GrokMuse.app
     let app_macos_dir = Path::new("target/bundle/GrokMuse.app/Contents/MacOS");
     fs::create_dir_all(app_macos_dir)?;
-    fs::copy("target/debug/gm-ui", app_macos_dir.join("gm-ui"))?;
-    fs::copy("target/debug/gm-daemon", app_macos_dir.join("gm-daemon"))?;
-    fs::copy("target/debug/gm", app_macos_dir.join("gm"))?;
+    fs::copy(format!("{bin_dir}/gm-ui"), app_macos_dir.join("gm-ui"))?;
+    fs::copy(
+        format!("{bin_dir}/gm-daemon"),
+        app_macos_dir.join("gm-daemon"),
+    )?;
+    fs::copy(format!("{bin_dir}/gm"), app_macos_dir.join("gm"))?;
 
     let app_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -333,7 +353,7 @@ fn assemble_dmg(id: &str, output: &str) -> Result<(), Box<dyn std::error::Error>
     println!("==> Assembling distributable macOS DMG with identity: {id}");
 
     // 1. Compile & assemble bundles
-    create_app_bundles()?;
+    create_app_bundles(false)?;
 
     // 2. Sign both bundles with hardened runtime & entitlements
     println!(
@@ -413,7 +433,19 @@ fn assemble_dmg(id: &str, output: &str) -> Result<(), Box<dyn std::error::Error>
         return Err("hdiutil verify failed".into());
     }
 
-    // 6. Cleanup staging
+    // 6. Generate SHA-256 release checksum file
+    println!("==> Generating release SHA-256 checksum file...");
+    let dmg_bytes = fs::read(output)?;
+    let sha256_digest = gm_core::hash::compute_sha256(&dmg_bytes);
+    let dmg_filename = Path::new(output)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Grok-Muse.dmg".into());
+    let sha_path = format!("{output}.sha256");
+    fs::write(&sha_path, format!("{sha256_digest}  {dmg_filename}\n"))?;
+    println!("==> Release checksum file generated: {sha_path} ({sha256_digest})");
+
+    // 7. Cleanup staging
     let _ = fs::remove_dir_all(staging);
 
     let meta = fs::metadata(output)?;
@@ -430,6 +462,7 @@ fn assemble_dmg(id: &str, output: &str) -> Result<(), Box<dyn std::error::Error>
     println!("  Hardened Runtime   : ENABLED (--options runtime)");
     println!("  Entitlements       : entitlements.plist");
     println!("  DMG Checksum       : VALID (hdiutil verify)");
+    println!("  Release Checksum   : {sha_path}");
     println!("════════════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -794,11 +827,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Bundle => {
-            create_app_bundles()?;
+        Commands::Bundle { release } => {
+            create_app_bundles(release)?;
         }
 
-        Commands::Sign { identity } => {
+        Commands::Sign { identity, release } => {
             let id = identity.unwrap_or_else(detect_identity);
             println!("==> Signing artifacts with identity: {id}");
 
@@ -807,7 +840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !Path::new(helper_app).exists() || !Path::new(main_app).exists() {
                 println!("App bundles not found. Building bundles first...");
-                create_app_bundles()?;
+                create_app_bundles(release)?;
             }
 
             println!("==> Signing helper and main bundles with hardened runtime & entitlements...");
@@ -855,8 +888,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bin_dir,
             identity,
             no_sign,
+            release,
         } => {
-            run_install(dest_dir, bin_dir, identity, no_sign)?;
+            run_install(dest_dir, bin_dir, identity, no_sign, release)?;
         }
     }
 
@@ -1704,11 +1738,61 @@ async fn run_test_all(identity: Option<String>) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest_path = dst.as_ref().join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(entry.path(), &dest_path)?;
+        } else if file_type.is_symlink() {
+            let link_target = fs::read_link(entry.path())?;
+            if dest_path.exists() || fs::symlink_metadata(&dest_path).is_ok() {
+                let _ = fs::remove_file(&dest_path);
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(link_target, &dest_path)?;
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_file(link_target, &dest_path);
+            }
+        } else {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_symlink(target: &Path, link_path: &Path) -> std::io::Result<()> {
+    if link_path.exists() || fs::symlink_metadata(link_path).is_ok() {
+        let _ = fs::remove_file(link_path);
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link_path)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link_path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Symlinks not supported on this OS",
+        ))
+    }
+}
+
 fn run_install(
     dest_dir: Option<PathBuf>,
     bin_dir: Option<PathBuf>,
     identity: Option<String>,
     no_sign: bool,
+    release: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(workspace_root) = manifest_dir.parent() {
@@ -1720,7 +1804,7 @@ fn run_install(
     println!("===============================================================================\n");
 
     // 1. Compile & assemble app bundles
-    create_app_bundles()?;
+    create_app_bundles(release)?;
 
     // 2. Code sign bundles unless explicitly skipped
     if !no_sign {
@@ -1768,18 +1852,10 @@ fn run_install(
             let _ = fs::remove_dir_all(&dest);
         }
 
-        let cp_status = Command::new("cp")
-            .args([
-                "-R",
-                src.to_str().unwrap(),
-                target_app_dir.to_str().unwrap(),
-            ])
-            .status()?;
-        if !cp_status.success() {
-            return Err(format!("Failed to copy {app_name} to {:?}", target_app_dir).into());
-        }
+        copy_dir_all(&src, &dest)?;
 
         // Verify codesign of installed app
+        #[cfg(target_os = "macos")]
         if !no_sign {
             let _ = Command::new("codesign")
                 .args(["--verify", "--deep", "--strict", dest.to_str().unwrap()])
@@ -1818,20 +1894,12 @@ fn run_install(
 
     for (link_name, target_file) in symlinks {
         let link_path = target_bin_dir.join(link_name);
-        if link_path.exists() || fs::symlink_metadata(&link_path).is_ok() {
-            let _ = fs::remove_file(&link_path);
-        }
-
         println!("  Symlinking {:?} -> {:?}", link_path, target_file);
-        let ln_status = Command::new("ln")
-            .args([
-                "-sf",
-                target_file.to_str().unwrap(),
-                link_path.to_str().unwrap(),
-            ])
-            .status()?;
-        if !ln_status.success() {
-            eprintln!("  Warning: failed to create symlink at {:?}", link_path);
+        if let Err(e) = create_symlink(&target_file, &link_path) {
+            eprintln!(
+                "  Warning: failed to create symlink at {:?}: {}",
+                link_path, e
+            );
         }
     }
 
@@ -1942,7 +2010,8 @@ mod tests {
             Some(test_apps.clone()),
             Some(test_bin.clone()),
             None,
-            true, // no_sign for fast offline test
+            true,  // no_sign for fast offline test
+            false, // debug
         );
         assert!(res.is_ok(), "run_install failed: {:?}", res.err());
 

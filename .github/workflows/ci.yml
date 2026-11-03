@@ -51,6 +51,13 @@ jobs:
         working-directory: grok-muse
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Check Windows target platform foundations
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --target x86_64-pc-windows-gnu -p gm-platform -p gm-core -p gm-cu-helper
+
       - name: Run nextest
         working-directory: grok-muse
         run: cargo nextest run --workspace --all-features

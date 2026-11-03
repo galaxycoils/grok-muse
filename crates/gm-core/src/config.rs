@@ -12,11 +12,47 @@ pub struct GmConfig {
 
 impl Default for GmConfig {
     fn default() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let app_support = PathBuf::from(home).join("Library/Application Support/GrokMuse");
+        #[cfg(target_os = "windows")]
+        let (socket_path, storage_dir) = {
+            let app_data = std::env::var("APPDATA")
+                .or_else(|_| std::env::var("LOCALAPPDATA"))
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".into());
+            let storage = PathBuf::from(app_data).join("GrokMuse");
+            let socket = PathBuf::from(r"\\.\pipe\grok-muse-cu-helper");
+            (socket, storage)
+        };
+
+        #[cfg(target_os = "linux")]
+        let (socket_path, storage_dir) = {
+            let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                format!("{home}/.local/share")
+            });
+            let storage = PathBuf::from(data_home).join("grok-muse");
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+            let socket = PathBuf::from(runtime_dir).join("grok-muse-cu-helper.sock");
+            (socket, storage)
+        };
+
+        #[cfg(target_os = "macos")]
+        let (socket_path, storage_dir) = {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let app_support = PathBuf::from(home).join("Library/Application Support/GrokMuse");
+            let socket = app_support.join("cu-helper.sock");
+            (socket, app_support)
+        };
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        let (socket_path, storage_dir) = {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let base = PathBuf::from(home).join(".grok-muse");
+            (base.join("cu-helper.sock"), base)
+        };
+
         Self {
-            socket_path: app_support.join("cu-helper.sock"),
-            storage_dir: app_support,
+            socket_path,
+            storage_dir,
             providers: ProvidersConfig::default(),
             safety: SafetyConfig::default(),
             budget: BudgetConfig::default(),
