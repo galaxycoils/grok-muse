@@ -49,11 +49,11 @@ jobs:
 
       - name: Clippy check
         working-directory: grok-muse
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run nextest
         working-directory: grok-muse
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --all-features
 
       - name: Run G5 eval suite gate
         working-directory: grok-muse

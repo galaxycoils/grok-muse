@@ -67,8 +67,25 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let idx = ((sorted.len() as f64) * pct).ceil() as usize - 1;
+    let pct_clamped = pct.clamp(0.0, 1.0);
+    let idx = (((sorted.len() as f64) * pct_clamped).ceil() as usize).saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)]
+}
+
+pub fn extract_mount_point(plist_str: &str) -> Option<PathBuf> {
+    if let Some(key_idx) = plist_str.find("<key>mount-point</key>") {
+        let after_key = &plist_str[key_idx + "<key>mount-point</key>".len()..];
+        if let Some(str_start) = after_key.find("<string>") {
+            let after_str = &after_key[str_start + "<string>".len()..];
+            if let Some(str_end) = after_str.find("</string>") {
+                let mp = after_str[..str_end].trim();
+                if !mp.is_empty() {
+                    return Some(PathBuf::from(mp));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn measure_process_tree_memory(pids: &[u32]) -> (f64, String) {
@@ -416,22 +433,7 @@ fn run_verify_dmg(dmg_path_str: &str) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         let plist_str = String::from_utf8_lossy(&output.stdout);
-        let mut mount_point: Option<PathBuf> = None;
-        let lines: Vec<&str> = plist_str.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if line.contains("<key>mount-point</key>") && i + 1 < lines.len() {
-                let next_line = lines[i + 1];
-                if let Some(start) = next_line.find("<string>")
-                    && let Some(end) = next_line.find("</string>")
-                {
-                    let mp = &next_line[start + 8..end];
-                    mount_point = Some(PathBuf::from(mp));
-                    break;
-                }
-            }
-        }
-
-        let mp = mount_point.ok_or_else(|| {
+        let mp = extract_mount_point(&plist_str).ok_or_else(|| {
             format!("Could not extract mount point from attach output for {dmg_path_str}")
         })?;
         println!("    ✔ Mounted volume at: {:?}", mp);
@@ -440,9 +442,17 @@ fn run_verify_dmg(dmg_path_str: &str) -> Result<(), Box<dyn std::error::Error>> 
         struct DmgGuard(PathBuf);
         impl Drop for DmgGuard {
             fn drop(&mut self) {
-                let _ = Command::new("hdiutil")
-                    .args(["detach", self.0.to_str().unwrap(), "-force"])
-                    .status();
+                let mp_str = self.0.to_string_lossy();
+                let ejected = Command::new("diskutil")
+                    .args(["eject", &mp_str])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ejected {
+                    let _ = Command::new("hdiutil")
+                        .args(["detach", &mp_str, "-force"])
+                        .status();
+                }
             }
         }
         let guard = DmgGuard(mp.clone());
@@ -507,11 +517,19 @@ fn run_verify_dmg(dmg_path_str: &str) -> Result<(), Box<dyn std::error::Error>> 
 
         // 5. Clean detachment
         println!("  [Step 5/5] Detaching DMG cleanly...");
-        let detach_status = Command::new("hdiutil")
-            .args(["detach", mp.to_str().unwrap(), "-force"])
-            .status()?;
-        if !detach_status.success() {
-            return Err(format!("Failed to detach DMG at {:?}", mp).into());
+        let mp_str = mp.to_string_lossy();
+        let ejected = Command::new("diskutil")
+            .args(["eject", &mp_str])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ejected {
+            let detach_status = Command::new("hdiutil")
+                .args(["detach", &mp_str, "-force"])
+                .status()?;
+            if !detach_status.success() {
+                return Err(format!("Failed to detach DMG at {:?}", mp).into());
+            }
         }
         std::mem::forget(guard);
         println!("    ✔ Detached volume cleanly.");
@@ -1062,4 +1080,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_percentile_underflow_and_boundaries() {
+        assert_eq!(percentile(&[], 0.5), 0.0);
+
+        let data = vec![10.0];
+        assert_eq!(percentile(&data, 0.0), 10.0);
+        assert_eq!(percentile(&data, 0.5), 10.0);
+        assert_eq!(percentile(&data, 1.0), 10.0);
+
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile(&values, 0.0), 1.0);
+        assert_eq!(percentile(&values, 0.5), 3.0);
+        assert_eq!(percentile(&values, 1.0), 5.0);
+    }
+
+    #[test]
+    fn test_extract_mount_point_formats() {
+        let multiline_plist = r#"
+        <dict>
+            <key>mount-point</key>
+            <string>/Volumes/Grok-Muse</string>
+        </dict>
+        "#;
+        assert_eq!(
+            extract_mount_point(multiline_plist),
+            Some(PathBuf::from("/Volumes/Grok-Muse"))
+        );
+
+        let inline_plist = "<key>mount-point</key><string>/Volumes/TestVolume 1</string>";
+        assert_eq!(
+            extract_mount_point(inline_plist),
+            Some(PathBuf::from("/Volumes/TestVolume 1"))
+        );
+
+        let missing_plist = "<dict><key>dev-entry</key><string>/dev/disk4s1</string></dict>";
+        assert_eq!(extract_mount_point(missing_plist), None);
+    }
 }

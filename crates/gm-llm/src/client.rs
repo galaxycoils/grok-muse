@@ -322,25 +322,42 @@ impl LlmBackend for ReqwestLlmBackend {
         let mut first_token_time: Option<std::time::Instant> = None;
         let mut full_text = String::new();
         let mut buffer = String::new();
+        let mut parsed_prompt_tokens: Option<u32> = None;
+        let mut parsed_completion_tokens: Option<u32> = None;
 
-        while let Ok(Some(chunk)) = resp.chunk().await {
+        'stream: while let Ok(Some(chunk)) = resp.chunk().await {
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim().to_string();
                 buffer.drain(..pos + 1);
 
-                if let Some(data) = line.strip_prefix("data: ") {
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let data = payload.trim();
                     if data == "[DONE]" {
-                        break;
+                        break 'stream;
                     }
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data)
-                        && let Some(delta) = val["choices"][0]["delta"]["content"].as_str()
-                        && !delta.is_empty()
-                    {
-                        if first_token_time.is_none() {
-                            first_token_time = Some(std::time::Instant::now());
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = val["choices"][0]["delta"]["content"].as_str()
+                            && !delta.is_empty()
+                        {
+                            if first_token_time.is_none() {
+                                first_token_time = Some(std::time::Instant::now());
+                            }
+                            full_text.push_str(delta);
                         }
-                        full_text.push_str(delta);
+
+                        if let Some(usage) = val.get("usage") {
+                            if let Some(pt) = usage["prompt_tokens"].as_u64() {
+                                parsed_prompt_tokens = Some(pt as u32);
+                            }
+                            if let Some(ct) = usage["completion_tokens"].as_u64() {
+                                parsed_completion_tokens = Some(ct as u32);
+                            }
+                        }
                     }
                 }
             }
@@ -351,8 +368,9 @@ impl LlmBackend for ReqwestLlmBackend {
             .map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
             .unwrap_or(total_time_ms * 0.35);
 
-        let completion_tokens = (full_text.split_whitespace().count() as f64 * 1.3).ceil() as u32;
-        let prompt_tokens = 50;
+        let completion_tokens = parsed_completion_tokens
+            .unwrap_or_else(|| (full_text.split_whitespace().count() as f64 * 1.3).ceil() as u32);
+        let prompt_tokens = parsed_prompt_tokens.unwrap_or(50);
         let gen_time_s = (total_time_ms - ttft_ms) / 1000.0;
         let tokens_per_second = if gen_time_s > 0.0 {
             (completion_tokens as f64) / gen_time_s
@@ -435,19 +453,28 @@ impl LlmBackend for CalibratedFastRouteBackend {
         target: &ModelTarget,
         _messages: &[ChatMessage],
     ) -> Result<(ChatCompletionResponse, LlmStreamMetrics)> {
+        let start = std::time::Instant::now();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         let jitter = ((nanos % 40) as f64) - 20.0;
-        let actual_ttft = (self.ttft_ms + jitter).max(50.0);
-        tokio::time::sleep(std::time::Duration::from_millis(actual_ttft as u64)).await;
+        let target_ttft = (self.ttft_ms + jitter).max(50.0);
+        tokio::time::sleep(std::time::Duration::from_millis(target_ttft as u64)).await;
+        let actual_ttft = start.elapsed().as_secs_f64() * 1000.0;
 
         let tokens = 25u32;
-        let gen_ms = (tokens as f64 / self.tokens_per_second) * 1000.0;
-        tokio::time::sleep(std::time::Duration::from_millis(gen_ms as u64)).await;
+        let target_gen_ms = (tokens as f64 / self.tokens_per_second) * 1000.0;
+        let gen_start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(target_gen_ms as u64)).await;
+        let actual_gen_s = gen_start.elapsed().as_secs_f64();
 
-        let total_ms = actual_ttft + gen_ms;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let actual_tps = if actual_gen_s > 0.0 {
+            (tokens as f64) / actual_gen_s
+        } else {
+            self.tokens_per_second
+        };
         let resp = ChatCompletionResponse {
             id: "calibrated_resp".into(),
             content: self.action_content.clone(),
@@ -459,7 +486,7 @@ impl LlmBackend for CalibratedFastRouteBackend {
         let metrics = LlmStreamMetrics {
             ttft_ms: actual_ttft,
             total_duration_ms: total_ms,
-            tokens_per_second: (tokens as f64) / (gen_ms / 1000.0),
+            tokens_per_second: actual_tps,
             prompt_tokens: 45,
             completion_tokens: tokens,
             full_content: self.action_content.clone(),

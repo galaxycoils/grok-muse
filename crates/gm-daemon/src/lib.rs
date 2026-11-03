@@ -625,9 +625,11 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
         }
 
         if input == "/clear" {
-            let sys = history[0].clone();
+            let sys = history.first().cloned();
             history.clear();
-            history.push(sys);
+            if let Some(s) = sys {
+                history.push(s);
+            }
             writeln!(writer, "✔ Conversation history cleared.\n")?;
             writer.flush()?;
             continue;
@@ -638,11 +640,25 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             let asst_msgs = history.iter().filter(|m| m.role == "assistant").count();
             writeln!(
                 writer,
-                "Context History: {} messages total ({} user, {} assistant)\n",
+                "Context History: {} messages total ({} user, {} assistant)",
                 history.len(),
                 user_msgs,
                 asst_msgs
             )?;
+            for (idx, msg) in history.iter().enumerate() {
+                if idx == 0 && msg.role == "system" {
+                    continue;
+                }
+                let preview: String = msg.content.chars().take(80).collect();
+                let ellipsis = if msg.content.chars().count() > 80 {
+                    "..."
+                } else {
+                    ""
+                };
+                let role = &msg.role;
+                writeln!(writer, "  [{idx}] {role}: {preview}{ellipsis}")?;
+            }
+            writeln!(writer)?;
             writer.flush()?;
             continue;
         }
@@ -699,7 +715,11 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             continue;
         }
 
-        if input.starts_with("/memory") || input.starts_with("/mem") {
+        if input == "/memory"
+            || input.starts_with("/memory ")
+            || input == "/mem"
+            || input.starts_with("/mem ")
+        {
             let query = if let Some(q) = input.strip_prefix("/memory") {
                 q.trim()
             } else if let Some(q) = input.strip_prefix("/mem") {
@@ -751,7 +771,11 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             continue;
         }
 
-        if input.starts_with("/do") || input.starts_with("/task") {
+        if input == "/do"
+            || input.starts_with("/do ")
+            || input == "/task"
+            || input.starts_with("/task ")
+        {
             let task_instruction = if let Some(t) = input.strip_prefix("/do") {
                 t.trim()
             } else if let Some(t) = input.strip_prefix("/task") {
@@ -800,6 +824,17 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             continue;
         }
 
+        // Check for unrecognized slash commands
+        if input.starts_with('/') {
+            let cmd = input.split_whitespace().next().unwrap_or(input);
+            writeln!(
+                writer,
+                "Unknown command: '{cmd}'. Type /help for available commands.\n"
+            )?;
+            writer.flush()?;
+            continue;
+        }
+
         // Regular conversational message
         // 1. Contextual memory retrieval
         let memory_context = match memory.search(input, 3) {
@@ -844,6 +879,7 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
                 );
             }
             Err(e) => {
+                history.pop();
                 writeln!(writer, "\nError completing chat request: {}\n", e)?;
             }
         }
@@ -1332,6 +1368,26 @@ mod tests {
         assert!(out_str.contains("System Status Inspection"));
         assert!(out_str.contains("Context History:"));
         assert!(out_str.contains("Conversation history cleared."));
+        assert!(out_str.contains("Exiting Grok-Muse chat. Goodbye!"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_repl_edge_cases_unknown_and_boundaries() {
+        let input = "   \n/unknown_cmd\n/document code\n/members in team\n/do\n/memory\nWhat is your role?\n/history\n/quit\n";
+        let reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+
+        let res = run_chat_loop(reader, &mut output, None, None).await;
+        assert!(res.is_ok());
+
+        let out_str = String::from_utf8_lossy(&output);
+        assert!(out_str.contains("Unknown command: '/unknown_cmd'"));
+        assert!(out_str.contains("Unknown command: '/document'"));
+        assert!(out_str.contains("Unknown command: '/members'"));
+        assert!(out_str.contains("Usage: /do <task instruction>"));
+        assert!(out_str.contains("Usage: /memory <search terms>"));
+        assert!(out_str.contains("[1] user:"));
+        assert!(out_str.contains("[2] assistant:"));
         assert!(out_str.contains("Exiting Grok-Muse chat. Goodbye!"));
     }
 }

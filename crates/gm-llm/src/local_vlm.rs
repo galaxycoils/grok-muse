@@ -24,6 +24,14 @@ impl VlmBoundingBox {
             (self.y_min + self.y_max) / 2.0,
         )
     }
+
+    pub fn width(&self) -> f64 {
+        (self.x_max - self.x_min).abs()
+    }
+
+    pub fn height(&self) -> f64 {
+        (self.y_max - self.y_min).abs()
+    }
 }
 
 /// Result of grounding a natural language query against visual image input.
@@ -376,5 +384,43 @@ mod tests {
         assert_eq!(resp.model, "qwen2-vl-2b-metal");
         assert_eq!(resp.estimated_cost_usd, 0.0);
         assert!(resp.content.contains("click"));
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_client_integration_with_local_vlm_adapter() {
+        use crate::budget::BudgetManager;
+        use crate::client::HybridLlmClient;
+        use gm_core::config::BudgetConfig;
+
+        let bridge = Arc::new(CandleMlxBridgeBackend::new(CandleMlxBridgeConfig::default()));
+        let adapter = Arc::new(LocalVlmLlmAdapter::new(bridge));
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let hybrid = HybridLlmClient::new(adapter, budget.clone());
+
+        let target = ModelTarget {
+            provider: crate::router::ProviderKind::Meta,
+            api_base: "local://vlm".into(),
+            model: "smolvlm-instruct-mlx".into(),
+            allow_vision: true,
+        };
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Locate Submit button".into(),
+        }];
+
+        let resp = hybrid
+            .execute_routed(&target, None, &messages)
+            .await
+            .unwrap();
+        assert_eq!(resp.model, "smolvlm-instruct-mlx");
+        assert_eq!(resp.estimated_cost_usd, 0.0);
+        assert_eq!(budget.get_daily_spent(), 0.0);
+
+        let (stream_resp, metrics) = hybrid
+            .execute_routed_stream(&target, None, &messages)
+            .await
+            .unwrap();
+        assert_eq!(stream_resp.model, "smolvlm-instruct-mlx");
+        assert!(metrics.total_duration_ms >= 0.0);
     }
 }
