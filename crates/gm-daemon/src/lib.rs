@@ -2724,6 +2724,7 @@ mod tests {
         let _ = std::fs::remove_file(&helper_socket);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_dual_socket_run_kill_with_config_under_50ms() {
         let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
@@ -2844,6 +2845,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_openbot_cli_subcommands_and_daemon_ipc() {
         let temp_dir = tempfile::tempdir().unwrap();
