@@ -239,8 +239,7 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
         "gm-daemon",
         "-p",
         "gm-ui",
-        "--bin",
-        "gm",
+        "--bins",
     ];
     if release {
         args.push("--release");

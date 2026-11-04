@@ -19,8 +19,8 @@ impl VlmDeviceContext {
             VlmDevice::Metal => {
                 #[cfg(feature = "metal")]
                 {
-                    match Device::new_metal(0) {
-                        Ok(metal_dev) => {
+                    match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                        Ok(Ok(metal_dev)) => {
                             info!(
                                 "Initialized Apple Silicon Metal acceleration for local VLM (Device 0)"
                             );
@@ -31,9 +31,20 @@ impl VlmDeviceContext {
                                 is_accelerated: true,
                             }
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             warn!(
                                 "Metal initialization failed ({err}); falling back to CPU execution"
+                            );
+                            Self {
+                                device: Device::Cpu,
+                                active_device_kind: VlmDevice::Cpu,
+                                requested_device_kind: VlmDevice::Metal,
+                                is_accelerated: false,
+                            }
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Metal runtime class unavailable on this macOS version; falling back to CPU execution"
                             );
                             Self {
                                 device: Device::Cpu,
