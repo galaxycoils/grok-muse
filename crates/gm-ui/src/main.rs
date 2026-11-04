@@ -2,9 +2,9 @@ mod native;
 use clap::{Parser, Subcommand};
 use gm_core::config::GmConfig;
 use gm_core::error::Result;
-use gm_core::ipc::{
-    DaemonEvent, DaemonRequest, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message,
-};
+use gm_core::ipc::DaemonRequest;
+#[cfg(unix)]
+use gm_core::ipc::{DaemonEvent, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::path::Path;
@@ -179,6 +179,7 @@ extern "C" fn approval_decision_callback(
     }
 }
 
+#[cfg(unix)]
 fn handle_daemon_event(ev: DaemonEvent) {
     #[cfg(target_os = "macos")]
     match ev {
@@ -386,38 +387,42 @@ async fn run_ui_tokio_client(
     ensure_daemon_running(&config, None).await;
 
     // 2. Background event subscriber with auto-reconnect
-    let daemon_socket = config.daemon_socket_path.clone();
-    tokio::spawn(async move {
-        loop {
-            #[cfg(unix)]
-            if let Ok(mut stream) = tokio::net::UnixStream::connect(&daemon_socket).await {
-                info!("Connected to gm-daemon event bus");
-                let sub_req = IpcMessage {
-                    id: 1,
-                    payload: DaemonRequest::SubscribeEvents,
-                };
-                if write_ipc_message(&mut stream, &sub_req).await.is_ok() {
-                    // Read initial Ack
-                    let _ack: Result<IpcMessage<DaemonResponse>> =
-                        read_ipc_message(&mut stream).await;
-                    loop {
-                        match read_ipc_message::<_, IpcMessage<DaemonResponse>>(&mut stream).await {
-                            Ok(msg) => {
-                                if let DaemonResponse::Event(ev) = msg.payload {
-                                    handle_daemon_event(ev);
+    #[cfg(unix)]
+    {
+        let daemon_socket = config.daemon_socket_path.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut stream) = tokio::net::UnixStream::connect(&daemon_socket).await {
+                    info!("Connected to gm-daemon event bus");
+                    let sub_req = IpcMessage {
+                        id: 1,
+                        payload: DaemonRequest::SubscribeEvents,
+                    };
+                    if write_ipc_message(&mut stream, &sub_req).await.is_ok() {
+                        // Read initial Ack
+                        let _ack: Result<IpcMessage<DaemonResponse>> =
+                            read_ipc_message(&mut stream).await;
+                        loop {
+                            match read_ipc_message::<_, IpcMessage<DaemonResponse>>(&mut stream)
+                                .await
+                            {
+                                Ok(msg) => {
+                                    if let DaemonResponse::Event(ev) = msg.payload {
+                                        handle_daemon_event(ev);
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("Daemon event stream disconnected: {e}");
-                                break;
+                                Err(e) => {
+                                    warn!("Daemon event stream disconnected: {e}");
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    });
+        });
+    }
 
     // 3. Process commands dispatched from AppKit callbacks
     while let Some(cmd) = cmd_rx.recv().await {
