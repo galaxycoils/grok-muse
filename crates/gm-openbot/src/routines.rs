@@ -220,62 +220,144 @@ impl DurableTaskQueue {
             return Ok(None);
         }
         let next = routine.next_after(now)?.to_rfc3339();
-
-        if let Some(ref q) = routine.quiet_hours {
-            let tz = routine.timezone.parse::<Tz>().map_err(error)?;
-            let local_hour = now.with_timezone(&tz).hour();
-            if q.is_quiet(local_hour) {
-                let run_id = format!("run-quiet-{}-{}", routine.id, due.timestamp());
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO routine_runs_v1(id,routine_id,task_id,scheduled_for,fired_at,status) VALUES (?1,?2,NULL,?3,?4,'skipped_quiet_hours')",
-                    params![run_id, routine.id, due.to_rfc3339(), now.to_rfc3339()],
-                );
-                tx.execute(
-                    "UPDATE routines_v1 SET next_due=?1 WHERE id=?2",
-                    params![next, routine.id],
-                )
-                .map_err(error)?;
-                tx.commit().map_err(error)?;
-                return Ok(None);
-            }
-        }
-
-        let active = if let Some(last) = last {
-            tx.query_row("SELECT status NOT IN ('completed','failed','cancelled') FROM bot_tasks WHERE id=?1",[last],|r|r.get::<_,bool>(0)).optional().map_err(error)?.unwrap_or(false)
-        } else {
-            false
-        };
-        if active {
-            let run_id = format!("run-overlap-{}-{}", routine.id, due.timestamp());
-            let _ = tx.execute(
-                "INSERT OR REPLACE INTO routine_runs_v1(id,routine_id,task_id,scheduled_for,fired_at,status) VALUES (?1,?2,NULL,?3,?4,'overlap_suppressed')",
-                params![run_id, routine.id, due.to_rfc3339(), now.to_rfc3339()],
-            );
-            tx.execute(
-                "UPDATE routines_v1 SET next_due=?1 WHERE id=?2",
-                params![next, routine.id],
-            )
-            .map_err(error)?;
-            tx.commit().map_err(error)?;
-            return Ok(None);
-        }
-        let task_id = format!("routine-{}-{}", routine.id, due.timestamp());
-        let timestamp = now.to_rfc3339();
-        tx.execute("INSERT OR REPLACE INTO bot_tasks(id,bot_id,channel_id,status,instruction,created_at,updated_at) VALUES (?1,?2,?3,'queued',?4,?5,?5)",
-            params![task_id,routine.bot_id,routine.channel_id,routine.instruction,timestamp]).map_err(error)?;
-        let run_id = format!("run-{}-{}", routine.id, due.timestamp());
-        let _ = tx.execute(
-            "INSERT OR REPLACE INTO routine_runs_v1(id,routine_id,task_id,scheduled_for,fired_at,status) VALUES (?1,?2,?3,?4,?5,'queued')",
-            params![run_id, routine.id, task_id, due.to_rfc3339(), timestamp],
-        );
+        let (_, task_id) = admit_run(&tx, routine, last, due, now, &due.timestamp().to_string())?;
         tx.execute(
-            "UPDATE routines_v1 SET next_due=?1,last_task_id=?2 WHERE id=?3",
-            params![next, task_id, routine.id],
+            "UPDATE routines_v1 SET next_due=?1 WHERE id=?2",
+            params![next, routine.id],
         )
         .map_err(error)?;
         tx.commit().map_err(error)?;
-        Ok(Some(task_id))
+        Ok(task_id)
     }
+
+    /// Runs an enabled routine now for an external trigger (webhook/app event).
+    /// `delivery_id` is claimed in the same transaction, so a redelivery never
+    /// queues twice and a failed admission leaves the delivery retryable.
+    /// Returns `None` for an unknown routine. The schedule is not advanced.
+    pub fn trigger_routine(
+        &self,
+        routine_id: &str,
+        delivery_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<RoutineTriggerOutcome>> {
+        if delivery_id.is_empty()
+            || delivery_id.len() > 128
+            || !delivery_id.bytes().all(|c| c.is_ascii_graphic())
+        {
+            return Err(error(
+                "Delivery identifier must be 1-128 visible ASCII characters",
+            ));
+        }
+        let mut connection = self.conn.lock();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(error)?;
+        let current: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT config_json,last_task_id FROM routines_v1 WHERE id=?1",
+                [routine_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        let Some((json, last)) = current else {
+            return Ok(None);
+        };
+        let routine: Routine = serde_json::from_str(&json)?;
+        let outcome = |status: &str, task_id| {
+            Ok(Some(RoutineTriggerOutcome {
+                status: status.into(),
+                task_id,
+            }))
+        };
+        // Disabled (including freshly imported) routines do not consume the delivery.
+        if !routine.enabled {
+            return outcome("disabled", None);
+        }
+        let claimed = tx
+            .execute(
+                "INSERT OR IGNORE INTO bridge_deliveries(delivery_id,received_at) VALUES (?1,?2)",
+                params![
+                    format!("routine:{routine_id}:{delivery_id}"),
+                    now.timestamp()
+                ],
+            )
+            .map_err(error)?
+            > 0;
+        if !claimed {
+            return outcome("duplicate", None);
+        }
+        let key = format!("hook-{}", uuid::Uuid::new_v4().simple());
+        let (status, task_id) = admit_run(&tx, &routine, last, now, now, &key)?;
+        tx.commit().map_err(error)?;
+        outcome(status, task_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RoutineTriggerOutcome {
+    /// `queued`, `duplicate`, `disabled`, `overlap_suppressed` or `skipped_quiet_hours`.
+    pub status: String,
+    pub task_id: Option<String>,
+}
+
+/// Applies quiet hours and overlap prevention inside the caller's transaction,
+/// records the run, and queues a task when admitted.
+fn admit_run(
+    tx: &rusqlite::Transaction<'_>,
+    routine: &Routine,
+    last: Option<String>,
+    scheduled_for: DateTime<Utc>,
+    now: DateTime<Utc>,
+    key: &str,
+) -> Result<(&'static str, Option<String>)> {
+    let record = |run_id: String, task_id: Option<&str>, status: &str| {
+        tx.execute(
+            "INSERT OR REPLACE INTO routine_runs_v1(id,routine_id,task_id,scheduled_for,fired_at,status) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![run_id, routine.id, task_id, scheduled_for.to_rfc3339(), now.to_rfc3339(), status],
+        )
+        .map_err(error)
+    };
+    if let Some(ref q) = routine.quiet_hours {
+        let tz = routine.timezone.parse::<Tz>().map_err(error)?;
+        if q.is_quiet(now.with_timezone(&tz).hour()) {
+            let status = "skipped_quiet_hours";
+            record(format!("run-quiet-{}-{key}", routine.id), None, status)?;
+            return Ok((status, None));
+        }
+    }
+    let active = if let Some(last) = last {
+        tx.query_row(
+            "SELECT status NOT IN ('completed','failed','cancelled') FROM bot_tasks WHERE id=?1",
+            [last],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(error)?
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    if active {
+        let status = "overlap_suppressed";
+        record(format!("run-overlap-{}-{key}", routine.id), None, status)?;
+        return Ok((status, None));
+    }
+    let task_id = format!("routine-{}-{key}", routine.id);
+    let timestamp = now.to_rfc3339();
+    tx.execute("INSERT OR REPLACE INTO bot_tasks(id,bot_id,channel_id,status,instruction,created_at,updated_at) VALUES (?1,?2,?3,'queued',?4,?5,?5)",
+        params![task_id,routine.bot_id,routine.channel_id,routine.instruction,timestamp]).map_err(error)?;
+    record(
+        format!("run-{}-{key}", routine.id),
+        Some(&task_id),
+        "queued",
+    )?;
+    tx.execute(
+        "UPDATE routines_v1 SET last_task_id=?1 WHERE id=?2",
+        params![task_id, routine.id],
+    )
+    .map_err(error)?;
+    Ok(("queued", Some(task_id)))
 }
 impl OpenBotSupervisor {
     pub fn save_routine(&self, routine: &Routine) -> Result<()> {
@@ -322,6 +404,46 @@ impl OpenBotSupervisor {
         limit: usize,
     ) -> Result<Vec<RoutineRunRecord>> {
         self.queue().list_routine_runs(routine_id, limit)
+    }
+    /// External trigger entry point. Applies the same bot/channel gates as scheduled ticks.
+    pub fn trigger_routine(
+        &self,
+        routine_id: &str,
+        delivery_id: &str,
+    ) -> Result<Option<RoutineTriggerOutcome>> {
+        let Some(state) = self
+            .queue()
+            .list_routines()?
+            .into_iter()
+            .find(|s| s.routine.id == routine_id)
+        else {
+            return Ok(None);
+        };
+        let routine = state.routine;
+        if self.roster().get_bot(&routine.bot_id).is_none() {
+            return Err(error("Routine bot is unavailable"));
+        }
+        if let Some(channel) = &routine.channel_id {
+            match self.channels().get_channel(channel)? {
+                Some(c) if !c.paused && !c.archived => {}
+                _ => return Err(error("Routine channel is paused, archived or missing")),
+            }
+        }
+        let outcome = self
+            .queue()
+            .trigger_routine(routine_id, delivery_id, Utc::now())?;
+        if let Some(RoutineTriggerOutcome {
+            task_id: Some(id), ..
+        }) = &outcome
+        {
+            self.emit_agui(
+                "ROUTINE_QUEUED",
+                id,
+                &routine.bot_id,
+                serde_json::json!({"routine_id":routine.id,"trigger":"webhook"}),
+            );
+        }
+        Ok(outcome)
     }
 }
 #[cfg(test)]
@@ -443,6 +565,55 @@ mod tests {
         let runs2 = queue.list_routine_runs(&routine.id, 10).unwrap();
         assert_eq!(runs2.len(), 2);
         assert_eq!(runs2[0].status, "queued");
+
+        drop(queue);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_trigger_routine_deduplication_and_outcomes() {
+        let path =
+            std::env::temp_dir().join(format!("gm-routine-trig-{}.sqlite", uuid::Uuid::new_v4()));
+        let queue = DurableTaskQueue::open(&path).unwrap();
+        let routine = daily();
+        queue
+            .save_routine(&routine, time("2026-11-04T00:00:00Z"))
+            .unwrap();
+
+        let now = time("2026-11-04T12:00:00Z");
+        let outcome1 = queue
+            .trigger_routine(&routine.id, "delivery-1", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome1.status, "queued");
+        assert!(outcome1.task_id.is_some());
+
+        // Duplicate delivery_id is rejected
+        let outcome2 = queue
+            .trigger_routine(&routine.id, "delivery-1", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome2.status, "duplicate");
+        assert!(outcome2.task_id.is_none());
+
+        // Second delivery while first task is active is overlap_suppressed
+        let outcome3 = queue
+            .trigger_routine(&routine.id, "delivery-2", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome3.status, "overlap_suppressed");
+        assert!(outcome3.task_id.is_none());
+
+        // Cancel the first task so it is no longer active
+        queue.cancel(outcome1.task_id.as_deref().unwrap()).unwrap();
+
+        // Third delivery now succeeds
+        let outcome4 = queue
+            .trigger_routine(&routine.id, "delivery-3", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome4.status, "queued");
+        assert!(outcome4.task_id.is_some());
 
         drop(queue);
         let _ = std::fs::remove_file(path);
