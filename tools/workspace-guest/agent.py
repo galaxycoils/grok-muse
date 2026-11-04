@@ -7,9 +7,42 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import stat
 import time
 
-MAX_OUTPUT = 768 * 1024
+MAX_OUTPUT = 256 * 1024
+
+
+def export_artifacts(root):
+    exports = root / "exports"
+    if not exports.exists():
+        return []
+    if exports.is_symlink() or not exports.is_dir():
+        raise ValueError("Artifact exports must be a real directory")
+    artifacts, total, visited = [], 0, 0
+    for directory, folders, files in os.walk(exports, followlinks=False):
+        visited += len(folders) + len(files)
+        if visited > 1000:
+            raise ValueError("Too many artifact entries")
+        for name in folders:
+            if (Path(directory) / name).is_symlink():
+                raise ValueError("Artifact symlinks are forbidden")
+        for name in sorted(files):
+            path = Path(directory) / name
+            relative = path.relative_to(exports)
+            if any(part.startswith(".") for part in relative.parts) or len(artifacts) >= 32:
+                raise ValueError("Invalid artifact name or too many artifacts")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as source:
+                metadata = os.fstat(source.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024**2:
+                    raise ValueError("Artifact is not a regular file under 1 MiB")
+                data = source.read(1024**2 + 1)
+            total += len(data)
+            if len(data) > 1024**2 or total > 4 * 1024**2:
+                raise ValueError("Artifacts exceed export limits")
+            artifacts.append({"path": str(relative), "data": base64.b64encode(data).decode()})
+    return artifacts
 
 
 def run(request):
@@ -62,7 +95,7 @@ def run(request):
             pass
         process.wait()
         selector.close()
-    return {"version": 1, "exit_code": code, **{k: bytes(v).decode("utf-8", errors="replace") for k, v in captured.items()}}
+    return {"version": 1, "exit_code": code, "artifacts": export_artifacts(root), **{k: bytes(v).decode("utf-8", errors="replace") for k, v in captured.items()}}
 
 
 def main():

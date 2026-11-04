@@ -26,6 +26,12 @@ unsafe extern "C" {
     fn gm_mac_uninstall_global_hotkeys();
     fn gm_mac_seconds_since_last_input() -> c_double;
     fn gm_mac_get_primary_backing_scale() -> c_double;
+    fn gm_mac_primary_display_bounds(
+        x: *mut c_double,
+        y: *mut c_double,
+        w: *mut c_double,
+        h: *mut c_double,
+    );
     fn gm_mac_peek_latest_frame_timestamp() -> u64;
     fn gm_mac_start_stream() -> c_int;
     fn gm_mac_set_capture_active(active: c_int) -> c_int;
@@ -321,6 +327,7 @@ impl Platform for MacPlatform {
                     width: out_w,
                     height: out_h,
                     scale_factor: out_scale,
+                    desktop_bounds: Some(primary_display_bounds()),
                     data: FrameData::InlineBytes(jpeg_bytes),
                     timestamp_ms: out_ts,
                 };
@@ -401,6 +408,7 @@ impl Platform for MacPlatform {
             width: final_w,
             height: final_h,
             scale_factor: scale,
+            desktop_bounds: Some(primary_display_bounds()),
             data: frame_data,
             timestamp_ms,
         };
@@ -783,6 +791,14 @@ end tell"#,
             unsafe { gm_mac_send_notification(c_title.as_ptr(), c_sub.as_ptr(), c_body.as_ptr()) };
         Ok(ret == 0)
     }
+}
+
+fn primary_display_bounds() -> gm_core::types::Rect {
+    let (mut x, mut y, mut w, mut h) = (0.0, 0.0, 0.0, 0.0);
+    unsafe {
+        gm_mac_primary_display_bounds(&mut x, &mut y, &mut w, &mut h);
+    }
+    gm_core::types::Rect::new(x, y, w, h)
 }
 
 #[cfg(test)]

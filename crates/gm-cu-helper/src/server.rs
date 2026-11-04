@@ -27,6 +27,7 @@ struct ActionSessions {
 }
 use std::sync::atomic::Ordering;
 
+#[cfg(any(unix, test))]
 pub use gm_core::ipc::is_peer_authorized;
 
 impl<P: Platform + 'static> HelperServer<P> {
@@ -42,11 +43,24 @@ impl<P: Platform + 'static> HelperServer<P> {
         let path = socket_path.as_ref();
         #[cfg(unix)]
         {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
+            }
+            use std::os::unix::fs::OpenOptionsExt;
+            let lease = Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path.with_extension("helper.lock"))?,
+            );
+            lease.try_lock().map_err(|e| {
+                gm_core::error::GmError::Config(format!("Another helper owns this socket: {e}"))
+            })?;
+            if path.exists() {
+                std::fs::remove_file(path)?;
             }
 
             let listener = UnixListener::bind(path)?;
@@ -89,7 +103,9 @@ impl<P: Platform + 'static> HelperServer<P> {
                         let platform = Arc::clone(&self.platform);
                         let shm_ring = Arc::clone(&self.shm_ring);
                         let actions = self.actions.clone();
+                        let connection_lease = lease.clone();
                         tokio::spawn(async move {
+                            let _lease = connection_lease;
                             if let Err(e) =
                                 handle_connection(stream, platform, shm_ring, actions).await
                             {
@@ -172,17 +188,69 @@ async fn handle_connection<P: Platform, S: AsyncRead + AsyncWrite + Unpin>(
                 Ok(act) => HelperResponse::UserActivity(act),
                 Err(e) => HelperResponse::Error(e.to_string()),
             },
+            HelperRequest::CaptureTaskFrame {
+                task_id,
+                max_long_edge,
+                quality,
+            } => {
+                let _gate = actions.gate.lock().await;
+                if actions.killed.load(Ordering::SeqCst)
+                    || actions
+                        .current
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        != Some(&task_id)
+                {
+                    HelperResponse::Error("Stale or stopped observation session".into())
+                } else {
+                    match platform.capture(max_long_edge, quality).await {
+                        Ok(frame) => HelperResponse::Frame(shm_ring.promote_frame(frame)),
+                        Err(e) => HelperResponse::Error(e.to_string()),
+                    }
+                }
+            }
+            HelperRequest::GetTaskAxSnapshot { task_id, window_id } => {
+                let _gate = actions.gate.lock().await;
+                if actions.killed.load(Ordering::SeqCst)
+                    || actions
+                        .current
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        != Some(&task_id)
+                {
+                    HelperResponse::Error("Stale or stopped observation session".into())
+                } else {
+                    match platform.ax_snapshot(window_id).await {
+                        Ok(snapshot) => HelperResponse::AxSnapshot(snapshot),
+                        Err(e) => HelperResponse::Error(e.to_string()),
+                    }
+                }
+            }
             HelperRequest::CaptureLatestFrame {
                 max_long_edge,
                 quality,
-            } => match platform.capture(max_long_edge, quality).await {
-                Ok(frame) => HelperResponse::Frame(shm_ring.promote_frame(frame)),
-                Err(e) => HelperResponse::Error(e.to_string()),
-            },
+            } => {
+                let _gate = actions.gate.lock().await;
+                if actions.managed.load(Ordering::SeqCst) || actions.killed.load(Ordering::SeqCst) {
+                    HelperResponse::Error("An explicit observation session is required".into())
+                } else {
+                    match platform.capture(max_long_edge, quality).await {
+                        Ok(frame) => HelperResponse::Frame(shm_ring.promote_frame(frame)),
+                        Err(e) => HelperResponse::Error(e.to_string()),
+                    }
+                }
+            }
             HelperRequest::GetAxSnapshot { window_id } => {
-                match platform.ax_snapshot(window_id).await {
-                    Ok(snap) => HelperResponse::AxSnapshot(snap),
-                    Err(e) => HelperResponse::Error(e.to_string()),
+                let _gate = actions.gate.lock().await;
+                if actions.managed.load(Ordering::SeqCst) || actions.killed.load(Ordering::SeqCst) {
+                    HelperResponse::Error("An explicit observation session is required".into())
+                } else {
+                    match platform.ax_snapshot(window_id).await {
+                        Ok(snapshot) => HelperResponse::AxSnapshot(snapshot),
+                        Err(e) => HelperResponse::Error(e.to_string()),
+                    }
                 }
             }
             HelperRequest::BeginTask { task_id } => {
@@ -411,6 +479,10 @@ mod session_tests {
         );
         let new = gm_platform::IpcPlatformClient::new(&path);
         new.begin_task("same-logical-task").await.unwrap();
+        assert!(old.ax_snapshot(None).await.is_err());
+        assert!(old.capture(Some(320), Some(70)).await.is_err());
+        assert!(new.ax_snapshot(None).await.is_ok());
+        assert!(new.capture(Some(320), Some(70)).await.is_ok());
         assert!(
             old.act(&ComputerAction::Type {
                 text: "stale attempt".into()
@@ -463,5 +535,34 @@ mod session_tests {
             .unwrap();
         server.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ownership_tests {
+    use super::*;
+    #[tokio::test]
+    async fn second_helper_cannot_unlink_or_replace_a_live_owner() {
+        let path =
+            std::env::temp_dir().join(format!("gm-helper-owner-{}.sock", uuid::Uuid::new_v4()));
+        let first = HelperServer::new(gm_platform::MockPlatform::new());
+        let socket = path.clone();
+        let handle = tokio::spawn(async move { first.run(socket).await });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = gm_platform::IpcPlatformClient::new(&path);
+        client.ping().await.unwrap();
+        let second = HelperServer::new(gm_platform::MockPlatform::new());
+        assert!(second.run(&path).await.is_err());
+        client.ping().await.unwrap();
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("helper.lock"));
     }
 }

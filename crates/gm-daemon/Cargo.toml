@@ -17,6 +17,8 @@ name = "gm"
 path = "src/bin/gm.rs"
 
 [dependencies]
+ed25519-dalek = "2"
+hex = "0.4"
 gm-core = { workspace = true }
 gm-platform = { workspace = true }
 gm-llm = { workspace = true, features = ["local-vlm"] }

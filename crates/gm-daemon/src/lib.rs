@@ -100,12 +100,17 @@ pub async fn ensure_helper_running(config: &GmConfig) -> Result<()> {
         "Auto-spawning gm-cu-helper at {:?} with socket {:?}",
         helper_bin, config.socket_path
     );
-    let mut cmd = std::process::Command::new(&helper_bin);
+    let mut cmd = tokio::process::Command::new(&helper_bin);
     cmd.arg("--socket").arg(&config.socket_path);
 
-    let _child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| GmError::Platform(format!("Failed to auto-spawn gm-cu-helper: {e}")))?;
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            warn!(%error,"Helper process could not be reaped");
+        }
+    });
 
     let start = tokio::time::Instant::now();
     let timeout = tokio::time::Duration::from_millis(1500);
@@ -716,7 +721,10 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let router = LlmRouter::new(config.providers.clone());
 
     let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
@@ -918,7 +926,10 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
         "Model unavailable (configure a provider or compatible local model)"
     };
 
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = Arc::new(HybridLlmClient::new(backend, Arc::clone(&budget)));
     let router = LlmRouter::new(config.providers.clone());
     let memory = Arc::new(
@@ -1278,7 +1289,10 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let router = LlmRouter::new(config.providers.clone());
 
     let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
@@ -1494,7 +1508,10 @@ pub async fn run_review(date_str: Option<String>) -> Result<()> {
 
     let secrets = KeychainSecrets::default();
     let llm_backend = build_llm_backend(&secrets);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = HybridLlmClient::new(llm_backend, budget);
     let router = LlmRouter::new(config.providers.clone());
     let llm_ctx = Some((&llm_client, &router));
@@ -1601,7 +1618,10 @@ pub async fn run_ideas(json: bool) -> Result<()> {
     let config = GmConfig::load(None)?;
     let secrets = KeychainSecrets::default();
     let llm_backend = build_llm_backend(&secrets);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = HybridLlmClient::new(llm_backend, budget);
     let router = LlmRouter::new(config.providers.clone());
     let llm_ctx = Some((&llm_client, &router));
@@ -1958,7 +1978,10 @@ pub async fn run_serve(bind: &str, config_path: Option<PathBuf>) -> Result<()> {
     let sup = open_default_openbot_supervisor(config_path)?;
     println!("==> Starting OpenBot Companion Web / AG-UI / A2A server on http://{bind} ...");
     let secrets = KeychainSecrets::default();
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm = Arc::new(HybridLlmClient::new(build_llm_backend(&secrets), budget));
     let runtime = sup.start_runtime(
         Arc::new(IpcPlatformClient::new(&config.socket_path)),
@@ -2235,6 +2258,8 @@ mod tests {
             dmg_size_bytes: Some(1024),
             checksum_download_url: None,
             expected_sha256: None,
+            manifest_download_url: None,
+            signature_download_url: None,
             published_at: None,
             release_notes: Some("Release notes".into()),
         };

@@ -201,7 +201,7 @@ fn handle_daemon_event(ev: DaemonEvent) {
                 gm_ui_set_hud_state(state_code, c_status.as_ptr(), c_detail.as_ptr());
             }
         }
-        DaemonEvent::ChatToken { delta, done } => {
+        DaemonEvent::ChatToken { delta, done } | DaemonEvent::ChatTokenV1 { delta, done, .. } => {
             let c_delta = CString::new(delta.replace('\0', "")).unwrap_or_default();
             unsafe {
                 gm_ui_append_chat_delta(c_delta.as_ptr());
@@ -293,6 +293,7 @@ fn handle_daemon_event(ev: DaemonEvent) {
                 gm_ui_append_chat_message(role.as_ptr(), msg.as_ptr());
             }
         }
+        DaemonEvent::ApprovalResolved { .. } => {}
         DaemonEvent::ChannelMessage {
             channel_id,
             author,
@@ -506,7 +507,12 @@ async fn main() -> Result<()> {
     let config = GmConfig::load(cli.config.as_deref())?;
     if matches!(cmd, Commands::Native) {
         ensure_daemon_running(&config, cli.config.as_deref()).await;
-        return native::run(config);
+        return native::run(
+            config,
+            cli.config
+                .clone()
+                .unwrap_or_else(gm_core::config::default_config_path),
+        );
     }
     let _ = CONFIG.set(config.clone());
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());

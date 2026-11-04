@@ -19,8 +19,10 @@ struct ImageManifest {
     version: u32,
     architecture: String,
     sha256: String,
+    #[serde(default)]
+    firmware_sha256: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct GuestFile {
     path: String,
     data: String,
@@ -38,6 +40,53 @@ struct GuestReply {
     exit_code: i32,
     stdout: String,
     stderr: String,
+    #[serde(default)]
+    artifacts: Vec<GuestFile>,
+}
+pub struct VmOutcome {
+    pub exit_code: i32,
+    pub output: String,
+    pub artifacts: Vec<VmArtifact>,
+}
+pub struct VmArtifact {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+fn decode_artifacts(files: Vec<GuestFile>) -> Result<Vec<VmArtifact>> {
+    let mut artifacts = Vec::new();
+    let mut total = 0usize;
+    let mut names = std::collections::HashSet::new();
+    if files.len() > 32 {
+        return Err(config_error("Guest exported too many files"));
+    }
+    for file in files {
+        if file.path.len() > 1024
+            || file.path.contains('\\')
+            || file.path.split('/').any(|c| {
+                c.is_empty() || c == "." || c == ".." || c.contains(':') || c.starts_with('.')
+            })
+            || !names.insert(file.path.clone())
+        {
+            return Err(config_error(
+                "Guest exported an unsafe or duplicate artifact path",
+            ));
+        }
+        if file.data.len() > 1_400_000 {
+            return Err(config_error("Guest artifact exceeds 1 MiB"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(file.data)
+            .map_err(|_| config_error("Invalid guest artifact encoding"))?;
+        total = total.saturating_add(bytes.len());
+        if bytes.len() > 1024 * 1024 || total > 4 * 1024 * 1024 {
+            return Err(config_error("Guest artifact export exceeds its byte limit"));
+        }
+        artifacts.push(VmArtifact {
+            path: file.path,
+            bytes,
+        });
+    }
+    Ok(artifacts)
 }
 fn config_error(message: impl Into<String>) -> GmError {
     GmError::Config(message.into())
@@ -81,6 +130,29 @@ fn verified_image(config: &WorkspaceVmConfig) -> Result<()> {
     }
     if hex::encode(hasher.finalize()) != manifest.sha256 {
         return Err(config_error("Workspace image checksum mismatch"));
+    }
+    match (&config.firmware_path, &manifest.firmware_sha256) {
+        (Some(path), Some(expected)) => {
+            let mut file = std::fs::File::open(path)?;
+            let mut hasher = Sha256::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = file.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&chunk[..n]);
+            }
+            if hex::encode(hasher.finalize()) != *expected {
+                return Err(config_error("VM firmware checksum mismatch"));
+            }
+        }
+        (None, None) if !cfg!(target_arch = "aarch64") => {}
+        _ => {
+            return Err(config_error(
+                "VM firmware must be provided and authenticated by the image manifest; ARM requires UEFI",
+            ));
+        }
     }
     Ok(())
 }
@@ -133,16 +205,32 @@ fn qemu_arguments(config: &WorkspaceVmConfig) -> Vec<String> {
             "host".into(),
         ]);
     }
+    if let Some(path) = &config.firmware_path {
+        args.extend(["-bios".into(), path.to_string_lossy().into_owned()]);
+    }
     args
 }
 fn collect_files(
-    root: &Path,
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
     files: &mut Vec<GuestFile>,
     total: &mut usize,
+    entries: &mut usize,
+    depth: usize,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(directory)? {
+    if depth > 32 {
+        return Err(config_error(
+            "Workspace directory nesting exceeds 32 levels",
+        ));
+    }
+    for entry in directory.entries()? {
         let entry = entry?;
+        *entries += 1;
+        if *entries > 10000 {
+            return Err(config_error(
+                "Workspace import exceeds directory entry limit",
+            ));
+        }
         let metadata = entry.file_type()?;
         if metadata.is_symlink() {
             return Err(GmError::SafetyViolation(
@@ -152,22 +240,27 @@ fn collect_files(
         if entry.file_name() == ".git" {
             continue;
         }
+        let path = relative.join(entry.file_name());
         if metadata.is_dir() {
-            collect_files(root, &entry.path(), files, total)?;
+            collect_files(&entry.open_dir()?, &path, files, total, entries, depth + 1)?;
         } else if metadata.is_file() {
             if files.len() >= 1000 {
                 return Err(config_error("Workspace VM import exceeds 1000 files"));
             }
-            let data = std::fs::read(entry.path())?;
-            *total = total.saturating_add(data.len());
+            let remaining = 8 * 1024 * 1024 - *total;
+            let file = entry.open()?;
+            if file.metadata()?.len() > remaining as u64 {
+                return Err(config_error("Workspace VM import exceeds 8 MiB"));
+            }
+            let mut data = Vec::new();
+            file.take(remaining as u64 + 1).read_to_end(&mut data)?;
+            *total += data.len();
             if *total > 8 * 1024 * 1024 {
                 return Err(config_error("Workspace VM import exceeds 8 MiB"));
             }
-            let path = entry
-                .path()
-                .strip_prefix(root)
-                .map_err(|_| config_error("Invalid workspace import path"))?
-                .to_string_lossy()
+            let path = path
+                .to_str()
+                .ok_or_else(|| config_error("Workspace paths must be valid Unicode"))?
                 .replace('\\', "/");
             files.push(GuestFile {
                 path,
@@ -196,7 +289,7 @@ async fn guest_line<R: AsyncRead + Unpin>(
             .position(|b| *b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(bytes.len());
-        if line.len() + end > 2 * 1024 * 1024 {
+        if line.len() + end > 12 * 1024 * 1024 {
             return Err(std::io::Error::other("Guest protocol frame exceeds limit"));
         }
         let finished = bytes[end - 1] == b'\n';
@@ -216,7 +309,7 @@ pub async fn execute(
     workspace: &Path,
     command: &str,
     timeout_ms: u64,
-) -> Result<(i32, String)> {
+) -> Result<VmOutcome> {
     let verification = config.clone();
     tokio::task::spawn_blocking(move || verified_image(&verification))
         .await
@@ -225,7 +318,9 @@ pub async fn execute(
     let files = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
         let mut total = 0;
-        collect_files(&workspace, &workspace, &mut files, &mut total)?;
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&workspace, cap_std::ambient_authority())?;
+        collect_files(&directory, Path::new(""), &mut files, &mut total, &mut 0, 0)?;
         Ok::<_, GmError>(files)
     })
     .await
@@ -266,7 +361,7 @@ pub async fn execute(
     .await
     .map_err(|_| GmError::Timeout("Workspace command exceeded its deadline".into()))??
     .ok_or_else(|| config_error("Workspace VM disconnected"))?;
-    if line.len() > 2 * 1024 * 1024 {
+    if line.len() > 12 * 1024 * 1024 {
         return Err(config_error("Workspace command output exceeds its limit"));
     }
     let reply: GuestReply = serde_json::from_str(&line)?;
@@ -275,7 +370,11 @@ pub async fn execute(
     }
     child.kill().await?;
     let _ = child.wait().await;
-    Ok((reply.exit_code, format!("{}{}", reply.stdout, reply.stderr)))
+    Ok(VmOutcome {
+        exit_code: reply.exit_code,
+        output: format!("{}{}", reply.stdout, reply.stderr),
+        artifacts: decode_artifacts(reply.artifacts)?,
+    })
 }
 
 #[cfg(test)]
@@ -309,10 +408,12 @@ mod signature_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let key = SigningKey::from_bytes(&[7; 32]);
         let image = b"test fixture, not a runnable VM";
+        let firmware = cfg!(target_arch = "aarch64").then_some(b"UEFI test fixture".as_slice());
         let manifest = serde_json::to_vec(&ImageManifest {
             version: 1,
             architecture: std::env::consts::ARCH.into(),
             sha256: hex::encode(Sha256::digest(image)),
+            firmware_sha256: firmware.map(|f| hex::encode(Sha256::digest(f))),
         })
         .unwrap();
         let config = WorkspaceVmConfig {
@@ -321,8 +422,12 @@ mod signature_tests {
             manifest_path: directory.join("manifest.json"),
             signature_path: directory.join("manifest.sig"),
             trusted_public_key_hex: hex::encode(key.verifying_key().as_bytes()),
+            firmware_path: firmware.map(|_| directory.join("uefi.bin")),
             ..Default::default()
         };
+        if let Some(firmware) = firmware {
+            std::fs::write(config.firmware_path.as_ref().unwrap(), firmware).unwrap();
+        }
         std::fs::write(&config.image_path, image).unwrap();
         std::fs::write(&config.manifest_path, &manifest).unwrap();
         std::fs::write(
@@ -337,5 +442,53 @@ mod signature_tests {
         std::fs::write(&config.manifest_path, b"modified manifest").unwrap();
         assert!(verified_image(&config).is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn rejects_guest_path_escapes_duplicates_and_oversized_payloads() {
+        let file = |path: &str, data: &[u8]| GuestFile {
+            path: path.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(data),
+        };
+        let decoded = decode_artifacts(vec![file("patches/change.patch", b"patch")]).unwrap();
+        assert_eq!(decoded[0].bytes, b"patch");
+        for path in [
+            "../escape",
+            "/absolute",
+            "C:/windows",
+            "nested/../file",
+            ".ssh/key",
+            "a\\b",
+            "a//b",
+            "a/./b",
+        ] {
+            assert!(
+                decode_artifacts(vec![file(path, b"test")]).is_err(),
+                "{path}"
+            );
+        }
+        assert!(decode_artifacts(vec![file("same", b"a"), file("same", b"b")]).is_err());
+        assert!(decode_artifacts(vec![file("huge", &vec![0; 1024 * 1024 + 1])]).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn imports_reject_symlink_escapes_and_bounded_reading_rejects_large_files() {
+        let root = std::env::temp_dir().join(format!("gm-vm-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("escape")).unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        assert!(collect_files(&dir, Path::new(""), &mut vec![], &mut 0, &mut 0, 0).is_err());
+        std::fs::remove_file(root.join("escape")).unwrap();
+        std::fs::File::create(root.join("large"))
+            .unwrap()
+            .set_len(9 * 1024 * 1024)
+            .unwrap();
+        assert!(collect_files(&dir, Path::new(""), &mut vec![], &mut 0, &mut 0, 0).is_err());
+        drop(dir);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

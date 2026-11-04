@@ -4,6 +4,7 @@ use crate::types::{
     ReminderItem, UserActivity,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,15 @@ pub enum HelperRequest {
         quality: Option<u8>,
     },
     GetAxSnapshot {
+        window_id: Option<u32>,
+    },
+    CaptureTaskFrame {
+        task_id: String,
+        max_long_edge: Option<u32>,
+        quality: Option<u8>,
+    },
+    GetTaskAxSnapshot {
+        task_id: String,
         window_id: Option<u32>,
     },
     BeginTask {
@@ -83,6 +93,12 @@ pub enum QueueControlAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum DaemonRequest {
     Ping,
@@ -97,6 +113,11 @@ pub enum DaemonRequest {
         message_id: String,
         text: String,
     },
+    SendChatMessageV2 {
+        message_id: String,
+        text: String,
+        history: Vec<ChatTurn>,
+    },
     SetPaused {
         paused: bool,
     },
@@ -106,7 +127,35 @@ pub enum DaemonRequest {
         approved: bool,
     },
     SubscribeEvents,
+    ImportAttachment {
+        bot_id: String,
+        source_path: PathBuf,
+    },
+    ListBotFiles {
+        bot_id: String,
+    },
+    PreviewBotFile {
+        bot_id: String,
+        path: String,
+    },
+    ListRoutines,
+    SaveRoutine {
+        routine: serde_json::Value,
+    },
     ListBots,
+    SaveBot {
+        profile: serde_json::Value,
+    },
+    ListChannels,
+    ChannelHistory {
+        channel_id: String,
+    },
+    CreateChannel {
+        channel_id: String,
+        topic: String,
+        owner_bot_id: Option<String>,
+        participants: Vec<String>,
+    },
     QueueTask {
         bot_id: Option<String>,
         channel_id: Option<String>,

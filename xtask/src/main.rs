@@ -151,7 +151,7 @@ pub fn extract_mount_point(plist_str: &str) -> Option<PathBuf> {
     None
 }
 
-fn measure_process_tree_memory(pids: &[u32]) -> (f64, String) {
+fn measure_process_tree_memory(pids: &[u32]) -> Result<(f64, String), Box<dyn std::error::Error>> {
     let pid_strings: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
 
     // Prefer macOS official `footprint` tool if available
@@ -181,10 +181,10 @@ fn measure_process_tree_memory(pids: &[u32]) -> (f64, String) {
         }
         if total_kb > 0.0 {
             let mb = total_kb / 1024.0;
-            return (
+            return Ok((
                 mb,
                 format!("macOS footprint tool phys_footprint: {:.2} MB", mb),
-            );
+            ));
         }
     }
 
@@ -205,10 +205,19 @@ fn measure_process_tree_memory(pids: &[u32]) -> (f64, String) {
             }
         }
         let mb = (total_kb as f64) / 1024.0;
-        return (mb, format!("ps resident set: {:.2} MB", mb));
+        if text
+            .lines()
+            .filter(|line| line.trim().parse::<u64>().is_ok())
+            .count()
+            != pids.len()
+            || mb <= 0.0
+        {
+            return Err("Memory measurement is missing one or more live processes".into());
+        }
+        return Ok((mb, format!("ps resident set: {:.2} MB", mb)));
     }
 
-    (0.0, "unknown".into())
+    Err("Memory measurement is unavailable on this host".into())
 }
 
 fn detect_identity() -> String {
@@ -687,18 +696,12 @@ async fn run_bench_llm(
                 "Live Provider (Meta/xAI API)",
             )
         } else {
-            println!(
-                "  [Warning] No API keys in Keychain or ENV. Using S3-calibrated fast-route model backend."
-            );
-            (
-                Arc::new(CalibratedFastRouteBackend::default()),
-                "Calibrated Fast Route (S3 Model Profile)",
-            )
+            return Err("--live requires configured provider credentials; no synthetic fallback is permitted".into());
         }
     } else {
         (
             Arc::new(CalibratedFastRouteBackend::default()),
-            "Calibrated Fast Route (S3 Model Profile)",
+            "Synthetic offline latency fixture (not a provider certification)",
         )
     };
 
@@ -741,7 +744,7 @@ async fn run_bench_llm(
                 "system",
                 "You are an autonomous computer-use agent. Output JSON with fields 'action' and 'params'.",
             ),
-            ChatMessage::text("user", "Click the Submit button"),
+            ChatMessage::text("user", "Complete the single-step latency fixture"),
         ];
         let (_, metrics) = hybrid_client
             .execute_routed_stream(&primary, fallback.as_ref(), &msgs)
@@ -786,7 +789,10 @@ async fn run_bench_llm(
     for i in 0..iterations {
         let start = Instant::now();
         let _ = agent
-            .run_task(&format!("step_bench_{i}"), "Click the Submit button")
+            .run_task(
+                &format!("step_bench_{i}"),
+                "Complete the single-step latency fixture",
+            )
             .await?;
         step_times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
     }
@@ -944,25 +950,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_bench_hotpath() -> Result<(f64, f64, f64, f64), Box<dyn std::error::Error>> {
-    println!("==> Benchmarking G3 local hot-path budgets against native macOS platform...");
+    println!(
+        "==> Benchmarking G3 against the native desktop (requires an authorized interactive session)..."
+    );
 
     #[cfg(target_os = "macos")]
-    let platform: Arc<dyn Platform> = match gm_platform::MacPlatform::new() {
-        Ok(p) => {
-            println!(
-                "  [Platform] Active backend: Native macOS (ScreenCaptureKit + AXUIElement + CGEvent)"
-            );
-            Arc::new(p)
-        }
-        Err(e) => {
-            eprintln!(
-                "  [Platform] Native MacPlatform initialization warning: {e}. Falling back to MockPlatform"
-            );
-            Arc::new(MockPlatform::new())
-        }
-    };
-    #[cfg(not(target_os = "macos"))]
-    let platform: Arc<dyn Platform> = Arc::new(MockPlatform::new());
+    let platform: Arc<dyn Platform> = Arc::new(gm_platform::MacPlatform::new()?);
+    #[cfg(target_os = "linux")]
+    let platform: Arc<dyn Platform> = Arc::new(gm_platform::LinuxPlatform::new()?);
+    #[cfg(target_os = "windows")]
+    let platform: Arc<dyn Platform> = Arc::new(gm_platform::WindowsPlatform::new()?);
 
     // Warmup platform calls
     for _ in 0..3 {
@@ -1057,12 +1054,11 @@ async fn run_bench_hotpath() -> Result<(f64, f64, f64, f64), Box<dyn std::error:
         "Downscale + JPEG encode exceeded 15ms p95 budget"
     );
 
-    // 4. Action dispatch target: < 5 ms p99
-    let action = ComputerAction::Click {
-        token: Some("el_0".into()),
-        coords: Some((150.0, 200.0)),
-        button: None,
-        click_count: Some(1),
+    // Measure dispatcher overhead without clicking an arbitrary real application.
+    // Actual input delivery/latency requires a controlled native fixture.
+    let action = ComputerAction::Wait {
+        condition: None,
+        timeout_ms: 0,
     };
     // Warmup dispatch
     let _ = platform.act(&action).await;
@@ -1080,7 +1076,7 @@ async fn run_bench_hotpath() -> Result<(f64, f64, f64, f64), Box<dyn std::error:
     let act_budget = if cfg!(debug_assertions) { 7.0 } else { 5.0 };
     let act_pass = act_p99_ms < act_budget;
     println!(
-        "  [G3.4] Action dispatch: p50={:.3}ms, p95={:.3}ms, p99={:.3}ms (Target: < {:.1}ms{}) -> {}",
+        "  [G3.4] Wait(0) dispatcher overhead (input latency unmeasured): p50={:.3}ms, p95={:.3}ms, p99={:.3}ms (Target: < {:.1}ms{}) -> {}",
         act_p50_ms,
         act_p95_ms,
         act_p99_ms,
@@ -1097,7 +1093,9 @@ async fn run_bench_hotpath() -> Result<(f64, f64, f64, f64), Box<dyn std::error:
         "Action dispatch exceeded {act_budget}ms p99 budget"
     );
 
-    println!("==> G3 Hotpath Gate: PASSED (All 4 latency criteria met on native platform)");
+    println!(
+        "==> Native capture/AX/JPEG and dispatcher checks passed. Actual input latency remains unmeasured."
+    );
     Ok((frame_p99, ax_p95_ms, down_p95, act_p99_ms))
 }
 
@@ -1119,100 +1117,98 @@ async fn run_bench_rss() -> Result<(f64, f64), Box<dyn std::error::Error>> {
         return Err("Failed to build release binaries for RSS benchmark".into());
     }
 
-    // --- Scenario 1: Whole tree idle (daemon + helper + tray) ---
-    println!("\n--- [S2.1] Measuring Whole-Tree Idle Memory (Tray Mode) ---");
-    let mut daemon_idle = Command::new("target/release/gm-daemon").spawn()?;
-    let mut helper_idle = Command::new("target/release/gm-cu-helper").spawn()?;
-    let mut ui_tray = Command::new("target/release/gm-ui").arg("tray").spawn()?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
-
-    let pid_daemon_idle = daemon_idle.id();
-    let pid_helper_idle = helper_idle.id();
-    let pid_tray = ui_tray.id();
-
-    let (idle_mb, idle_metric) =
-        measure_process_tree_memory(&[pid_daemon_idle, pid_helper_idle, pid_tray]);
-
-    let _ = daemon_idle.kill();
-    let _ = helper_idle.kill();
-    let _ = ui_tray.kill();
-    let _ = daemon_idle.wait();
-    let _ = helper_idle.wait();
-    let _ = ui_tray.wait();
-
-    println!("  Processes: gm-daemon + gm-cu-helper + gm-ui (tray)");
-    println!(
-        "  Measured whole-tree idle footprint: {:.2} MB ({}) (Target: < 50.0 MB)",
-        idle_mb, idle_metric
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    assert!(
-        idle_mb < 50.0,
-        "Idle memory exceeded 50MB: {:.2} MB",
-        idle_mb
-    );
-    println!("  [G2.1 Idle Gate] PASS");
-
-    // --- Scenario 2: Whole tree with UI open (daemon + helper + chat window) ---
-    println!("\n--- [S2.2] Measuring Whole-Tree Active Memory (UI Window Open) ---");
-    let mut daemon_open = Command::new("target/release/gm-daemon").spawn()?;
-    let mut helper_open = Command::new("target/release/gm-cu-helper").spawn()?;
-    let mut ui_chat = Command::new("target/release/gm-ui").arg("chat").spawn()?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
-
-    let pid_daemon_open = daemon_open.id();
-    let pid_helper_open = helper_open.id();
-    let pid_chat = ui_chat.id();
-
-    let (open_mb, open_metric) =
-        measure_process_tree_memory(&[pid_daemon_open, pid_helper_open, pid_chat]);
-
-    let _ = daemon_open.kill();
-    let _ = helper_open.kill();
-    let _ = ui_chat.kill();
-    let _ = daemon_open.wait();
-    let _ = helper_open.wait();
-    let _ = ui_chat.wait();
-
-    println!("  Processes: gm-daemon + gm-cu-helper + gm-ui (chat open)");
-    println!(
-        "  Measured whole-tree UI open footprint: {:.2} MB ({}) (Target: < 120.0 MB)",
-        open_mb, open_metric
-    );
-    assert!(
-        open_mb < 120.0,
-        "UI open memory exceeded 120MB: {:.2} MB",
-        open_mb
-    );
-    println!("  [G2.2 UI Open Gate] PASS");
-
-    // --- Spike S2 UI Technology Architecture Comparison ---
-    println!("\n--- [Spike S2] UI Architecture Options & Tradeoff Evaluation ---");
-    println!("  Option 1: Native AppKit / Cocoa tray + floating panel");
-    println!(
-        "    Idle Footprint: {:.1} MB | Open Footprint: {:.1} MB | Decision: SELECTED (G1/G2 Compliant)",
-        idle_mb, open_mb
-    );
-    println!("  Option 2: Iced (Rust wgpu/tiny-skia)");
-    println!(
-        "    Idle RSS: ~31 MB   | Open RSS: ~82 MB   | Decision: Feasible backup (Metal context overhead)"
-    );
-    println!("  Option 3: Tauri / WebKit (WKWebView)");
-    println!(
-        "    Idle RSS: ~38 MB   | Open RSS: ~148 MB  | Decision: REJECTED (Exceeds 120 MB ceiling due to WebKit helper processes)"
-    );
-    println!("  Option 4: Electron / Chromium");
-    println!(
-        "    Idle RSS: ~85 MB   | Open RSS: ~220 MB  | Decision: DISQUALIFIED (Violates G1 native & G2 RSS)"
-    );
-
-    println!("\n==> G2 RSS & Spike S2 Gates: PASSED");
+    let folder = std::env::temp_dir().join(format!("gm-rss-{nonce}"));
+    gm_core::storage::ensure_private_dir(&folder)?;
+    let mut config = gm_core::config::GmConfig {
+        storage_dir: folder.join("data"),
+        ..Default::default()
+    };
+    config.openbot.bots_dir = config.storage_dir.join("bots");
+    config.openbot.companion_enabled = false;
+    #[cfg(unix)]
+    {
+        config.socket_path = folder.join("helper.sock");
+        config.daemon_socket_path = folder.join("daemon.sock");
+    }
+    #[cfg(windows)]
+    {
+        config.socket_path = PathBuf::from(format!(r"\\.\pipe\gm-rss-helper-{nonce}"));
+        config.daemon_socket_path = PathBuf::from(format!(r"\\.\pipe\gm-rss-daemon-{nonce}"));
+    }
+    let config_path = folder.join("config.json");
+    config.save(&config_path)?;
+    let mut children = vec![
+        Owned(
+            Command::new("target/release/gm-cu-helper")
+                .arg("--socket")
+                .arg(&config.socket_path)
+                .spawn()?,
+        ),
+        Owned(
+            Command::new("target/release/gm-daemon")
+                .arg("--config")
+                .arg(&config_path)
+                .arg("daemon")
+                .spawn()?,
+        ),
+    ];
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    for child in &mut children {
+        if child.0.try_wait()?.is_some() {
+            return Err("A benchmark process exited before measurement".into());
+        }
+    }
+    let pids: Vec<u32> = children.iter().map(|c| c.0.id()).collect();
+    let (idle_mb, idle_metric) = measure_process_tree_memory(&pids)?;
+    println!("Core idle (daemon + helper, UI closed): {idle_mb:.2} MiB ({idle_metric})");
+    children.push(Owned(
+        Command::new("target/release/gm-ui")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("native")
+            .spawn()?,
+    ));
+    let mut samples = vec![];
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for child in &mut children {
+            if child.0.try_wait()?.is_some() {
+                return Err("Native UI or runtime exited before measurement".into());
+            }
+        }
+        let pids: Vec<u32> = children.iter().map(|c| c.0.id()).collect();
+        samples.push(measure_process_tree_memory(&pids)?.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let open_mb = samples[samples.len() / 2];
+    println!("Native UI open (median of 5 samples): {open_mb:.2} MiB");
+    drop(children);
+    let _ = std::fs::remove_dir_all(&folder);
+    if idle_mb >= 50.0 || open_mb >= 120.0 {
+        return Err(format!(
+            "Memory target exceeded: core={idle_mb:.2} MiB, UI-open={open_mb:.2} MiB"
+        )
+        .into());
+    }
     Ok((idle_mb, open_mb))
 }
 
 async fn run_eval() -> Result<gm_eval::EvalSummaryReport, Box<dyn std::error::Error>> {
-    println!("==> Running G5 25-task macOS evaluation suite...");
+    println!(
+        "==> Running offline G5 fixtures (not native desktop or provider quality certification)..."
+    );
     let runner = EvalRunner::default();
     let (results, summary) = runner.run_all().await;
     for r in &results {
@@ -1235,7 +1231,7 @@ async fn run_eval() -> Result<gm_eval::EvalSummaryReport, Box<dyn std::error::Er
     );
 
     println!(
-        "\n==> Running v0.2.0 Capability Evaluation Suite (SoM, Stagnation, Approvals, MCP, Live AX)..."
+        "\n==> Running v0.2.0 Capability Evaluation Suite (SoM, Stagnation, Approvals, MCP, AX fixtures)..."
     );
     let v2_results = gm_eval::run_v2_capability_evals().await;
     let mut v2_all_passed = true;
@@ -1276,7 +1272,7 @@ async fn run_eval() -> Result<gm_eval::EvalSummaryReport, Box<dyn std::error::Er
 
     if summary.meets_g5_quality_gate && v2_all_passed && openbot_all_passed {
         println!(
-            "==> G5 + v0.2.0 + v0.3.0 OpenBot Quality Gate: PASSED ({}/{} G5 + {}/{} v0.2.0 + {}/{} OpenBot)",
+            "==> Offline G5 + v0.2.0 + v0.3.0 fixture checks: PASSED ({}/{} G5 + {}/{} v0.2.0 + {}/{} OpenBot)",
             summary.passed_tasks,
             summary.total_tasks,
             v2_results.iter().filter(|r| r.success).count(),
@@ -1295,7 +1291,7 @@ fn run_simulate_dogfood(
     days: u32,
     output_path: &str,
 ) -> Result<DogfoodMetricsSummary, Box<dyn std::error::Error>> {
-    println!("==> Simulating {days}-Day Dogfood Cycle & Generating G6 Metrics Certification...");
+    println!("==> Simulating {days}-Day Dogfood Cycle & Generating G6 Fixture Metrics...");
 
     let out_file = Path::new(output_path);
     if out_file.exists() {
@@ -1477,7 +1473,7 @@ fn run_simulate_dogfood(
     }
 
     println!("\n╔═════════════════════════════════════════════════════════════════════════════╗");
-    println!("║        Grok-Muse 14-Day Dogfood Simulation & G6 Certification Report         ║");
+    println!("║        Grok-Muse 14-Day Dogfood Simulation & G6 Fixture Report         ║");
     println!("╚═════════════════════════════════════════════════════════════════════════════╝");
     println!("  Output File                 : {output_path}");
     println!(
@@ -1525,7 +1521,9 @@ fn run_simulate_dogfood(
         summary.spend_cap_enforced
     );
     println!("  Topic Counts                : {:?}", summary.topic_counts);
-    println!("  G6 Proactive Dogfood Gate   : PASSED (Certified for Release)");
+    println!(
+        "  G6 Proactive Dogfood Gate   : PASSED (simulation only; real usefulness is unverified)"
+    );
     println!("═══════════════════════════════════════════════════════════════════════════════\n");
 
     Ok(summary)
@@ -1544,7 +1542,7 @@ fn dirs_data_dir() -> PathBuf {
 async fn run_test_all(identity: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let start_all = Instant::now();
     println!("\n===============================================================================");
-    println!("  Grok-Muse Full Release Gate Certification Suite (xtask test-all)");
+    println!("  Grok-Muse Automated Release Check Suite (xtask test-all)");
     println!("===============================================================================\n");
 
     let mut scorecard: Vec<(
@@ -1813,7 +1811,7 @@ async fn run_test_all(identity: Option<String>) -> Result<(), Box<dyn std::error
     );
     if all_passed {
         println!(
-            "  Overall Release Decision   : CERTIFIED FOR PRODUCTION RELEASE (ALL 8 GATES PASSED)"
+            "  Overall Release Decision   : AUTOMATED CHECKS PASSED; native acceptance, real-model quality, VM boot and platform signing remain separate checks"
         );
     } else {
         println!("  Overall Release Decision   : RELEASE BLOCKED (ONE OR MORE GATES FAILED)");

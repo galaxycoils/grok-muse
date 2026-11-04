@@ -160,10 +160,7 @@ impl KeychainSecrets {
     pub fn set_secret(&self, account: &str, secret: &str) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            // Delete existing secret first if present so that set_generic_password
-            // (which calls SecKeychainAddGenericPassword) does not fail with errSecDuplicateItem (-25299).
-            let _ = security_framework::passwords::delete_generic_password(&self.service, account);
-
+            // The platform API updates an existing item atomically. Preserve the old key if saving fails.
             security_framework::passwords::set_generic_password(
                 &self.service,
                 account,

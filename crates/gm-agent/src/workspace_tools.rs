@@ -190,7 +190,16 @@ impl BotWorkspaceSandbox {
                 "Artifact is not a regular file within the size limit".into(),
             ));
         }
-        Ok(handle.read(path)?)
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        handle
+            .open(path)?
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(GmError::Config("Artifact exceeds transfer limit".into()));
+        }
+        Ok(bytes)
     }
     pub fn receive_artifact(&self, name: &std::ffi::OsStr, data: &[u8]) -> Result<PathBuf> {
         use std::io::Write;
@@ -209,6 +218,86 @@ impl BotWorkspaceSandbox {
         Ok(self.inbox_dir.join(name))
     }
 
+    /// Lists inert inbox/outbox entries; never follows links or opens executables.
+    pub fn shared_files(&self) -> Result<Vec<(String, u64)>> {
+        fn walk(
+            dir: &Dir,
+            prefix: &str,
+            out: &mut Vec<(String, u64)>,
+            visited: &mut usize,
+            depth: usize,
+        ) -> Result<()> {
+            if depth > 16 {
+                return Err(GmError::Config(
+                    "Artifact directory nesting exceeds limit".into(),
+                ));
+            }
+            for entry in dir.entries()? {
+                *visited += 1;
+                if *visited > 1000 {
+                    return Err(GmError::Config(
+                        "Artifact directory entry limit exceeded".into(),
+                    ));
+                }
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let path = format!("{prefix}/{name}");
+                if kind.is_dir() {
+                    walk(&entry.open_dir()?, &path, out, visited, depth + 1)?;
+                } else if kind.is_file() {
+                    out.push((path, entry.metadata()?.len()));
+                }
+            }
+            Ok(())
+        }
+        let mut out = vec![];
+        let mut visited = 0;
+        walk(&self.inbox_cap, "inbox", &mut out, &mut visited, 0)?;
+        walk(&self.outbox_cap, "outbox", &mut out, &mut visited, 0)?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+    pub fn preview_shared_file(&self, path: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let (area, relative) = path
+            .split_once('/')
+            .ok_or_else(|| GmError::Config("Expected inbox/ or outbox/ path".into()))?;
+        if relative.is_empty()
+            || relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == ".." || p.contains(':'))
+        {
+            return Err(GmError::SafetyViolation("Invalid artifact path".into()));
+        }
+        let directory = match area {
+            "inbox" => &self.inbox_cap,
+            "outbox" => &self.outbox_cap,
+            _ => {
+                return Err(GmError::SafetyViolation(
+                    "Only inbox and outbox are exposed to previews".into(),
+                ));
+            }
+        };
+        let file = directory.open(relative)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > 1024 * 1024 {
+            return Err(GmError::Config(
+                "Preview requires a regular file under 1 MiB".into(),
+            ));
+        }
+        let mut bytes = vec![];
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(GmError::Config("Preview exceeds 1 MiB".into()));
+        }
+        Ok(bytes)
+    }
     pub fn network_allowed(&self) -> bool {
         self.allow_network
     }
@@ -365,7 +454,17 @@ impl BotWorkspaceSandbox {
                 if handle.metadata(&relative)?.len() > 1024 * 1024 {
                     return Err(GmError::Config("File exceeds the 1 MiB tool limit".into()));
                 }
-                let content = handle.read_to_string(&relative).map_err(GmError::Io)?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                handle
+                    .open(&relative)?
+                    .take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(GmError::Config("File exceeds the 1 MiB tool limit".into()));
+                }
+                let content = String::from_utf8(bytes)
+                    .map_err(|_| GmError::Config("File is not valid UTF-8 text".into()))?;
                 let scrubbed = self.scrubber.scrub_str(&content);
                 if let Some(logger) = audit {
                     logger.log_governance(
@@ -519,15 +618,43 @@ impl BotWorkspaceSandbox {
                 let timeout =
                     Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(100, 120_000));
                 let vm = self.vm_config.clone();
-                let (exit_code, output) = crate::vm::execute(
+                let outcome = crate::vm::execute(
                     vm,
                     &self.workspace_dir,
                     command,
                     timeout.as_millis() as u64,
                 )
                 .await?;
+                let mut output = outcome.output;
+                if !outcome.artifacts.is_empty() {
+                    use std::io::Write;
+                    let slot = format!("vm-{}", uuid::Uuid::new_v4());
+                    self.outbox_cap.create_dir(&slot)?;
+                    let directory = self.outbox_cap.open_dir(&slot)?;
+                    for artifact in outcome.artifacts {
+                        let path = Path::new(&artifact.path);
+                        if let Some(parent) = path.parent() {
+                            directory.create_dir_all(parent)?;
+                        }
+                        let mut options = cap_std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use cap_std::fs::OpenOptionsExt;
+                            options.mode(0o600);
+                        }
+                        let mut file = directory.open_with(path, &options)?;
+                        file.write_all(&artifact.bytes)?;
+                        file.sync_all()?;
+                        output.push_str(&format!(
+                            "\nReview artifact: outbox/{slot}/{} ({} bytes)",
+                            artifact.path,
+                            artifact.bytes.len()
+                        ));
+                    }
+                }
                 Ok(WorkspaceToolOutcome {
-                    summary: format!("Workspace VM command exited with {exit_code}"),
+                    summary: format!("Workspace VM command exited with {}", outcome.exit_code),
                     output: self.scrubber.scrub_str(&output),
                     diff_preview: None,
                 })

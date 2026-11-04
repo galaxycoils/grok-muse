@@ -1,11 +1,13 @@
 //! Grok-Muse OpenBot Multi-Agent & Coworker Suite (`v0.3.0`).
 
 pub mod a2a;
+pub mod attachments;
 pub mod bridges;
 pub mod channels;
 pub mod compaction;
 pub mod queue;
 pub mod roster;
+pub mod routines;
 pub mod runtime;
 pub mod supervisor;
 pub mod web;
@@ -16,6 +18,7 @@ pub use channels::*;
 pub use compaction::*;
 pub use queue::*;
 pub use roster::*;
+pub use routines::*;
 pub use supervisor::*;
 pub use web::*;
 

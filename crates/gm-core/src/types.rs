@@ -67,8 +67,40 @@ pub struct FrameCapture {
     pub width: u32,
     pub height: u32,
     pub scale_factor: f64,
+    /// Desktop rectangle represented by the entire encoded image. Independent of
+    /// backing scale, JPEG resizing, and the active window's position.
+    #[serde(default)]
+    pub desktop_bounds: Option<Rect>,
     pub data: FrameData,
     pub timestamp_ms: u64,
+}
+
+impl FrameCapture {
+    pub fn image_to_desktop(&self, point: (f64, f64)) -> Option<(f64, f64)> {
+        let bounds = self.desktop_bounds?;
+        let (x, y) = point;
+        if self.width == 0
+            || self.height == 0
+            || !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= f64::from(self.width)
+            || y >= f64::from(self.height)
+            || !bounds.x.is_finite()
+            || !bounds.y.is_finite()
+            || !bounds.width.is_finite()
+            || !bounds.height.is_finite()
+            || bounds.width <= 0.0
+            || bounds.height <= 0.0
+        {
+            return None;
+        }
+        Some((
+            bounds.x + x * bounds.width / f64::from(self.width),
+            bounds.y + y * bounds.height / f64::from(self.height),
+        ))
+    }
 }
 
 /// Actions supported by the Computer Use helper.
@@ -388,5 +420,37 @@ mod tests {
 
         mail.is_flagged = true;
         assert!(mail.is_urgent_heuristic());
+    }
+}
+
+#[cfg(test)]
+mod capture_geometry_tests {
+    use super::*;
+    #[test]
+    fn image_mapping_handles_negative_monitors_resize_and_bad_coordinates() {
+        let frame = FrameCapture {
+            width: 1280,
+            height: 720,
+            scale_factor: 3.0,
+            desktop_bounds: Some(Rect::new(-2560.0, -200.0, 2560.0, 1440.0)),
+            data: FrameData::InlineBytes(vec![]),
+            timestamp_ms: 0,
+        };
+        assert_eq!(
+            frame.image_to_desktop((640.0, 360.0)),
+            Some((-1280.0, 520.0))
+        );
+        for p in [
+            (f64::NAN, 1.0),
+            (f64::INFINITY, 1.0),
+            (-1.0, 0.0),
+            (1280.0, 0.0),
+            (0.0, 720.0),
+        ] {
+            assert_eq!(frame.image_to_desktop(p), None);
+        }
+        let old = serde_json::json!({"width":100,"height":100,"scale_factor":2.0,"data":{"InlineBytes":[]},"timestamp_ms":0});
+        let old: FrameCapture = serde_json::from_value(old).unwrap();
+        assert_eq!(old.image_to_desktop((10.0, 10.0)), None);
     }
 }

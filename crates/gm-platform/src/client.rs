@@ -147,13 +147,23 @@ impl Platform for IpcPlatformClient {
         max_long_edge: Option<u32>,
         quality: Option<u8>,
     ) -> Result<FrameCapture> {
-        match self
-            .send_request(HelperRequest::CaptureLatestFrame {
+        let task = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let request = match task {
+            Some((_, task_id)) => HelperRequest::CaptureTaskFrame {
+                task_id,
                 max_long_edge,
                 quality,
-            })
-            .await?
-        {
+            },
+            None => HelperRequest::CaptureLatestFrame {
+                max_long_edge,
+                quality,
+            },
+        };
+        match self.send_request(request).await? {
             HelperResponse::Frame(frame) => Ok(frame),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for capture: {other:?}"
@@ -162,10 +172,16 @@ impl Platform for IpcPlatformClient {
     }
 
     async fn ax_snapshot(&self, window_id: Option<u32>) -> Result<AxSnapshot> {
-        match self
-            .send_request(HelperRequest::GetAxSnapshot { window_id })
-            .await?
-        {
+        let task = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let request = match task {
+            Some((_, task_id)) => HelperRequest::GetTaskAxSnapshot { task_id, window_id },
+            None => HelperRequest::GetAxSnapshot { window_id },
+        };
+        match self.send_request(request).await? {
             HelperResponse::AxSnapshot(snap) => Ok(snap),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for ax_snapshot: {other:?}"

@@ -7,6 +7,7 @@ authors.workspace = true
 description = "OpenBot multi-agent coworker orchestration, durable FIFO queues, channels, A2A, AG-UI companion server, and external chat bridges"
 
 [dependencies]
+chrono-tz = "0.10"
 gm-core = { workspace = true }
 gm-safety = { workspace = true }
 gm-memory = { workspace = true }

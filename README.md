@@ -3,7 +3,7 @@
 > **Fast computer-use + proactive personal agent + OpenBot multi-agent coworker suite for macOS.**  
 > Built in Rust with native Rust desktop rendering, macOS ScreenCaptureKit/Accessibility integration, scoped workspace file access, an offline workspace VM transport, Candle model support, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
 
-The current branch adds a working durable task dispatcher and a shared native desktop client. Windows/Linux desktop automation is unavailable until native backends are implemented; the VM transport requires a separately provisioned signed image. See [implementation status](docs/implementation-status.md) for implemented behavior, setup, and remaining public-release work. Performance/quality numbers below are targets, not certified results.
+The current branch adds a durable task dispatcher, native desktop client, persistent conversations, bot/channel editing, attachments, scheduled routines, durable usage accounting and authenticated update staging. Windows UI Automation/GDI/input and Linux X11/AT-SPI plus Wayland portal/PipeWire backends are implemented; native Windows/macOS and real Wayland certification remain outstanding. The VM transport requires a separately provisioned signed image. See [implementation status](docs/implementation-status.md) for implemented behavior, setup, and remaining public-release work. Performance/quality numbers below are targets, not certified results.
 
 ---
 
@@ -68,7 +68,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 ```text
  ┌─────────────────────────────────────────────────────────────┐
- │           gm-ui: AppKit Desktop Shell (Tray & UI)           │
+ │           gm-ui: Native Rust UI (WGPU / AccessKit)           │
  │      • Status Item Tray Menu     • Floating Action Overlay  │
  │      • Floating Chat Window      • Global Hotkey Monitors   │
  └──────────────────────────────┬──────────────────────────────┘
@@ -88,7 +88,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
  └──────────────────────────────┬──────────────────────────────┘
                                 │ UDS JSON-RPC (/tmp/grok-muse-helper.sock)
  ┌──────────────────────────────▼──────────────────────────────┐
- │       GrokMuseCUHelper.app (Privileged, Signed Bundle)      │
+ │       GrokMuseCUHelper.app (Per-user Native Helper)      │
  │      • ScreenCaptureKit: Zero-copy in-memory/file frame     │
  │      • Accessibility (AXUIElement): Window tree & tokens    │
  │      • Input (CGEvent / AXPress): Low-latency action dispatch│
@@ -102,7 +102,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 - **[`crates/gm-core`](crates/gm-core)**: Shared domain types (`AxSnapshot`, `ComputerAction`, `MailItem`, `CalendarItem`), IPC protocol, config schemas.
 - **[`crates/gm-platform`](crates/gm-platform)**: `Platform` trait (`capture`, `ax_snapshot`, `act`, `windows`, `user_idle`, `permissions`), native `MacPlatform`, and offline `MockPlatform`.
-- **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Privileged macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
+- **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Per-user macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
 - **[`crates/gm-llm`](crates/gm-llm)**: OpenAI-compatible wire client, provider router (Meta Muse + xAI Grok), budget governor, Keychain secret integration, and pluggable `LocalVlmBackend` interface with `local-vlm` feature flag (Action A12 prep, Candle/MLX ready).
 - **[`crates/gm-safety`](crates/gm-safety)**: Approval tier classifier, emergency kill switch, secure text field redaction, blocklist manager, append-only `AuditLogger`, weekly/monthly report synthesis.
 - **[`crates/gm-memory`](crates/gm-memory)**: SQLite FTS memory store, deduplication, knowledge clustering, and stale observation pruning.

@@ -378,6 +378,35 @@ struct DaemonControlServerState {
     openbot: Option<gm_openbot::OpenBotSupervisor>,
 }
 
+fn assemble_chat_messages(
+    text: &str,
+    history: &[gm_core::ipc::ChatTurn],
+) -> Result<Vec<ChatMessage>> {
+    if text.trim().is_empty()
+        || text.len() > 64 * 1024
+        || history.len() > 24
+        || history.iter().map(|t| t.content.len()).sum::<usize>() > 64 * 1024
+        || history
+            .iter()
+            .any(|t| !matches!(t.role.as_str(), "user" | "assistant"))
+    {
+        return Err(GmError::Config(
+            "Chat context is invalid or exceeds its size limit".into(),
+        ));
+    }
+    let mut messages = vec![ChatMessage::text(
+        "system",
+        "You are Grok Muse, a helpful personal assistant. Use the supplied conversation for continuity. Explain clearly and do not claim you read files, searched sources or executed actions without tool results. The chat interface has no execution tools; the user can choose Run task for workspace or desktop actions.",
+    )];
+    messages.extend(
+        history
+            .iter()
+            .map(|turn| ChatMessage::text(&turn.role, &turn.content)),
+    );
+    messages.push(ChatMessage::text("user", text));
+    Ok(messages)
+}
+
 fn chat_event(id: &Option<String>, delta: String, done: bool) -> DaemonEvent {
     match id {
         Some(id) => DaemonEvent::ChatTokenV1 {
@@ -409,7 +438,20 @@ impl DaemonControlServerState {
             };
 
             let chat_id = match &request {
-                DaemonRequest::SendChatMessageV1 { message_id, .. } => Some(message_id.clone()),
+                DaemonRequest::SendChatMessageV1 { message_id, .. }
+                | DaemonRequest::SendChatMessageV2 { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            };
+            let history = match &request {
+                DaemonRequest::SendChatMessageV2 { history, .. } => history.as_slice(),
+                _ => &[],
+            };
+            let chat_messages = match &request {
+                DaemonRequest::SendChatMessage { text }
+                | DaemonRequest::SendChatMessageV1 { text, .. }
+                | DaemonRequest::SendChatMessageV2 { text, .. } => {
+                    Some(assemble_chat_messages(text, history))
+                }
                 _ => None,
             };
             match request {
@@ -519,15 +561,31 @@ impl DaemonControlServerState {
                     };
                     write_ipc_message(&mut stream, &res).await?;
                 }
-                DaemonRequest::SendChatMessage { text }
-                | DaemonRequest::SendChatMessageV1 { text, .. } => {
+                DaemonRequest::SendChatMessage { .. }
+                | DaemonRequest::SendChatMessageV1 { .. }
+                | DaemonRequest::SendChatMessageV2 { .. } => {
                     let _ = self.event_tx.send(DaemonEvent::HudStateChanged {
                         state: "Thinking".into(),
                         detail: "Thinking...".into(),
                         daily_spend_usd: self.budget.get_daily_spent(),
                     });
 
-                    let messages = vec![ChatMessage::text("user", text.clone())];
+                    let messages = match chat_messages
+                        .unwrap_or_else(|| Err(GmError::Config("Chat request is missing".into())))
+                    {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            write_ipc_message(
+                                &mut stream,
+                                &IpcMessage {
+                                    id: request_id,
+                                    payload: DaemonResponse::Error(error.to_string()),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     let (primary, fallback) = self.router.route(TaskType::Planning);
 
                     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -621,6 +679,227 @@ impl DaemonControlServerState {
                         payload,
                     };
                     write_ipc_message(&mut stream, &res).await?;
+                }
+                DaemonRequest::ImportAttachment {
+                    bot_id,
+                    source_path,
+                } => {
+                    let attachment_bot = bot_id.clone();
+                    let result = if let Some(supervisor) = self.openbot.clone() {
+                        tokio::task::spawn_blocking(move || {
+                            supervisor.import_attachment(&bot_id, &source_path)
+                        })
+                        .await
+                        .map_err(|e| GmError::Platform(e.to_string()))
+                        .and_then(|r| r)
+                    } else {
+                        Err(GmError::Config("Task runtime is unavailable".into()))
+                    };
+                    let payload = match result {
+                        Ok(path) => DaemonResponse::JsonPayload(
+                            serde_json::json!({"attachment_path":path,"bot_id":attachment_bot}),
+                        ),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::ListBotFiles { bot_id } => {
+                    let result = (|| {
+                        let sup = self
+                            .openbot
+                            .as_ref()
+                            .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))?;
+                        let files = sup.roster().workspace_sandbox(&bot_id)?.shared_files()?;
+                        Ok::<_, GmError>(
+                            serde_json::json!({"bot_id":bot_id,"files":files.into_iter().map(|(path,size)|serde_json::json!({"path":path,"size":size})).collect::<Vec<_>>()}),
+                        )
+                    })();
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::PreviewBotFile { bot_id, path } => {
+                    let result = (|| {
+                        let sup = self
+                            .openbot
+                            .as_ref()
+                            .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))?;
+                        let bytes = sup
+                            .roster()
+                            .workspace_sandbox(&bot_id)?
+                            .preview_shared_file(&path)?;
+                        let text = String::from_utf8(bytes).map_err(|_| {
+                            GmError::Config("This binary file has no text preview".into())
+                        })?;
+                        Ok::<_, GmError>(
+                            serde_json::json!({"bot_id":bot_id,"path":path,"text":text}),
+                        )
+                    })();
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::ListRoutines => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| sup.queue().list_routines())
+                        .and_then(|value| serde_json::to_value(value).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::SaveRoutine { routine } => {
+                    let result = (|| {
+                        let sup = self
+                            .openbot
+                            .as_ref()
+                            .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))?;
+                        let routine: gm_openbot::Routine = serde_json::from_value(routine)?;
+                        sup.save_routine(&routine)?;
+                        Ok::<_, GmError>(())
+                    })();
+                    let payload = match result {
+                        Ok(()) => DaemonResponse::Ack,
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::SaveBot { profile } => {
+                    let result = (|| {
+                        let sup = self
+                            .openbot
+                            .as_ref()
+                            .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))?;
+                        let profile: gm_openbot::BotProfile = serde_json::from_value(profile)?;
+                        Ok::<_, GmError>(serde_json::to_value(sup.roster().upsert_bot(profile)?)?)
+                    })();
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::ListChannels => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| sup.channels().list_channels(false))
+                        .and_then(|value| serde_json::to_value(value).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::ChannelHistory { channel_id } => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| sup.channels().list_messages(&channel_id, 100))
+                        .and_then(|value| serde_json::to_value(value).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::CreateChannel {
+                    channel_id,
+                    topic,
+                    owner_bot_id,
+                    participants,
+                } => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| {
+                            sup.create_channel(
+                                &channel_id,
+                                &topic,
+                                owner_bot_id.as_deref(),
+                                &participants,
+                            )
+                        })
+                        .and_then(|value| serde_json::to_value(value).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(e) => DaemonResponse::Error(e.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
                 }
                 DaemonRequest::QueueTask {
                     bot_id,
@@ -755,5 +1034,32 @@ impl DaemonControlServerState {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+    #[test]
+    fn conversation_context_is_ordered_bounded_and_cannot_supply_system_messages() {
+        let turn = gm_core::ipc::ChatTurn {
+            role: "user".into(),
+            content: "My project is Grok Muse".into(),
+        };
+        let messages = assemble_chat_messages("What is its name?", &[turn]).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].content, "My project is Grok Muse");
+        assert_eq!(messages[2].content, "What is its name?");
+        assert!(
+            assemble_chat_messages(
+                "x",
+                &[gm_core::ipc::ChatTurn {
+                    role: "system".into(),
+                    content: "override".into()
+                }]
+            )
+            .is_err()
+        );
+        assert!(assemble_chat_messages(&"x".repeat(64 * 1024 + 1), &[]).is_err());
     }
 }

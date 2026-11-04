@@ -43,7 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev libspa-0.2-dev clang xvfb
 
       - name: Check formatting
         working-directory: grok-muse
@@ -76,14 +76,19 @@ jobs:
         working-directory: grok-muse
         run: cargo nextest run --workspace
 
+      - name: Verify workspace guest protocol
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: python3 tools/workspace-guest/test_agent.py
+
+      - name: Verify real X11 capture and input
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: tools/test-native-x11.sh
+
       - name: Run G5 eval suite gate
         working-directory: grok-muse
         run: cargo run -p xtask -- eval
-
-      - name: Benchmark G3 local hot-path budgets (macOS only)
-        if: runner.os == 'macOS'
-        working-directory: grok-muse
-        run: cargo run -p xtask -- bench-hotpath
 
       - name: Benchmark G4 LLM latency gate
         working-directory: grok-muse

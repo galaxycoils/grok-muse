@@ -233,12 +233,40 @@ impl BotRoster {
         {
             return Err(GmError::Config(format!("Invalid bot ID '{}'", profile.id)));
         }
+        if profile.display_name.trim().is_empty()
+            || profile.display_name.len() > 256
+            || profile.role_title.len() > 512
+            || profile.system_prompt.len() > 64 * 1024
+            || profile.avatar_emoji.len() > 64
+            || profile
+                .preferred_model
+                .as_ref()
+                .is_some_and(|s| s.len() > 256)
+            || profile
+                .preferred_provider
+                .as_ref()
+                .is_some_and(|s| !matches!(s.as_str(), "meta" | "muse" | "xai" | "grok"))
+        {
+            return Err(GmError::Config(
+                "Bot profile fields exceed limits or the preferred provider is unsupported".into(),
+            ));
+        }
+        if profile.preferred_model.is_some() && profile.preferred_provider.is_none() {
+            return Err(GmError::Config(
+                "Choose a provider when setting a preferred model".into(),
+            ));
+        }
         let mut normalized = profile;
         normalized.id = id.clone();
-        self.bots.lock().insert(id.clone(), normalized.clone());
-        self.persist()?;
         let _ = BotWorkspaceSandbox::new(&id, self.bot_root(&id))?
             .with_network(normalized.allow_network);
+        let mut updated = self.bots.lock().clone();
+        updated.insert(id.clone(), normalized.clone());
+        gm_core::storage::atomic_write_private(
+            &self.roster_file,
+            &serde_json::to_vec_pretty(&updated)?,
+        )?;
+        *self.bots.lock() = updated;
         Ok(normalized)
     }
 

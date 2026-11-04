@@ -1,0 +1,28 @@
+name: Native desktop measurements
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-desktop:
+    # This runner must have an unlocked desktop and grant capture/accessibility
+    # permissions to the native benchmark. Hosted headless CI cannot certify TCC.
+    runs-on: [self-hosted, macOS, grok-muse-desktop]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: grok-muse
+      - uses: actions/checkout@v4
+        with:
+          repository: galaxycoils/darius
+          ref: f47a4ce980abecb751c9f5c79e1c424a20100433
+          path: Darius
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - name: Measure native capture, accessibility and dispatcher
+        working-directory: grok-muse
+        run: cargo run --release -p xtask -- bench-hotpath
+      - name: Measure native application memory
+        working-directory: grok-muse
+        run: cargo run --release -p xtask -- bench-rss

@@ -61,6 +61,8 @@ impl OpenBotSupervisor {
             let runtime_lease = lease;
             let _guard = ActiveGuard(sup.runtime_active.clone());
             let mut workers = JoinSet::new();
+            let mut schedule_scan =
+                tokio::time::Instant::now() - std::time::Duration::from_secs(60);
             let mut active = std::collections::HashSet::new();
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -68,6 +70,10 @@ impl OpenBotSupervisor {
                 tokio::select! {
                     _ = timer.tick() => {
                         if kill.is_triggered() || sup.runtime_paused.load(std::sync::atomic::Ordering::SeqCst) { continue; }
+                        if schedule_scan.elapsed()>=std::time::Duration::from_secs(30) {
+                            schedule_scan=tokio::time::Instant::now();
+                            if let Err(error)=sup.tick_routines(chrono::Utc::now()) {tracing::error!(%error,"Routine scheduling failed");}
+                        }
                         for bot in sup.roster.list_bots() {
                             if workers.len() >= 4 || active.contains(&bot.id) { continue; }
                             // Do not spawn idle workers continuously.

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rusqlite = { workspace = true }
+uuid = { workspace = true }
 chrono = { workspace = true }
 gm-core = { workspace = true }
 darius-daemon = { workspace = true }

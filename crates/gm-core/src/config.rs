@@ -36,7 +36,14 @@ pub fn default_config_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join("Library/Application Support/GrokMuse/config.json")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = std::env::var("APPDATA")
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .unwrap_or_else(|_| ".".into());
+        PathBuf::from(app_data).join("GrokMuse/config.json")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join(".config/grok-muse/config.json")
@@ -92,16 +99,32 @@ impl GmConfig {
             config.daemon_socket_path = PathBuf::from(daemon_socket);
         }
 
-        if !config.budget.daily_spend_cap_usd.is_finite()
-            || config.budget.daily_spend_cap_usd < 0.0
-            || !config.budget.per_job_spend_cap_usd.is_finite()
-            || config.budget.per_job_spend_cap_usd < 0.0
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.budget.daily_spend_cap_usd.is_finite()
+            || self.budget.daily_spend_cap_usd < 0.0
+            || !self.budget.per_job_spend_cap_usd.is_finite()
+            || self.budget.per_job_spend_cap_usd < 0.0
         {
             return Err(crate::error::GmError::Config(
                 "Budget limits must be finite and nonnegative".into(),
             ));
         }
-        Ok(config)
+        if !self.safety.user_active_pause_seconds.is_finite()
+            || self.safety.user_active_pause_seconds < 0.0
+        {
+            return Err(crate::error::GmError::Config(
+                "Idle threshold must be finite and nonnegative".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn save(&self, path: &Path) -> crate::error::Result<()> {
+        self.validate()?;
+        crate::storage::atomic_write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn load_or_default(custom_path: Option<&Path>) -> Self {
@@ -436,6 +459,8 @@ pub struct WorkspaceVmConfig {
     pub manifest_path: PathBuf,
     pub signature_path: PathBuf,
     pub trusted_public_key_hex: String,
+    /// Read-only UEFI firmware, authenticated by the image manifest. Required on ARM.
+    pub firmware_path: Option<PathBuf>,
 }
 impl Default for WorkspaceVmConfig {
     fn default() -> Self {
@@ -451,6 +476,7 @@ impl Default for WorkspaceVmConfig {
             manifest_path: PathBuf::new(),
             signature_path: PathBuf::new(),
             trusted_public_key_hex: String::new(),
+            firmware_path: None,
         }
     }
 }

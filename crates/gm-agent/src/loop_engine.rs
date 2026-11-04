@@ -1,6 +1,6 @@
 use crate::approval::{ApprovalRequest, InteractionHandler, NonInteractiveHandler};
 use crate::mcp_bridge::{McpToolBridge, try_parse_mcp_tool_call};
-use crate::som::{annotate_frame_with_som, is_interactive_element, resolve_som_badge};
+use crate::som::{annotate_frame_with_geometry, is_interactive_element, resolve_som_badge};
 use crate::trajectory::TrajectoryRecorder;
 use crate::wheel::{OpenBotStepAction, WheelHandoffRequest, try_parse_openbot_step_action};
 use crate::workspace_tools::BotWorkspaceSandbox;
@@ -488,21 +488,23 @@ impl<P: Platform> AgentLoop<P> {
                 .and_then(|fc| gm_platform::resolve_frame_bytes(fc).ok());
 
             // 7. Optional Set-of-Marks annotation when vision escalated
-            let (som_annotation, active_som_marks) = if should_escalate_vision {
-                let fallback_dims = (
-                    sanitized_snapshot.bounds.width.max(1280.0) as u32,
-                    sanitized_snapshot.bounds.height.max(800.0) as u32,
-                );
-                let annotation = annotate_frame_with_som(
-                    resolved_frame_bytes.as_deref(),
-                    fallback_dims,
-                    &sanitized_snapshot,
-                )?;
-                let marks = annotation.marks.clone();
-                (Some(annotation), marks)
-            } else {
-                (None, Vec::new())
-            };
+            let (som_annotation, active_som_marks) =
+                if should_escalate_vision && resolved_frame_bytes.is_some() {
+                    let fallback_dims = (
+                        sanitized_snapshot.bounds.width.max(1280.0) as u32,
+                        sanitized_snapshot.bounds.height.max(800.0) as u32,
+                    );
+                    let annotation = annotate_frame_with_geometry(
+                        resolved_frame_bytes.as_deref(),
+                        fallback_dims,
+                        &sanitized_snapshot,
+                        frame_capture.as_ref().and_then(|f| f.desktop_bounds),
+                    )?;
+                    let marks = annotation.marks.clone();
+                    (Some(annotation), marks)
+                } else {
+                    (None, Vec::new())
+                };
 
             // 8. Wrap screen text as untrusted data
             let snapshot_json = serde_json::to_string(&sanitized_snapshot)?;
@@ -561,7 +563,7 @@ impl<P: Platform> AgentLoop<P> {
                 Some(som) => vec![
                     ChatMessage::text(
                         "system",
-                        "You are an autonomous computer-use agent with vision. Output JSON with fields 'action' and 'params'. You can reference interactive elements by their Set-of-Marks badge (#1, #2, ...) or accessibility token.",
+                        "You are an autonomous computer-use agent with vision. Output JSON with fields 'action' and 'params'. You can reference interactive elements by their Set-of-Marks badge (#1, #2, ...) or accessibility token. For pixel coordinates read from this image, add top-level coordinate_space: image. Accessibility coordinates and legend centers are desktop coordinates. Never guess coordinates outside the shared image.",
                     ),
                     ChatMessage::with_jpeg("user", prompt_text, &som.jpeg_bytes),
                 ],
@@ -939,6 +941,15 @@ impl<P: Platform> AgentLoop<P> {
                 ));
             }
 
+            // Explicit image coordinates are transformed once, before AX/SoM token resolution.
+            // Legacy responses without coordinate_space retain desktop coordinates.
+            if let Err(error) =
+                map_image_action(&mut action, &response.content, frame_capture.as_ref())
+            {
+                last_action_feedback = Some(error.to_string());
+                continue;
+            }
+
             // Resolve SoM badge tokens (e.g. "#1", "1", "som_1") to ax_token and coordinates
             if let ComputerAction::Click {
                 ref mut token,
@@ -1255,6 +1266,47 @@ impl<P: Platform> AgentLoop<P> {
             self.config.max_steps
         )))
     }
+}
+
+fn map_image_action(
+    action: &mut ComputerAction,
+    response: &str,
+    frame: Option<&gm_core::types::FrameCapture>,
+) -> Result<()> {
+    let json: serde_json::Value = serde_json::from_str(response)?;
+    match json.get("coordinate_space") {
+        None => return Ok(()),
+        Some(serde_json::Value::String(s)) if s == "desktop" => return Ok(()),
+        Some(serde_json::Value::String(s)) if s == "image" => {}
+        _ => {
+            return Err(GmError::Platform(
+                "Unknown coordinate_space; use image or desktop".into(),
+            ));
+        }
+    }
+    let frame = frame.ok_or_else(|| {
+        GmError::Platform("No screen image is available for image coordinates".into())
+    })?;
+    let convert = |p| {
+        frame.image_to_desktop(p).ok_or_else(|| {
+            GmError::Platform(
+                "Image coordinate is outside the capture or has no verified geometry".into(),
+            )
+        })
+    };
+    match action {
+        ComputerAction::Click {
+            coords: Some(p), ..
+        } => *p = convert(*p)?,
+        ComputerAction::Drag { start, end } => {
+            let a = convert(*start)?;
+            let b = convert(*end)?;
+            *start = a;
+            *end = b;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2003,5 +2055,50 @@ mod tests {
             std::env::remove_var("OB_LOOP_SECRET_TEST");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+    use gm_core::types::{FrameCapture, FrameData, Rect};
+    #[test]
+    fn rescaled_click_and_drag_map_once_and_invalid_drag_never_partially_changes() {
+        let frame = FrameCapture {
+            width: 1000,
+            height: 500,
+            scale_factor: 4.0,
+            desktop_bounds: Some(Rect::new(-2000.0, 100.0, 4000.0, 2000.0)),
+            data: FrameData::InlineBytes(vec![]),
+            timestamp_ms: 0,
+        };
+        let mut click = ComputerAction::Click {
+            token: None,
+            coords: Some((250.0, 250.0)),
+            button: None,
+            click_count: None,
+        };
+        map_image_action(&mut click, r#"{"coordinate_space":"image"}"#, Some(&frame)).unwrap();
+        assert!(matches!(
+            click,
+            ComputerAction::Click {
+                coords: Some((-1000.0, 1100.0)),
+                ..
+            }
+        ));
+        let mut drag = ComputerAction::Drag {
+            start: (10.0, 20.0),
+            end: (2000.0, 20.0),
+        };
+        let original = drag.clone();
+        assert!(
+            map_image_action(&mut drag, r#"{"coordinate_space":"image"}"#, Some(&frame)).is_err()
+        );
+        assert_eq!(drag, original);
+        assert!(
+            map_image_action(&mut drag, r#"{"coordinate_space":"unknown"}"#, Some(&frame)).is_err()
+        );
+        map_image_action(&mut drag, r#"{}"#, Some(&frame)).unwrap();
+        assert_eq!(drag, original);
     }
 }

@@ -80,7 +80,7 @@ pub struct QueuedTask {
 /// "Take the Wheel" human handoff states, reboot recovery, and JSONL backup/restore.
 #[derive(Clone)]
 pub struct DurableTaskQueue {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
     max_recoveries: u32,
 }
 
@@ -163,10 +163,12 @@ impl DurableTaskQueue {
             .commit()
             .map_err(|e| GmError::Platform(e.to_string()))?;
 
-        Ok(Self {
+        let queue = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_recoveries: 2,
-        })
+        };
+        queue.init_routines()?;
+        Ok(queue)
     }
 
     pub fn enqueue(

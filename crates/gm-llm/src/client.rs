@@ -651,7 +651,7 @@ impl Default for CalibratedFastRouteBackend {
             ttft_ms: 180.0,
             tokens_per_second: 75.0,
             action_content:
-                "{\"action\":\"click\",\"params\":{\"token\":\"el_4\",\"coords\":[320.0,450.0]}}"
+                "{\"action\":\"Done\",\"params\":{\"summary\":\"Synthetic latency fixture completed\"}}"
                     .into(),
         }
     }
@@ -663,7 +663,7 @@ impl CalibratedFastRouteBackend {
             ttft_ms,
             tokens_per_second,
             action_content:
-                "{\"action\":\"click\",\"params\":{\"token\":\"el_4\",\"coords\":[320.0,450.0]}}"
+                "{\"action\":\"Done\",\"params\":{\"summary\":\"Synthetic latency fixture completed\"}}"
                     .into(),
         }
     }
@@ -1102,7 +1102,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resp.content.contains("click"));
+        assert!(matches!(
+            serde_json::from_str::<gm_core::types::ComputerAction>(&resp.content).unwrap(),
+            gm_core::types::ComputerAction::Done { .. }
+        ));
         assert!(metrics.ttft_ms >= 50.0);
         assert!(metrics.tokens_per_second > 0.0);
         assert!(metrics.total_duration_ms > metrics.ttft_ms);
