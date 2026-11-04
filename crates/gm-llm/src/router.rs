@@ -14,6 +14,8 @@ pub enum TaskType {
 pub enum ProviderKind {
     Meta,
     Xai,
+    Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,8 @@ impl LlmRouter {
         self.preference = match provider {
             Some("meta" | "muse") => Some((ProviderKind::Meta, model.map(str::to_string))),
             Some("xai" | "grok") => Some((ProviderKind::Xai, model.map(str::to_string))),
+            Some("claude" | "anthropic") => Some((ProviderKind::Claude, model.map(str::to_string))),
+            Some("codex" | "openai") => Some((ProviderKind::Codex, model.map(str::to_string))),
             Some(other) => {
                 return Err(gm_core::error::GmError::Config(format!(
                     "Unsupported bot provider: {other}"
@@ -145,6 +149,18 @@ impl LlmRouter {
                     model: self.config.xai_model.clone(),
                     allow_vision: task == TaskType::CuVisionStep
                         && self.config.allow_screenshot_egress_xai,
+                },
+                ProviderKind::Claude => ModelTarget {
+                    provider: provider.clone(),
+                    api_base: "cli://claude".into(),
+                    model: "claude-3-5-sonnet".into(),
+                    allow_vision: task == TaskType::CuVisionStep,
+                },
+                ProviderKind::Codex => ModelTarget {
+                    provider: provider.clone(),
+                    api_base: "cli://codex".into(),
+                    model: "codex".into(),
+                    allow_vision: false,
                 },
             };
             if let Some(model) = model {

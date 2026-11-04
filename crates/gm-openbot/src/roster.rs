@@ -242,10 +242,12 @@ impl BotRoster {
                 .preferred_model
                 .as_ref()
                 .is_some_and(|s| s.len() > 256)
-            || profile
-                .preferred_provider
-                .as_ref()
-                .is_some_and(|s| !matches!(s.as_str(), "meta" | "muse" | "xai" | "grok"))
+            || profile.preferred_provider.as_ref().is_some_and(|s| {
+                !matches!(
+                    s.as_str(),
+                    "meta" | "muse" | "xai" | "grok" | "claude" | "codex" | "anthropic" | "openai"
+                )
+            })
         {
             return Err(GmError::Config(
                 "Bot profile fields exceed limits or the preferred provider is unsupported".into(),

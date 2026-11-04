@@ -127,6 +127,11 @@ impl GmConfig {
         crate::storage::atomic_write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
+    /// Atomically write configuration using write-to-temp and rename semantics.
+    pub fn save_atomic(&self, path: impl AsRef<Path>) -> crate::error::Result<()> {
+        self.save(path.as_ref())
+    }
+
     pub fn load_or_default(custom_path: Option<&Path>) -> Self {
         Self::load(custom_path)
             .expect("Configuration could not be loaded; the original file has been preserved")

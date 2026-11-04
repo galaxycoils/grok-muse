@@ -396,6 +396,25 @@ impl OpenBotSupervisor {
         let queue_for_mutation = self.queue.clone();
         let mutation_id = task.id.clone();
         let allow_gui = profile.allow_gui && self.config.safety.allow_host_desktop;
+        let effective_prompt = if let Some(chan_id) = &task.channel_id {
+            if let Ok(Some(chan)) = self.channels.get_channel(chan_id) {
+                if !chan.instructions.trim().is_empty() {
+                    format!(
+                        "{}\n\n## Channel Instructions (#{})\n{}",
+                        profile.system_prompt,
+                        chan.id,
+                        chan.instructions.trim()
+                    )
+                } else {
+                    profile.system_prompt.clone()
+                }
+            } else {
+                profile.system_prompt.clone()
+            }
+        } else {
+            profile.system_prompt.clone()
+        };
+
         let agent = AgentLoop::new(
             platform.clone(),
             Arc::new(llm.scoped_job()),
@@ -416,7 +435,7 @@ impl OpenBotSupervisor {
             allow_network: profile.allow_network,
         })
         .with_secret_injection(self.config.safety.allow_secret_injection)
-        .with_system_prompt(profile.system_prompt.clone())
+        .with_system_prompt(effective_prompt)
         .with_mutation_callback(move |in_flight| {
             queue_for_mutation.set_mutating_in_flight(&mutation_id, in_flight)
         })
@@ -622,5 +641,14 @@ impl OpenBotSupervisor {
             });
         }
         Ok(updated)
+    }
+
+    pub fn update_channel_instructions(
+        &self,
+        channel_id: &str,
+        instructions: &str,
+    ) -> Result<bool> {
+        self.channels
+            .update_channel_instructions(channel_id, instructions)
     }
 }

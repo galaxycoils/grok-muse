@@ -11,6 +11,8 @@ pub struct ChannelInfo {
     pub id: String,
     pub name: String,
     pub topic: String,
+    #[serde(default)]
+    pub instructions: String,
     pub owner_bot_id: Option<String>,
     pub participants: Vec<String>,
     pub paused: bool,
@@ -57,11 +59,7 @@ pub struct ChannelStore {
 
 impl ChannelStore {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = db_path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(db_path.as_ref())
-            .map_err(|e| GmError::Platform(format!("Failed to open channel SQLite DB: {e}")))?;
+        let conn = crate::db_recovery::open_sqlite_with_recovery(db_path.as_ref())?;
         Self::init_conn(conn)
     }
 
@@ -79,6 +77,7 @@ impl ChannelStore {
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 topic TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '',
                 owner_bot_id TEXT,
                 participants_json TEXT NOT NULL,
                 paused INTEGER NOT NULL DEFAULT 0,
@@ -99,6 +98,26 @@ impl ChannelStore {
             "#,
         )
         .map_err(|e| GmError::Platform(format!("Channel schema init failed: {e}")))?;
+
+        // Idempotent column addition for existing databases
+        let has_instructions: bool = conn
+            .prepare("PRAGMA table_info(channels)")
+            .and_then(|mut stmt| {
+                let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                for col in columns {
+                    if col? == "instructions" {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap_or(false);
+
+        if !has_instructions {
+            let _ = conn.execute_batch(
+                "ALTER TABLE channels ADD COLUMN instructions TEXT NOT NULL DEFAULT '';",
+            );
+        }
 
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -138,8 +157,8 @@ impl ChannelStore {
             let parts_json = serde_json::to_string(&parts)?;
             conn.execute(
                 r#"INSERT OR IGNORE INTO channels (
-                    id, name, topic, owner_bot_id, participants_json, paused, archived, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)"#,
+                    id, name, topic, instructions, owner_bot_id, participants_json, paused, archived, created_at
+                ) VALUES (?1, ?2, ?3, '', ?4, ?5, 0, 0, ?6)"#,
                 params![id, name, topic, owner, parts_json, now],
             )
             .map_err(|e| GmError::Platform(e.to_string()))?;
@@ -147,10 +166,11 @@ impl ChannelStore {
         Ok(())
     }
 
-    pub fn create_channel(
+    pub fn create_channel_with_instructions(
         &self,
         id: &str,
         topic: &str,
+        instructions: &str,
         owner_bot_id: Option<&str>,
         participants: &[String],
     ) -> Result<ChannelInfo> {
@@ -172,9 +192,9 @@ impl ChannelStore {
             .lock()
             .execute(
                 r#"INSERT INTO channels (
-                    id, name, topic, owner_bot_id, participants_json, paused, archived, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)"#,
-                params![clean_id, name, topic, owner_bot_id, parts_json, now],
+                    id, name, topic, instructions, owner_bot_id, participants_json, paused, archived, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)"#,
+                params![clean_id, name, topic, instructions, owner_bot_id, parts_json, now],
             )
             .map_err(|e| GmError::Platform(e.to_string()))?;
 
@@ -182,12 +202,39 @@ impl ChannelStore {
             .ok_or_else(|| GmError::Platform("Channel not found after insert".into()))
     }
 
+    pub fn create_channel(
+        &self,
+        id: &str,
+        topic: &str,
+        owner_bot_id: Option<&str>,
+        participants: &[String],
+    ) -> Result<ChannelInfo> {
+        self.create_channel_with_instructions(id, topic, "", owner_bot_id, participants)
+    }
+
+    pub fn update_channel_instructions(
+        &self,
+        channel_id: &str,
+        instructions: &str,
+    ) -> Result<bool> {
+        let clean = normalize_channel_id(channel_id);
+        let rows = self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE channels SET instructions = ?1 WHERE id = ?2",
+                params![instructions, clean],
+            )
+            .map_err(|e| GmError::Platform(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
     pub fn get_channel(&self, channel_id: &str) -> Result<Option<ChannelInfo>> {
         let clean = normalize_channel_id(channel_id);
         self.conn
             .lock()
             .query_row(
-                r#"SELECT id, name, topic, owner_bot_id, participants_json, paused, archived, created_at
+                r#"SELECT id, name, topic, instructions, owner_bot_id, participants_json, paused, archived, created_at
                    FROM channels WHERE id = ?1"#,
                 params![clean],
                 Self::map_channel_row,
@@ -199,9 +246,9 @@ impl ChannelStore {
     pub fn list_channels(&self, include_archived: bool) -> Result<Vec<ChannelInfo>> {
         let conn = self.conn.lock();
         let sql = if include_archived {
-            "SELECT id, name, topic, owner_bot_id, participants_json, paused, archived, created_at FROM channels ORDER BY created_at ASC"
+            "SELECT id, name, topic, instructions, owner_bot_id, participants_json, paused, archived, created_at FROM channels ORDER BY created_at ASC"
         } else {
-            "SELECT id, name, topic, owner_bot_id, participants_json, paused, archived, created_at FROM channels WHERE archived = 0 ORDER BY created_at ASC"
+            "SELECT id, name, topic, instructions, owner_bot_id, participants_json, paused, archived, created_at FROM channels WHERE archived = 0 ORDER BY created_at ASC"
         };
         let mut stmt = conn
             .prepare(sql)
@@ -341,19 +388,64 @@ impl ChannelStore {
     }
 
     fn map_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelInfo> {
-        let parts_json: String = row.get(4)?;
+        let instructions: String = row.get(3).unwrap_or_default();
+        let parts_json: String = row.get(5)?;
         let participants: Vec<String> = serde_json::from_str(&parts_json).unwrap_or_default();
-        let paused_int: i32 = row.get(5)?;
-        let archived_int: i32 = row.get(6)?;
+        let paused_int: i32 = row.get(6)?;
+        let archived_int: i32 = row.get(7)?;
         Ok(ChannelInfo {
             id: row.get(0)?,
             name: row.get(1)?,
             topic: row.get(2)?,
-            owner_bot_id: row.get(3)?,
+            instructions,
+            owner_bot_id: row.get(4)?,
             participants,
             paused: paused_int != 0,
             archived: archived_int != 0,
-            created_at: row.get(7)?,
+            created_at: row.get(8)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_channel_instructions_persistence_and_update() {
+        let store = ChannelStore::in_memory().unwrap();
+        let chan = store
+            .create_channel_with_instructions(
+                "devops",
+                "DevOps channel",
+                "Always run cargo test before submitting diffs.",
+                Some("coder"),
+                &["coder".into()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            chan.instructions,
+            "Always run cargo test before submitting diffs."
+        );
+        let fetched = store.get_channel("devops").unwrap().unwrap();
+        assert_eq!(
+            fetched.instructions,
+            "Always run cargo test before submitting diffs."
+        );
+
+        assert!(
+            store
+                .update_channel_instructions(
+                    "devops",
+                    "Updated instructions: ensure clippy is clean."
+                )
+                .unwrap()
+        );
+        let updated = store.get_channel("devops").unwrap().unwrap();
+        assert_eq!(
+            updated.instructions,
+            "Updated instructions: ensure clippy is clean."
+        );
     }
 }

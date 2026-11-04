@@ -452,7 +452,10 @@ mod session_tests {
     use gm_core::types::ComputerAction;
     #[tokio::test]
     async fn cancelled_and_stale_sessions_cannot_act_or_cancel_a_new_attempt() {
-        let path = std::env::temp_dir().join(format!("gm-session-{}.sock", uuid::Uuid::new_v4()));
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/gm-ses-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
         let server = HelperServer::new(gm_platform::MockPlatform::new());
         let socket = path.clone();
         let handle = tokio::spawn(async move { server.run(socket).await });
@@ -504,8 +507,10 @@ mod session_tests {
     }
     #[tokio::test]
     async fn interrupted_helper_rpc_discards_its_partial_connection() {
-        let path =
-            std::env::temp_dir().join(format!("gm-rpc-cancel-{}.sock", uuid::Uuid::new_v4()));
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/gm-rpc-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
@@ -543,8 +548,10 @@ mod ownership_tests {
     use super::*;
     #[tokio::test]
     async fn second_helper_cannot_unlink_or_replace_a_live_owner() {
-        let path =
-            std::env::temp_dir().join(format!("gm-helper-owner-{}.sock", uuid::Uuid::new_v4()));
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/gm-own-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
         let first = HelperServer::new(gm_platform::MockPlatform::new());
         let socket = path.clone();
         let handle = tokio::spawn(async move { first.run(socket).await });

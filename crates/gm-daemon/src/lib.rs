@@ -20,10 +20,12 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 pub mod control_server;
+pub mod diagnostics;
 pub mod service;
 pub mod updater;
 
 pub use control_server::*;
+pub use diagnostics::*;
 pub use service::*;
 pub use updater::*;
 
@@ -292,6 +294,30 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Export, preview, or safely import multi-bot team templates
+    Team {
+        #[command(subcommand)]
+        action: Option<TeamSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage scheduled OpenBot routines, quiet hours, and run history
+    Routines {
+        #[command(subcommand)]
+        action: Option<RoutinesSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run local health diagnostics and export sanitized support bundles
+    Diagnostics {
+        #[command(subcommand)]
+        action: Option<DiagnosticsSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run loopback OpenBot Companion Web / AG-UI / A2A server (default: 127.0.0.1:7433)
     Serve {
         /// Loopback bind address
@@ -376,10 +402,71 @@ pub enum ChannelsSubcommand {
     },
     /// Assign lead owner bot for a channel
     Assign { channel: String, bot: String },
+    /// Set persistent instructions for a channel
+    SetInstructions {
+        channel: String,
+        instructions: String,
+    },
     /// Archive a channel
     Archive { channel: String },
     /// Restore an archived channel
     Restore { channel: String },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TeamSubcommand {
+    /// Export current team roster, channels, and routines to a portable JSON template
+    Export {
+        /// Team name
+        #[arg(long, default_value = "Grok Muse Team")]
+        name: String,
+        /// Description
+        #[arg(long, default_value = "Exported team configuration")]
+        description: String,
+        /// Output file path (defaults to stdout if not specified)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Preview a team template file before importing
+    Preview {
+        /// Path to team template JSON file
+        path: PathBuf,
+    },
+    /// Import bots, channels, and routines from a template file (routines imported in disabled state)
+    Import {
+        /// Path to team template JSON file
+        path: PathBuf,
+        /// Perform dry-run without writing to database
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing bot profiles if they already exist
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RoutinesSubcommand {
+    /// List configured routines and their schedules
+    List,
+    /// View recent execution history for a routine
+    Runs {
+        id: String,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DiagnosticsSubcommand {
+    /// Run local health checks across sockets, databases, permissions, and disk
+    Check,
+    /// Export an explicitly approved, redacted support diagnostic bundle scrubbing secrets
+    Export {
+        /// Output bundle file path
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1927,6 +2014,24 @@ pub async fn run_channels(
             sup.channels().reassign_owner(&channel, &bot)?;
             println!("✔ Assigned channel {channel} owner to @{bot}");
         }
+        ChannelsSubcommand::SetInstructions {
+            channel,
+            instructions,
+        } => {
+            sup.update_channel_instructions(&channel, &instructions)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "channel": channel,
+                        "instructions": instructions,
+                        "updated": true
+                    })
+                );
+            } else {
+                println!("✔ Updated instructions for channel {channel}");
+            }
+        }
         ChannelsSubcommand::Archive { channel } => {
             sup.channels().set_archived(&channel, true)?;
             println!("✔ Archived channel {channel}");
@@ -1934,6 +2039,221 @@ pub async fn run_channels(
         ChannelsSubcommand::Restore { channel } => {
             sup.channels().set_archived(&channel, false)?;
             println!("✔ Restored channel {channel}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_team(
+    action: Option<TeamSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let sup = open_default_openbot_supervisor(config_path)?;
+    match action.unwrap_or(TeamSubcommand::Export {
+        name: "Grok Muse Team".into(),
+        description: "Exported team configuration".into(),
+        output: None,
+    }) {
+        TeamSubcommand::Export {
+            name,
+            description,
+            output,
+        } => {
+            let template = gm_openbot::templates::export_team(
+                sup.roster(),
+                sup.channels(),
+                sup.queue(),
+                &name,
+                &description,
+            )?;
+            let json_str = serde_json::to_string_pretty(&template)?;
+            if let Some(out_path) = output {
+                std::fs::write(&out_path, &json_str)?;
+                println!("✔ Team template exported to {}", out_path.display());
+            } else {
+                println!("{json_str}");
+            }
+        }
+        TeamSubcommand::Preview { path } => {
+            let content = std::fs::read_to_string(&path)?;
+            let preview = gm_openbot::templates::preview_template(&content)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                println!("Team Template: {}", preview.team_name);
+                println!("  Description: {}", preview.description);
+                println!("  Bots to import: {}", preview.bots.len());
+                for b in &preview.bots {
+                    println!("    - @{}", b);
+                }
+                println!("  Channels to import: {}", preview.channels.len());
+                for c in &preview.channels {
+                    println!("    - #{}", c);
+                }
+                println!("  Routines to import: {}", preview.routines.len());
+                for r in &preview.routines {
+                    println!("    - {} (triggers disabled on import)", r);
+                }
+                if !preview.warnings.is_empty() {
+                    println!("  Warnings ({}):", preview.warnings.len());
+                    for w in &preview.warnings {
+                        println!("    ⚠ {w}");
+                    }
+                }
+            }
+        }
+        TeamSubcommand::Import {
+            path,
+            dry_run,
+            overwrite,
+        } => {
+            let content = std::fs::read_to_string(&path)?;
+            if dry_run {
+                let preview = gm_openbot::templates::preview_template(&content)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&preview)?);
+                } else {
+                    println!("✔ Team template validation passed (DRY RUN):");
+                    println!(
+                        "  {} bots, {} channels, {} routines ready to import",
+                        preview.bots.len(),
+                        preview.channels.len(),
+                        preview.routines.len()
+                    );
+                }
+            } else {
+                let template: gm_openbot::templates::TeamTemplate = serde_json::from_str(&content)
+                    .map_err(|e| GmError::Config(format!("Invalid team template file: {e}")))?;
+                let summary = gm_openbot::templates::import_team(&sup, &template, overwrite)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!(
+                        "✔ Team template '{}' imported successfully:",
+                        summary.team_name
+                    );
+                    println!(
+                        "  Imported {} bots, {} channels, {} routines (all triggers initially disabled)",
+                        summary.bots_imported, summary.channels_imported, summary.routines_imported,
+                    );
+                    for notice in summary.notices {
+                        println!("  ℹ {notice}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_routines(
+    action: Option<RoutinesSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let sup = open_default_openbot_supervisor(config_path)?;
+    match action.unwrap_or(RoutinesSubcommand::List) {
+        RoutinesSubcommand::List => {
+            let routines = sup.queue().list_routines()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&routines)?);
+            } else {
+                println!("Configured Routines ({}):", routines.len());
+                for r in routines {
+                    let quiet_info = match &r.routine.quiet_hours {
+                        Some(q) => format!(
+                            " (quiet hours: {:02}:00-{:02}:00)",
+                            q.start_hour, q.end_hour
+                        ),
+                        None => String::new(),
+                    };
+                    println!(
+                        "  • {:<16} bot: @{:<12} next_due: {} enabled: {}{}",
+                        r.routine.id,
+                        r.routine.bot_id,
+                        r.next_run_utc,
+                        r.routine.enabled,
+                        quiet_info
+                    );
+                }
+            }
+        }
+        RoutinesSubcommand::Runs { id, limit } => {
+            let runs = sup.queue().list_routine_runs(&id, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+            } else {
+                println!("Run History for Routine '{}' ({} runs):", id, runs.len());
+                for run in runs {
+                    println!(
+                        "  [{}] status: {:<20} scheduled: {} fired: {} task: {}",
+                        run.id,
+                        run.status,
+                        run.scheduled_for,
+                        run.fired_at,
+                        run.task_id.as_deref().unwrap_or("none")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_diagnostics(
+    action: Option<DiagnosticsSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = GmConfig::load(config_path.as_deref())?;
+    match action.unwrap_or(DiagnosticsSubcommand::Check) {
+        DiagnosticsSubcommand::Check => {
+            let report = run_health_diagnostics(&config);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Grok Muse System Health Diagnostics:");
+                println!("Overall Status: {:?}", report.overall);
+                println!("Timestamp:      {}", report.timestamp);
+                println!("--------------------------------------------------");
+                for check in &report.checks {
+                    let status_badge = match check.status {
+                        DiagnosticStatus::Ok => "✔ OK",
+                        DiagnosticStatus::Warning => "⚠ WARN",
+                        DiagnosticStatus::Error => "✘ ERROR",
+                    };
+                    println!(
+                        "{:<8} [{:<12}] {}",
+                        status_badge, check.category, check.name
+                    );
+                    println!("         {}", check.message);
+                    if let Some(ref rem) = check.remediation {
+                        println!("         Action: {rem}");
+                    }
+                }
+                println!("--------------------------------------------------");
+            }
+        }
+        DiagnosticsSubcommand::Export { output } => {
+            println!("Generating sanitized diagnostic support bundle...");
+            let bundle = export_support_bundle(&config, &output)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+            } else {
+                println!(
+                    "✔ Sanitized diagnostic bundle exported to {}",
+                    output.display()
+                );
+                println!("  Version:           {}", bundle.grok_muse_version);
+                println!("  Platform:          {} ({})", bundle.os, bundle.arch);
+                println!(
+                    "  Redaction status:  VERIFIED ({} secret values scrubbed)",
+                    bundle.scrubbed_secret_count
+                );
+                println!("  SHA-256 Checksum:  {}", bundle.sha256_fingerprint);
+                println!("  Review the file before sharing for technical support.");
+            }
         }
     }
     Ok(())

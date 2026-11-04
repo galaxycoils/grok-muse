@@ -5,21 +5,25 @@ pub mod attachments;
 pub mod bridges;
 pub mod channels;
 pub mod compaction;
+pub mod db_recovery;
 pub mod queue;
 pub mod roster;
 pub mod routines;
 pub mod runtime;
 pub mod supervisor;
+pub mod templates;
 pub mod web;
 
 pub use a2a::*;
 pub use bridges::*;
 pub use channels::*;
 pub use compaction::*;
+pub use db_recovery::*;
 pub use queue::*;
 pub use roster::*;
 pub use routines::*;
 pub use supervisor::*;
+pub use templates::*;
 pub use web::*;
 
 #[cfg(test)]

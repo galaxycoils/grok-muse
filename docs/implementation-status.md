@@ -30,6 +30,13 @@ This branch implements the task/runtime foundation, native daily-use features, s
 - Persistent SQLite usage admission across independent connections and process restarts. Unresolved reservations retain their estimated exposure. This is conservative estimated accounting, not provider invoice reconciliation; pricing remains approximate.
 - Signed updater manifests bind version, OS/architecture, asset name, size and SHA-256 to a trusted Ed25519 key and expiry. Unsigned downloads are refused. Downloads are bounded, use unique temporary files and clean up on failure/cancellation. `tools/make-release-manifest.py` produces the manifest/signature from an offline publisher key. This stages an authenticated asset; installer signing and automatic rollback remain separate release work.
 - Workspace VM exports from `/workspace/exports` are validated, bounded and saved to a new outbox directory for review, without automatically changing host project files. ARM UEFI firmware can be supplied with a signed manifest digest. Workspace imports use directory handles and bounded reads.
+- Persistent channel instructions (`ChannelInfo.instructions`, `create_channel_with_instructions`, `update_channel_instructions`, `gm channels set-instructions`) with supervisor prompt injection for channel bot tasks.
+- Team templates and safe import/export (`gm team export`, `gm team preview`, `gm team import`) with strict credential exclusion and trigger safety (all imported routines forced to `enabled = false`).
+- Durable routines quiet hours (`QuietHours`, `is_quiet`), overlap suppression recording, and persistent SQLite run history (`routine_runs_v1`, `gm routines runs <id>`).
+- CLI provider drivers in `gm-llm` (`CliDriver`, `CliLlmBackend`) for Claude, Codex, and Grok with explicit PATH/version availability checks, actionable auth instructions, and honest cost labeling (`0.0` USD).
+- SQLite automated corruption recovery (`open_sqlite_with_recovery`) preserving corrupt databases and WAL/SHM files to timestamped `.bak` files without silent data deletion.
+- Local health diagnostics (`gm diagnostics check`) and sanitized support bundle export (`gm diagnostics export`) with `SecretScrubber` credential redaction and SHA-256 fingerprint verification.
+- Release engineering documentation: `THIRD_PARTY_NOTICES.md`, `CONTRIBUTING.md`, `docs/SUPPORT_MATRIX.md`, `docs/TROUBLESHOOTING.md`, and `docs/PRIVACY.md`.
 
 ## Running locally
 

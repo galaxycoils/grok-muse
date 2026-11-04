@@ -86,11 +86,7 @@ pub struct DurableTaskQueue {
 
 impl DurableTaskQueue {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = db_path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(db_path.as_ref())
-            .map_err(|e| GmError::Platform(format!("Failed to open queue SQLite DB: {e}")))?;
+        let conn = crate::db_recovery::open_sqlite_with_recovery(db_path.as_ref())?;
         Self::init_conn(conn)
     }
 

@@ -87,7 +87,7 @@ pub struct LlmStreamMetrics {
 /// - muse-spark: $0.80 / 1M prompt, $3.20 / 1M completion + $0.001 / image
 /// - muse-wonder: $2.50 / 1M prompt, $10.00 / 1M completion
 /// - grok-4: $3.00 / 1M prompt, $15.00 / 1M completion + $0.002 / image
-/// - local models: $0.0
+/// - local & CLI models: $0.0 (unmetered / honestly labeled)
 pub fn estimate_cost_usd(
     model: &str,
     prompt_tokens: u32,
@@ -95,7 +95,8 @@ pub fn estimate_cost_usd(
     image_count: usize,
 ) -> f64 {
     let m = model.to_lowercase();
-    if m.starts_with("local") {
+    if m.starts_with("local") || m.starts_with("cli") || m.contains("claude") || m.contains("codex")
+    {
         0.0
     } else if m.contains("spark") {
         let prompt_cost = (prompt_tokens as f64 / 1_000_000.0) * 0.80;
@@ -116,8 +117,12 @@ pub fn estimate_cost_usd(
 }
 
 pub fn estimate_api_cost_usd(model: &str, prompt: u32, completion: u32, images: usize) -> f64 {
+    let m = model.to_lowercase();
+    if m.starts_with("cli") || m.contains("claude") || m.contains("codex") {
+        return 0.0;
+    }
     estimate_cost_usd(
-        if model.to_lowercase().starts_with("local") {
+        if m.starts_with("local") {
             "unknown-hosted-model"
         } else {
             model
@@ -425,6 +430,20 @@ impl LlmBackend for ReqwestLlmBackend {
                     .get_xai_key()
                     .ok()
             }),
+            crate::router::ProviderKind::Claude => {
+                let driver =
+                    crate::cli_driver::CliDriver::new(crate::cli_driver::CliProvider::Claude);
+                return crate::cli_driver::CliLlmBackend::new(driver)
+                    .complete(target, messages)
+                    .await;
+            }
+            crate::router::ProviderKind::Codex => {
+                let driver =
+                    crate::cli_driver::CliDriver::new(crate::cli_driver::CliProvider::Codex);
+                return crate::cli_driver::CliLlmBackend::new(driver)
+                    .complete(target, messages)
+                    .await;
+            }
         };
 
         let Some(key) = api_key else {
@@ -505,6 +524,11 @@ impl LlmBackend for ReqwestLlmBackend {
                     .get_xai_key()
                     .ok()
             }),
+            crate::router::ProviderKind::Claude | crate::router::ProviderKind::Codex => {
+                let resp = self.complete(target, messages).await?;
+                let _ = delta_tx.send(resp.content.clone()).await;
+                return Ok(resp);
+            }
         };
 
         let Some(key) = api_key else {

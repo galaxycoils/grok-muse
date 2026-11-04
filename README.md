@@ -241,7 +241,10 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 | `gm models` | `<list\|pull\|rm> [--json]` | Manage offline local Vision-Language Models (`qwen2-vl-2b`, `smolvlm2-2.2b`). |
 | `gm bots` | `<list\|show\|create\|rm> [--json]` | Manage OpenBot persistent agent roster and isolated per-bot workspaces. |
 | `gm queue` | `<list\|add\|pause\|resume\|cancel\|reassign\|backup\|restore>` | Manage crash-safe SQLite FIFO task queues across bots. |
-| `gm channels` | `<list\|post\|history\|assign\|archive\|restore>` | Post to multi-bot channels (`#general`, `#research`, `#ops`) and trigger `@bot` mentions. |
+| `gm channels` | `<list\|post\|history\|assign\|set-instructions\|archive\|restore>` | Manage multi-bot channels, persistent instructions, and `@bot` mentions. |
+| `gm team` | `<export\|preview\|import> [--json]` | Safe portable team templates (credential-scrubbed, disabled triggers on import). |
+| `gm routines` | `<list\|runs> [--json]` | Scheduled recurring routines, quiet hours, and execution run history. |
+| `gm diagnostics` | `<check\|export> [--json]` | Local health checks and redacted support bundle export with SHA-256 fingerprint. |
 | `gm serve` | `[--bind 127.0.0.1:7433]` | Launch the loopback OpenBot Companion Web UI, AG-UI SSE stream, and `/admin/audit` dashboard. |
 
 ---
