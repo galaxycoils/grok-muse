@@ -15,7 +15,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, broadcast, oneshot};
-use tracing::{error, info, warn};
+#[cfg(unix)]
+use tracing::error;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use gm_agent::{AgentLoop, AgentLoopConfig};
 use gm_core::config::GmConfig;
 use gm_core::error::{GmError, Result};
+#[cfg(unix)]
 use gm_core::ipc::{
     DaemonRequest, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message,
 };
@@ -11,8 +12,10 @@ use gm_llm::{
     META_KEY_ACCOUNT, MockLlmBackend, ReqwestLlmBackend, TaskType, XAI_KEY_ACCOUNT,
 };
 use gm_memory::PersonalMemoryStore;
+use gm_platform::IpcPlatformClient;
+#[cfg(unix)]
+use gm_platform::Platform;
 use gm_platform::permissions::{PrivacyPane, check_all_permissions};
-use gm_platform::{IpcPlatformClient, Platform};
 use gm_safety::{AuditLogger, BlocklistManager, KillSwitch};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -922,15 +925,15 @@ pub async fn run_kill() -> Result<()> {
     run_kill_with_config(&config).await
 }
 
-pub async fn run_kill_with_config(config: &GmConfig) -> Result<()> {
+pub async fn run_kill_with_config(_config: &GmConfig) -> Result<()> {
     println!("🚨 Grok-Muse Emergency Kill Switch Triggered");
 
     let daemon_kill = async {
         #[cfg(unix)]
-        if config.daemon_socket_path.exists()
+        if _config.daemon_socket_path.exists()
             && let Ok(Ok(mut stream)) = tokio::time::timeout(
                 tokio::time::Duration::from_millis(40),
-                tokio::net::UnixStream::connect(&config.daemon_socket_path),
+                tokio::net::UnixStream::connect(&_config.daemon_socket_path),
             )
             .await
         {
@@ -962,12 +965,12 @@ pub async fn run_kill_with_config(config: &GmConfig) -> Result<()> {
 
     let helper_kill = async {
         #[cfg(unix)]
-        if config.socket_path.exists() {
+        if _config.socket_path.exists() {
             println!(
                 "Connecting to CU Helper socket ({:?}) to drop active actions...",
-                config.socket_path
+                _config.socket_path
             );
-            let platform = IpcPlatformClient::new(&config.socket_path);
+            let platform = IpcPlatformClient::new(&_config.socket_path);
             match tokio::time::timeout(tokio::time::Duration::from_millis(40), platform.cancel())
                 .await
             {
