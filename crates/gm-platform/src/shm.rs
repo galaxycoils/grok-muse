@@ -12,6 +12,7 @@ static RING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default capacity per shared-memory ring slot (8 MiB virtual pages; only touched pages fault).
 pub const DEFAULT_SHM_SLOT_CAPACITY: usize = 8 * 1024 * 1024;
+#[cfg(unix)]
 const RING_SLOTS: usize = 4;
 
 #[cfg(unix)]

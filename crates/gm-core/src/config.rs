@@ -15,7 +15,18 @@ pub fn default_daemon_socket_path() -> PathBuf {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        PathBuf::from("/tmp/gm-daemon.sock")
+        let base = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let data = std::env::var("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                            .join(".local/share")
+                    });
+                data.join("grok-muse")
+            });
+        base.join("grok-muse-daemon.sock")
     }
 }
 
@@ -25,7 +36,14 @@ pub fn default_config_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join("Library/Application Support/GrokMuse/config.json")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = std::env::var("APPDATA")
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .unwrap_or_else(|_| ".".into());
+        PathBuf::from(app_data).join("GrokMuse/config.json")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join(".config/grok-muse/config.json")
@@ -43,30 +61,30 @@ pub struct GmConfig {
     pub safety: SafetyConfig,
     pub budget: BudgetConfig,
     pub openbot: OpenBotConfig,
+    pub workspace_vm: WorkspaceVmConfig,
 }
 
 impl GmConfig {
-    pub fn load_or_default(custom_path: Option<&Path>) -> Self {
-        let mut config = if let Some(path) = custom_path {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    serde_json::from_str(&content).unwrap_or_default()
-                } else {
-                    Self::default()
-                }
-            } else {
+    /// Missing default configuration uses defaults. Explicit paths and malformed files fail closed.
+    pub fn load(custom_path: Option<&Path>) -> crate::error::Result<Self> {
+        let path = custom_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_config_path);
+        let mut config: Self = match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|e| {
+                crate::error::GmError::Config(format!(
+                    "Invalid configuration {}: {e}",
+                    path.display()
+                ))
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && custom_path.is_none() => {
                 Self::default()
             }
-        } else {
-            let def_path = default_config_path();
-            if def_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&def_path) {
-                    serde_json::from_str(&content).unwrap_or_default()
-                } else {
-                    Self::default()
-                }
-            } else {
-                Self::default()
+            Err(e) => {
+                return Err(crate::error::GmError::Config(format!(
+                    "Cannot read configuration {}: {e}",
+                    path.display()
+                )));
             }
         };
 
@@ -81,7 +99,42 @@ impl GmConfig {
             config.daemon_socket_path = PathBuf::from(daemon_socket);
         }
 
-        config
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.budget.daily_spend_cap_usd.is_finite()
+            || self.budget.daily_spend_cap_usd < 0.0
+            || !self.budget.per_job_spend_cap_usd.is_finite()
+            || self.budget.per_job_spend_cap_usd < 0.0
+        {
+            return Err(crate::error::GmError::Config(
+                "Budget limits must be finite and nonnegative".into(),
+            ));
+        }
+        if !self.safety.user_active_pause_seconds.is_finite()
+            || self.safety.user_active_pause_seconds < 0.0
+        {
+            return Err(crate::error::GmError::Config(
+                "Idle threshold must be finite and nonnegative".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn save(&self, path: &Path) -> crate::error::Result<()> {
+        self.validate()?;
+        crate::storage::atomic_write_private(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Atomically write configuration using write-to-temp and rename semantics.
+    pub fn save_atomic(&self, path: impl AsRef<Path>) -> crate::error::Result<()> {
+        self.save(path.as_ref())
+    }
+
+    pub fn load_or_default(custom_path: Option<&Path>) -> Self {
+        Self::load(custom_path)
+            .expect("Configuration could not be loaded; the original file has been preserved")
     }
 }
 
@@ -105,8 +158,10 @@ impl Default for GmConfig {
                 format!("{home}/.local/share")
             });
             let storage = PathBuf::from(data_home).join("grok-muse");
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-            let socket = PathBuf::from(runtime_dir).join("grok-muse-cu-helper.sock");
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| storage.clone());
+            let socket = runtime_dir.join("grok-muse-cu-helper.sock");
             (socket, storage)
         };
 
@@ -138,6 +193,7 @@ impl Default for GmConfig {
             safety: SafetyConfig::default(),
             budget: BudgetConfig::default(),
             openbot,
+            workspace_vm: WorkspaceVmConfig::default(),
         }
     }
 }
@@ -162,8 +218,8 @@ impl Default for ProvidersConfig {
             meta_reasoning_model: "muse-wonder".into(),
             xai_api_base: "https://api.x.ai/v1".into(),
             xai_model: "grok-4".into(),
-            allow_screenshot_egress_meta: true,
-            allow_screenshot_egress_xai: true,
+            allow_screenshot_egress_meta: false,
+            allow_screenshot_egress_xai: false,
         }
     }
 }
@@ -171,6 +227,10 @@ impl Default for ProvidersConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SafetyConfig {
+    /// Explicit opt-in for agents to observe or control the host desktop.
+    pub allow_host_desktop: bool,
+    /// Experimental credential injection requires separate opt-in and per-action approval.
+    pub allow_secret_injection: bool,
     pub blocklisted_apps: Vec<String>,
     pub redact_secure_fields: bool,
     pub kill_switch_shortcut: String,
@@ -180,6 +240,8 @@ pub struct SafetyConfig {
 impl Default for SafetyConfig {
     fn default() -> Self {
         Self {
+            allow_host_desktop: false,
+            allow_secret_injection: false,
             blocklisted_apps: vec![
                 "1Password".into(),
                 "Keychain Access".into(),
@@ -390,5 +452,36 @@ mod tests {
         assert!(!cfg.openbot.bridges.telegram_enabled);
         assert!(!cfg.openbot.bridges.slack_enabled);
         assert!(!cfg.openbot.bridges.discord_enabled);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceVmConfig {
+    pub enabled: bool,
+    pub qemu_path: PathBuf,
+    pub image_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub signature_path: PathBuf,
+    pub trusted_public_key_hex: String,
+    /// Read-only UEFI firmware, authenticated by the image manifest. Required on ARM.
+    pub firmware_path: Option<PathBuf>,
+}
+impl Default for WorkspaceVmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qemu_path: if cfg!(target_arch = "aarch64") {
+                "qemu-system-aarch64"
+            } else {
+                "qemu-system-x86_64"
+            }
+            .into(),
+            image_path: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            signature_path: PathBuf::new(),
+            trusted_public_key_hex: String::new(),
+            firmware_path: None,
+        }
     }
 }

@@ -49,8 +49,9 @@ pub struct Trajectory {
 }
 
 pub fn default_trajectories_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Library/Application Support/GrokMuse/trajectories")
+    gm_core::config::GmConfig::default()
+        .storage_dir
+        .join("trajectories")
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +89,7 @@ impl TrajectoryRecorder {
         let timestamp = started_at.format("%Y%m%d_%H%M%S_%3f");
         let jsonl_path = directory.join(format!("{safe_filename}_{timestamp}.jsonl"));
 
-        let _ = std::fs::create_dir_all(&directory);
+        let _ = gm_core::storage::ensure_private_dir(&directory);
 
         let recorder = Self {
             trajectory: Arc::new(Mutex::new(Trajectory {

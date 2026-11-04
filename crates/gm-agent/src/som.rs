@@ -1,5 +1,5 @@
 use gm_core::error::{GmError, Result};
-use gm_core::types::{AxElement, AxSnapshot};
+use gm_core::types::{AxElement, AxSnapshot, Rect};
 use image::{ExtendedColorType, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 
@@ -153,15 +153,23 @@ pub fn annotate_frame_with_som(
     fallback_dims: (u32, u32),
     snapshot: &AxSnapshot,
 ) -> Result<SomAnnotation> {
+    annotate_frame_with_geometry(frame_bytes, fallback_dims, snapshot, None)
+}
+
+pub fn annotate_frame_with_geometry(
+    frame_bytes: Option<&[u8]>,
+    fallback_dims: (u32, u32),
+    snapshot: &AxSnapshot,
+    desktop_bounds: Option<Rect>,
+) -> Result<SomAnnotation> {
     let (fw, fh) = fallback_dims;
     let def_w = if fw > 0 { fw } else { 1280 };
     let def_h = if fh > 0 { fh } else { 800 };
 
     let mut img = if let Some(bytes) = frame_bytes {
-        match image::load_from_memory(bytes) {
-            Ok(dyn_img) => dyn_img.to_rgb8(),
-            Err(_) => RgbImage::from_pixel(def_w, def_h, Rgb([30, 30, 30])),
-        }
+        image::load_from_memory(bytes)
+            .map_err(|e| GmError::Platform(format!("Captured image could not be decoded: {e}")))?
+            .to_rgb8()
     } else {
         RgbImage::from_pixel(def_w, def_h, Rgb([30, 30, 30]))
     };
@@ -184,10 +192,23 @@ pub fn annotate_frame_with_som(
         let color_rgb = COLOR_PALETTE[idx % COLOR_PALETTE.len()];
         let border_color = Rgb(color_rgb);
 
-        let rx = el.frame.x as i32;
-        let ry = el.frame.y as i32;
-        let rw = (el.frame.width as i32).max(1);
-        let rh = (el.frame.height as i32).max(1);
+        let bounds =
+            desktop_bounds.unwrap_or(Rect::new(0.0, 0.0, f64::from(img_w), f64::from(img_h)));
+        if !bounds.width.is_finite()
+            || !bounds.height.is_finite()
+            || bounds.width <= 0.0
+            || bounds.height <= 0.0
+        {
+            return Err(GmError::Platform("Invalid screenshot geometry".into()));
+        }
+        let (cx, cy) = el.frame.center();
+        if !cx.is_finite() || !cy.is_finite() || !bounds.contains(cx, cy) {
+            continue;
+        }
+        let rx = ((el.frame.x - bounds.x) * f64::from(img_w) / bounds.width) as i32;
+        let ry = ((el.frame.y - bounds.y) * f64::from(img_h) / bounds.height) as i32;
+        let rw = (el.frame.width * f64::from(img_w) / bounds.width).max(1.0) as i32;
+        let rh = (el.frame.height * f64::from(img_h) / bounds.height).max(1.0) as i32;
 
         let x1 = rx.clamp(0, img_w - 1);
         let y1 = ry.clamp(0, img_h - 1);
@@ -266,8 +287,9 @@ pub fn annotate_frame_with_som(
             Rgb([255, 255, 255]),
         );
 
-        let center_x = (rx + rw / 2).clamp(0, img_w);
-        let center_y = (ry + rh / 2).clamp(0, img_h);
+        // Marks resolve to desktop coordinates, independent of the encoded image.
+        let center_x = cx as i32;
+        let center_y = cy as i32;
 
         let mark = SomMark {
             badge_id,
@@ -427,5 +449,46 @@ mod tests {
         // Non-existent badge
         assert!(resolve_som_badge("#99", &marks).is_none());
         assert!(resolve_som_badge("invalid_token", &marks).is_none());
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    #[test]
+    fn scaled_marks_draw_in_image_space_and_resolve_to_desktop_space() {
+        let snapshot = AxSnapshot {
+            window_id: 1,
+            app_name: "Fixture".into(),
+            window_title: "Fixture".into(),
+            bounds: Rect::new(-1000.0, 0.0, 500.0, 500.0),
+            timestamp_ms: 0,
+            elements: vec![AxElement {
+                token: "button".into(),
+                role: "AXButton".into(),
+                label: Some("Press".into()),
+                value: None,
+                frame: Rect::new(-900.0, 100.0, 100.0, 60.0),
+                is_enabled: true,
+                is_secure: false,
+            }],
+        };
+        let annotation = annotate_frame_with_geometry(
+            None,
+            (500, 250),
+            &snapshot,
+            Some(Rect::new(-1000.0, 0.0, 2000.0, 1000.0)),
+        )
+        .unwrap();
+        assert_eq!(annotation.marks[0].center, (-850, 130));
+        let image = image::load_from_memory(&annotation.jpeg_bytes)
+            .unwrap()
+            .to_rgb8();
+        // The element's left border maps from desktop x=-900 to image x=25.
+        let border = image.get_pixel(25, 30);
+        assert!(border[0] > 100 && border[0] > border[2] * 2);
+        assert!(
+            annotate_frame_with_geometry(Some(b"invalid"), (500, 250), &snapshot, None).is_err()
+        );
     }
 }

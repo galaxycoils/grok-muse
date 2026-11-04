@@ -109,17 +109,20 @@ impl Platform for MockPlatform {
 
     async fn capture(
         &self,
-        _max_long_edge: Option<u32>,
-        _quality: Option<u8>,
+        max_long_edge: Option<u32>,
+        quality: Option<u8>,
     ) -> Result<FrameCapture> {
         if let Some(frame) = self.latest_frame.lock().clone() {
             Ok(frame)
         } else {
+            let edge = max_long_edge.unwrap_or(1920).clamp(64, 1920);
+            let height = (f64::from(edge) * 1080.0 / 1920.0).round() as u32;
             Ok(FrameCapture {
-                width: 1920,
-                height: 1080,
-                scale_factor: 2.0,
-                data: FrameData::InlineBytes(vec![0xFF, 0xD8, 0xFF, 0xE0]),
+                width: edge,
+                height,
+                scale_factor: 1920.0 / f64::from(edge),
+                desktop_bounds: Some(gm_core::types::Rect::new(0.0, 0.0, 1920.0, 1080.0)),
+                data: FrameData::InlineBytes(mock_jpeg(edge, height, quality.unwrap_or(70))?),
                 timestamp_ms: 1000,
             })
         }
@@ -248,6 +251,26 @@ impl Platform for MockPlatform {
         });
         Ok(true)
     }
+}
+
+fn mock_jpeg(width: u32, height: u32, quality: u8) -> Result<Vec<u8>> {
+    type Images = std::collections::HashMap<(u32, u32, u8), Vec<u8>>;
+    static JPEG: std::sync::OnceLock<Mutex<Images>> = std::sync::OnceLock::new();
+    let mut images = JPEG.get_or_init(|| Mutex::new(Images::new())).lock();
+    let key = (width, height, quality.clamp(1, 100));
+    if let Some(bytes) = images.get(&key) {
+        return Ok(bytes.clone());
+    }
+    let image = image::RgbImage::from_pixel(width, height, image::Rgb([30, 30, 30]));
+    let mut bytes = vec![];
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, key.2)
+        .encode_image(&image)
+        .map_err(|e| gm_core::error::GmError::Platform(e.to_string()))?;
+    if images.len() >= 8 {
+        images.clear();
+    }
+    images.insert(key, bytes.clone());
+    Ok(bytes)
 }
 
 #[cfg(test)]

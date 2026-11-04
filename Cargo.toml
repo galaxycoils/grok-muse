@@ -68,3 +68,12 @@ libc = "0.2"
 lto = "thin"
 strip = "symbols"
 codegen-units = 16
+
+# Keep local/CI artifacts bounded; release builds retain their optimized profile above.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

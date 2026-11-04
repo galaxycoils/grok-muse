@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cap-std = "3"
 gm-core = { workspace = true }
 gm-platform = { workspace = true }
 gm-llm = { workspace = true }
@@ -20,6 +21,12 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Verify trusted workspace images before executing any guest code.
+ed25519-dalek = "2"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

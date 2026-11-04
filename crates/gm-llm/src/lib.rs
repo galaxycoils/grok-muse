@@ -1,5 +1,6 @@
 pub mod budget;
 pub mod circuit_breaker;
+pub mod cli_driver;
 pub mod client;
 pub mod router;
 pub mod secrets;
@@ -9,6 +10,7 @@ pub mod local_vlm;
 
 pub use budget::*;
 pub use circuit_breaker::*;
+pub use cli_driver::*;
 pub use client::*;
 pub use router::*;
 pub use secrets::*;

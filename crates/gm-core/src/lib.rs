@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod hash;
 pub mod ipc;
+pub mod storage;
 pub mod types;
 
 pub use config::*;

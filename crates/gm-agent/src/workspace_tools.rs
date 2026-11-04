@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalRequest, InteractionHandler};
+use cap_std::fs::Dir;
 use gm_core::error::{GmError, Result};
 use gm_core::types::ComputerAction;
 use gm_safety::{
@@ -9,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkspaceToolCall {
@@ -103,9 +103,13 @@ pub struct BotWorkspaceSandbox {
     workspace_dir: PathBuf,
     inbox_dir: PathBuf,
     outbox_dir: PathBuf,
+    workspace_cap: Arc<Dir>,
+    inbox_cap: Arc<Dir>,
+    outbox_cap: Arc<Dir>,
     gateway: SecurityGateway,
     scrubber: SecretScrubber,
     allow_network: bool,
+    vm_config: gm_core::config::WorkspaceVmConfig,
 }
 
 impl BotWorkspaceSandbox {
@@ -131,7 +135,22 @@ impl BotWorkspaceSandbox {
         let inbox_dir = canonical_root.join("inbox");
         let outbox_dir = canonical_root.join("outbox");
 
+        let workspace_cap = Arc::new(Dir::open_ambient_dir(
+            &workspace_dir,
+            cap_std::ambient_authority(),
+        )?);
+        let inbox_cap = Arc::new(Dir::open_ambient_dir(
+            &inbox_dir,
+            cap_std::ambient_authority(),
+        )?);
+        let outbox_cap = Arc::new(Dir::open_ambient_dir(
+            &outbox_dir,
+            cap_std::ambient_authority(),
+        )?);
         Ok(Self {
+            workspace_cap,
+            inbox_cap,
+            outbox_cap,
             bot_id,
             bot_root: canonical_root,
             workspace_dir,
@@ -140,12 +159,147 @@ impl BotWorkspaceSandbox {
             gateway: SecurityGateway::new(BlocklistManager::new(&[])),
             scrubber: SecretScrubber::new(),
             allow_network: true,
+            vm_config: gm_core::config::WorkspaceVmConfig::default(),
         })
     }
 
     pub fn with_scrubber(mut self, scrubber: SecretScrubber) -> Self {
         self.scrubber = scrubber;
         self
+    }
+
+    pub fn with_vm_config(mut self, config: gm_core::config::WorkspaceVmConfig) -> Self {
+        self.vm_config = config;
+        self
+    }
+
+    pub fn read_artifact(&self, name: &std::ffi::OsStr) -> Result<Vec<u8>> {
+        let path = Path::new(name);
+        if path.components().count() != 1 || path.file_name() != Some(name) {
+            return Err(GmError::SafetyViolation(
+                "Artifact must be a single filename".into(),
+            ));
+        }
+        let handle = if self.outbox_cap.exists(path) {
+            &self.outbox_cap
+        } else {
+            &self.workspace_cap
+        };
+        if !handle.metadata(path)?.is_file() || handle.metadata(path)?.len() > 8 * 1024 * 1024 {
+            return Err(GmError::Config(
+                "Artifact is not a regular file within the size limit".into(),
+            ));
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        handle
+            .open(path)?
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(GmError::Config("Artifact exceeds transfer limit".into()));
+        }
+        Ok(bytes)
+    }
+    pub fn receive_artifact(&self, name: &std::ffi::OsStr, data: &[u8]) -> Result<PathBuf> {
+        use std::io::Write;
+        let path = Path::new(name);
+        if path.components().count() != 1
+            || path.file_name() != Some(name)
+            || data.len() > 8 * 1024 * 1024
+        {
+            return Err(GmError::SafetyViolation("Invalid artifact transfer".into()));
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = self.inbox_cap.open_with(path, &options)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(self.inbox_dir.join(name))
+    }
+
+    /// Lists inert inbox/outbox entries; never follows links or opens executables.
+    pub fn shared_files(&self) -> Result<Vec<(String, u64)>> {
+        fn walk(
+            dir: &Dir,
+            prefix: &str,
+            out: &mut Vec<(String, u64)>,
+            visited: &mut usize,
+            depth: usize,
+        ) -> Result<()> {
+            if depth > 16 {
+                return Err(GmError::Config(
+                    "Artifact directory nesting exceeds limit".into(),
+                ));
+            }
+            for entry in dir.entries()? {
+                *visited += 1;
+                if *visited > 1000 {
+                    return Err(GmError::Config(
+                        "Artifact directory entry limit exceeded".into(),
+                    ));
+                }
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let path = format!("{prefix}/{name}");
+                if kind.is_dir() {
+                    walk(&entry.open_dir()?, &path, out, visited, depth + 1)?;
+                } else if kind.is_file() {
+                    out.push((path, entry.metadata()?.len()));
+                }
+            }
+            Ok(())
+        }
+        let mut out = vec![];
+        let mut visited = 0;
+        walk(&self.inbox_cap, "inbox", &mut out, &mut visited, 0)?;
+        walk(&self.outbox_cap, "outbox", &mut out, &mut visited, 0)?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+    pub fn preview_shared_file(&self, path: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let (area, relative) = path
+            .split_once('/')
+            .ok_or_else(|| GmError::Config("Expected inbox/ or outbox/ path".into()))?;
+        if relative.is_empty()
+            || relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == ".." || p.contains(':'))
+        {
+            return Err(GmError::SafetyViolation("Invalid artifact path".into()));
+        }
+        let directory = match area {
+            "inbox" => &self.inbox_cap,
+            "outbox" => &self.outbox_cap,
+            _ => {
+                return Err(GmError::SafetyViolation(
+                    "Only inbox and outbox are exposed to previews".into(),
+                ));
+            }
+        };
+        let file = directory.open(relative)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > 1024 * 1024 {
+            return Err(GmError::Config(
+                "Preview requires a regular file under 1 MiB".into(),
+            ));
+        }
+        let mut bytes = vec![];
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(GmError::Config("Preview exceeds 1 MiB".into()));
+        }
+        Ok(bytes)
+    }
+    pub fn network_allowed(&self) -> bool {
+        self.allow_network
     }
 
     pub fn with_network(mut self, allow_network: bool) -> Self {
@@ -174,45 +328,6 @@ impl BotWorkspaceSandbox {
     }
 
     /// Generate the macOS Seatbelt SBPL profile confining all file writes strictly to this bot's
-    /// `workspace/` and `outbox/` directories (plus `/private/tmp`).
-    pub fn generate_seatbelt_profile(&self) -> String {
-        let ws = self
-            .workspace_dir
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let outbox = self
-            .outbox_dir
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let net_rule = if self.allow_network {
-            "(allow network*)"
-        } else {
-            "(deny network*)"
-        };
-
-        format!(
-            r#"(version 1)
-(allow default)
-{net_rule}
-(deny file-write*)
-(allow file-write*
-    (subpath "{ws}")
-    (subpath "{outbox}")
-    (subpath "/private/tmp")
-    (subpath "/tmp")
-    (subpath "/private/var/folders")
-    (subpath "/var/folders")
-    (literal "/dev/null")
-    (literal "/dev/zero")
-    (literal "/dev/tty")
-    (literal "/dev/urandom")
-    (literal "/dev/random"))
-"#
-        )
-    }
-
     /// Resolve a relative path inside the bot root (`workspace/` by default unless prefixed with `inbox/` or `outbox/`).
     fn resolve_confined_path(
         &self,
@@ -284,6 +399,40 @@ impl BotWorkspaceSandbox {
         Ok(mapped)
     }
 
+    fn file_handle(&self, target: &Path) -> Result<(&Dir, PathBuf)> {
+        for (root, handle) in [
+            (&self.workspace_dir, &self.workspace_cap),
+            (&self.inbox_dir, &self.inbox_cap),
+            (&self.outbox_dir, &self.outbox_cap),
+        ] {
+            if let Ok(relative) = target.strip_prefix(root) {
+                if relative.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Err(GmError::SafetyViolation(
+                        "Parent traversal is not allowed in workspace paths".into(),
+                    ));
+                }
+                return Ok((
+                    handle.as_ref(),
+                    if relative.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        relative.to_path_buf()
+                    },
+                ));
+            }
+        }
+        Err(GmError::SafetyViolation(
+            "Path is outside workspace, inbox and outbox grants".into(),
+        ))
+    }
+
     pub async fn execute_tool(
         &self,
         task_id: &str,
@@ -293,10 +442,29 @@ impl BotWorkspaceSandbox {
         kill_switch: &KillSwitch,
         audit: Option<&Arc<AuditLogger>>,
     ) -> Result<WorkspaceToolOutcome> {
+        if kill_switch.is_triggered() {
+            return Err(GmError::SafetyViolation(
+                "Execution stopped by Kill Switch".into(),
+            ));
+        }
         match call {
             WorkspaceToolCall::ReadFile { path } => {
                 let target = self.resolve_confined_path(path, false, audit)?;
-                let content = std::fs::read_to_string(&target).map_err(GmError::Io)?;
+                let (handle, relative) = self.file_handle(&target)?;
+                if handle.metadata(&relative)?.len() > 1024 * 1024 {
+                    return Err(GmError::Config("File exceeds the 1 MiB tool limit".into()));
+                }
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                handle
+                    .open(&relative)?
+                    .take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(GmError::Config("File exceeds the 1 MiB tool limit".into()));
+                }
+                let content = String::from_utf8(bytes)
+                    .map_err(|_| GmError::Config("File is not valid UTF-8 text".into()))?;
                 let scrubbed = self.scrubber.scrub_str(&content);
                 if let Some(logger) = audit {
                     logger.log_governance(
@@ -318,12 +486,16 @@ impl BotWorkspaceSandbox {
 
             WorkspaceToolCall::WriteFile { path, content } => {
                 let target = self.resolve_confined_path(path, true, audit)?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
+                if content.len() > 1024 * 1024 {
+                    return Err(GmError::Config("File exceeds the 1 MiB tool limit".into()));
                 }
-                let previous = std::fs::read_to_string(&target).ok();
+                let (handle, relative) = self.file_handle(&target)?;
+                if let Some(parent) = relative.parent() {
+                    handle.create_dir_all(parent)?;
+                }
+                let previous = handle.read_to_string(&relative).ok();
                 let diff = compute_unified_diff_preview(path, previous.as_deref(), content, 200);
-                std::fs::write(&target, content)?;
+                handle.write(&relative, content)?;
                 let scrubbed_diff = self.scrubber.scrub_str(&diff);
                 if let Some(logger) = audit {
                     logger.log_governance(
@@ -353,11 +525,12 @@ impl BotWorkspaceSandbox {
                 let rel = path.as_deref().unwrap_or(".");
                 let target = self.resolve_confined_path(rel, false, audit)?;
                 let mut names = Vec::new();
-                if target.is_dir() {
-                    for entry in std::fs::read_dir(&target)? {
+                let (handle, relative) = self.file_handle(&target)?;
+                if handle.metadata(&relative)?.is_dir() {
+                    for entry in handle.read_dir(&relative)?.take(1000) {
                         let entry = entry?;
                         let file_name = entry.file_name().to_string_lossy().to_string();
-                        let suffix = if entry.path().is_dir() { "/" } else { "" };
+                        let suffix = if entry.file_type()?.is_dir() { "/" } else { "" };
                         names.push(format!("{file_name}{suffix}"));
                     }
                     names.sort();
@@ -444,110 +617,45 @@ impl BotWorkspaceSandbox {
 
                 let timeout =
                     Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(100, 120_000));
-                let profile = self.generate_seatbelt_profile();
-
-                let mut cmd =
-                    if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
-                        let mut c = Command::new("/usr/bin/sandbox-exec");
-                        c.args(["-p", &profile, "/bin/zsh", "-c", command]);
-                        c
-                    } else {
-                        let mut c = Command::new("/bin/sh");
-                        c.args(["-c", command]);
-                        c
-                    };
-
-                cmd.current_dir(&self.workspace_dir)
-                    .kill_on_drop(true)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-
-                let child = cmd.spawn().map_err(GmError::Io)?;
-                let output_fut = child.wait_with_output();
-
-                let output = tokio::select! {
-                    res = tokio::time::timeout(timeout, output_fut) => {
-                        match res {
-                            Ok(Ok(out)) => out,
-                            Ok(Err(e)) => return Err(GmError::Io(e)),
-                            Err(_) => {
-                                if let Some(logger) = audit {
-                                    logger.log_governance(
-                                        "workspace_shell_timeout",
-                                        Some(&self.bot_id),
-                                        AuditCategory::Failed,
-                                        decision.rule_id,
-                                        "Shell command exceeded timeout",
-                                        format!("Shell timed out after {}ms", timeout.as_millis()),
-                                        serde_json::json!({ "task_id": task_id, "step": step }),
-                                    );
-                                }
-                                return Err(GmError::Platform(format!(
-                                    "Workspace shell command timed out after {}ms",
-                                    timeout.as_millis()
-                                )));
-                            }
+                let vm = self.vm_config.clone();
+                let outcome = crate::vm::execute(
+                    vm,
+                    &self.workspace_dir,
+                    command,
+                    timeout.as_millis() as u64,
+                )
+                .await?;
+                let mut output = outcome.output;
+                if !outcome.artifacts.is_empty() {
+                    use std::io::Write;
+                    let slot = format!("vm-{}", uuid::Uuid::new_v4());
+                    self.outbox_cap.create_dir(&slot)?;
+                    let directory = self.outbox_cap.open_dir(&slot)?;
+                    for artifact in outcome.artifacts {
+                        let path = Path::new(&artifact.path);
+                        if let Some(parent) = path.parent() {
+                            directory.create_dir_all(parent)?;
                         }
-                    }
-                    _ = async {
-                        while !kill_switch.is_triggered() {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        let mut options = cap_std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use cap_std::fs::OpenOptionsExt;
+                            options.mode(0o600);
                         }
-                    } => {
-                        return Err(GmError::SafetyViolation("Workspace shell halted by Kill Switch".into()));
+                        let mut file = directory.open_with(path, &options)?;
+                        file.write_all(&artifact.bytes)?;
+                        file.sync_all()?;
+                        output.push_str(&format!(
+                            "\nReview artifact: outbox/{slot}/{} ({} bytes)",
+                            artifact.path,
+                            artifact.bytes.len()
+                        ));
                     }
-                };
-
-                let exit_code = output.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let combined = if stderr.trim().is_empty() {
-                    stdout.to_string()
-                } else if stdout.trim().is_empty() {
-                    stderr.to_string()
-                } else {
-                    format!("{stdout}\n[stderr]\n{stderr}")
-                };
-
-                let scrubbed_out = self.scrubber.scrub_str(combined.trim());
-                let scrubbed_cmd = self.scrubber.scrub_str(command);
-
-                if let Some(logger) = audit {
-                    let cat = if exit_code == 0 {
-                        AuditCategory::Permitted
-                    } else if combined.contains("Operation not permitted") {
-                        AuditCategory::Refused
-                    } else {
-                        AuditCategory::Failed
-                    };
-                    let rule = if cat == AuditCategory::Refused {
-                        "RULE-PATH-002"
-                    } else {
-                        decision.rule_id
-                    };
-                    let citation = if cat == AuditCategory::Refused {
-                        "macOS Seatbelt sandbox blocked write outside bot workspace"
-                    } else {
-                        &decision.citation
-                    };
-                    logger.log_governance(
-                        "workspace_shell",
-                        Some(&self.bot_id),
-                        cat,
-                        rule,
-                        citation,
-                        format!("Shell({scrubbed_cmd}) -> exit {exit_code}"),
-                        serde_json::json!({
-                            "task_id": task_id,
-                            "step": step,
-                            "exit_code": exit_code,
-                        }),
-                    );
                 }
-
                 Ok(WorkspaceToolOutcome {
-                    summary: format!("Shell({scrubbed_cmd}) -> exit {exit_code}"),
-                    output: scrubbed_out,
+                    summary: format!("Workspace VM command exited with {}", outcome.exit_code),
+                    output: self.scrubber.scrub_str(&output),
                     diff_preview: None,
                 })
             }
@@ -629,59 +737,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn test_macos_seatbelt_sandbox_exec_blocks_outside_writes() {
-        let dir = std::env::temp_dir().join(format!("bot_seatbelt_test_{}", uuid::Uuid::new_v4()));
+    async fn shell_without_a_verified_vm_never_uses_the_host() {
+        let dir = std::env::temp_dir().join(format!("gm-no-host-shell-{}", uuid::Uuid::new_v4()));
         let sandbox = BotWorkspaceSandbox::new("coder", &dir).unwrap();
         let handler: Arc<dyn InteractionHandler> = Arc::new(NonInteractiveHandler);
-        let ks = KillSwitch::new();
-        let audit = Arc::new(AuditLogger::in_memory());
-
-        // 1. Writing inside workspace succeeds under sandbox-exec
-        let ok_res = sandbox
+        let error = sandbox
             .execute_tool(
-                "t-sb",
+                "t",
                 1,
                 &WorkspaceToolCall::Shell {
-                    command: "echo 'inside_ok' > allowed.txt && cat allowed.txt".into(),
-                    timeout_ms: Some(5000),
+                    command: "printf never-executed".into(),
+                    timeout_ms: Some(1000),
                 },
                 &handler,
-                &ks,
-                Some(&audit),
+                &KillSwitch::new(),
+                None,
             )
             .await
-            .unwrap();
-        assert!(ok_res.output.contains("inside_ok"));
-        assert!(sandbox.workspace_dir().join("allowed.txt").exists());
-
-        // 2. Writing to $HOME outside bot workspace is blocked by kernel Seatbelt policy!
-        let home = std::env::var("HOME").unwrap();
-        let forbidden_file = format!(
-            "{home}/.grok_muse_seatbelt_escape_probe_{}",
-            uuid::Uuid::new_v4()
-        );
-        let blocked_res = sandbox
-            .execute_tool(
-                "t-sb",
-                2,
-                &WorkspaceToolCall::Shell {
-                    command: format!("echo 'escape' > \"{forbidden_file}\""),
-                    timeout_ms: Some(5000),
-                },
-                &handler,
-                &ks,
-                Some(&audit),
-            )
-            .await
-            .unwrap();
-        assert!(!Path::new(&forbidden_file).exists());
+            .unwrap_err();
         assert!(
-            blocked_res.summary.contains("exit 1")
-                || blocked_res.output.contains("Operation not permitted")
+            error
+                .to_string()
+                .contains("Host shell fallback is disabled")
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(sandbox);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

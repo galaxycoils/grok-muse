@@ -124,6 +124,13 @@ impl KeychainSecrets {
             }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Ok(entry) = keyring::Entry::new(&self.service, account)
+            && let Ok(secret) = entry.get_password()
+        {
+            return Ok(secret);
+        }
+
         // Fallback to environment variables
         let env_var_name = account.to_uppercase();
         if let Ok(val) = std::env::var(&env_var_name) {
@@ -153,10 +160,7 @@ impl KeychainSecrets {
     pub fn set_secret(&self, account: &str, secret: &str) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            // Delete existing secret first if present so that set_generic_password
-            // (which calls SecKeychainAddGenericPassword) does not fail with errSecDuplicateItem (-25299).
-            let _ = security_framework::passwords::delete_generic_password(&self.service, account);
-
+            // The platform API updates an existing item atomically. Preserve the old key if saving fails.
             security_framework::passwords::set_generic_password(
                 &self.service,
                 account,
@@ -174,10 +178,9 @@ impl KeychainSecrets {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (account, secret);
-            Err(GmError::Config(
-                "Keychain storage is only supported on macOS".into(),
-            ))
+            keyring::Entry::new(&self.service, account)
+                .and_then(|entry| entry.set_password(secret))
+                .map_err(|e| GmError::Config(format!("OS credential store unavailable: {e}")))
         }
     }
 
@@ -197,10 +200,9 @@ impl KeychainSecrets {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = account;
-            Err(GmError::Config(
-                "Keychain storage is only supported on macOS".into(),
-            ))
+            keyring::Entry::new(&self.service, account)
+                .and_then(|entry| entry.delete_credential())
+                .map_err(|e| GmError::Config(format!("OS credential store unavailable: {e}")))
         }
     }
 

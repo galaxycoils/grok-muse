@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use gm_agent::{AgentLoop, AgentLoopConfig};
 use gm_core::config::GmConfig;
 use gm_core::error::{GmError, Result};
+#[cfg(unix)]
 use gm_core::ipc::{
     DaemonRequest, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message,
 };
@@ -11,8 +12,10 @@ use gm_llm::{
     META_KEY_ACCOUNT, MockLlmBackend, ReqwestLlmBackend, TaskType, XAI_KEY_ACCOUNT,
 };
 use gm_memory::PersonalMemoryStore;
+use gm_platform::IpcPlatformClient;
+#[cfg(unix)]
+use gm_platform::Platform;
 use gm_platform::permissions::{PrivacyPane, check_all_permissions};
-use gm_platform::{IpcPlatformClient, Platform};
 use gm_safety::{AuditLogger, BlocklistManager, KillSwitch};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -20,12 +23,26 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 pub mod control_server;
+pub mod diagnostics;
 pub mod service;
 pub mod updater;
 
 pub use control_server::*;
+pub use diagnostics::*;
 pub use service::*;
 pub use updater::*;
+
+struct UnavailableLlmBackend;
+#[async_trait::async_trait]
+impl LlmBackend for UnavailableLlmBackend {
+    async fn complete(
+        &self,
+        _target: &gm_llm::ModelTarget,
+        _messages: &[ChatMessage],
+    ) -> Result<gm_llm::ChatCompletionResponse> {
+        Err(GmError::Config("No model is configured. Add a provider API key or install a compatible checkpoint and tokenizer. Demo inference requires explicit GM_FORCE_MOCK_LLM=1.".into()))
+    }
+}
 
 pub fn build_llm_backend(secrets: &KeychainSecrets) -> Arc<dyn LlmBackend> {
     if std::env::var("GM_FORCE_MOCK_LLM")
@@ -59,10 +76,8 @@ pub fn build_llm_backend(secrets: &KeychainSecrets) -> Arc<dyn LlmBackend> {
         );
         Arc::new(gm_llm::LocalVlmLlmAdapter::new(Arc::new(local_engine)))
     } else {
-        warn!(
-            "No META_API_KEY/XAI_API_KEY configured and no local VLM installed (run `gm models pull` for offline inference); falling back to MockLlmBackend"
-        );
-        Arc::new(MockLlmBackend::new())
+        warn!("No provider key or usable local VLM configured; inference is unavailable");
+        Arc::new(UnavailableLlmBackend)
     }
 }
 
@@ -90,15 +105,17 @@ pub async fn ensure_helper_running(config: &GmConfig) -> Result<()> {
         "Auto-spawning gm-cu-helper at {:?} with socket {:?}",
         helper_bin, config.socket_path
     );
-    let mut cmd = std::process::Command::new(&helper_bin);
+    let mut cmd = tokio::process::Command::new(&helper_bin);
     cmd.arg("--socket").arg(&config.socket_path);
 
-    #[cfg(not(target_os = "macos"))]
-    cmd.arg("--mock");
-
-    let _child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| GmError::Platform(format!("Failed to auto-spawn gm-cu-helper: {e}")))?;
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            warn!(%error,"Helper process could not be reaped");
+        }
+    });
 
     let start = tokio::time::Instant::now();
     let timeout = tokio::time::Duration::from_millis(1500);
@@ -280,6 +297,30 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Export, preview, or safely import multi-bot team templates
+    Team {
+        #[command(subcommand)]
+        action: Option<TeamSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage scheduled OpenBot routines, quiet hours, and run history
+    Routines {
+        #[command(subcommand)]
+        action: Option<RoutinesSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run local health diagnostics and export sanitized support bundles
+    Diagnostics {
+        #[command(subcommand)]
+        action: Option<DiagnosticsSubcommand>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run loopback OpenBot Companion Web / AG-UI / A2A server (default: 127.0.0.1:7433)
     Serve {
         /// Loopback bind address
@@ -364,10 +405,71 @@ pub enum ChannelsSubcommand {
     },
     /// Assign lead owner bot for a channel
     Assign { channel: String, bot: String },
+    /// Set persistent instructions for a channel
+    SetInstructions {
+        channel: String,
+        instructions: String,
+    },
     /// Archive a channel
     Archive { channel: String },
     /// Restore an archived channel
     Restore { channel: String },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TeamSubcommand {
+    /// Export current team roster, channels, and routines to a portable JSON template
+    Export {
+        /// Team name
+        #[arg(long, default_value = "Grok Muse Team")]
+        name: String,
+        /// Description
+        #[arg(long, default_value = "Exported team configuration")]
+        description: String,
+        /// Output file path (defaults to stdout if not specified)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Preview a team template file before importing
+    Preview {
+        /// Path to team template JSON file
+        path: PathBuf,
+    },
+    /// Import bots, channels, and routines from a template file (routines imported in disabled state)
+    Import {
+        /// Path to team template JSON file
+        path: PathBuf,
+        /// Perform dry-run without writing to database
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing bot profiles if they already exist
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RoutinesSubcommand {
+    /// List configured routines and their schedules
+    List,
+    /// View recent execution history for a routine
+    Runs {
+        id: String,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DiagnosticsSubcommand {
+    /// Run local health checks across sockets, databases, permissions, and disk
+    Check,
+    /// Export an explicitly approved, redacted support diagnostic bundle scrubbing secrets
+    Export {
+        /// Output bundle file path
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -586,7 +688,7 @@ pub async fn run_onboard(check_only: bool) -> Result<()> {
 
     // 3. Helper & Daemon status
     println!("\n▶ Step 3: Checking Background Helper & Daemon Architecture");
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     let helper_socket = &config.socket_path;
     if helper_socket.exists() {
         println!("  ✔ CU Helper socket   : Active at {:?}", helper_socket);
@@ -614,8 +716,92 @@ pub async fn run_onboard(check_only: bool) -> Result<()> {
     Ok(())
 }
 
+async fn submit_to_running_daemon(config: &GmConfig, instruction: &str) -> Result<Option<String>> {
+    async fn exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        mut stream: S,
+        instruction: &str,
+    ) -> Result<Option<String>> {
+        gm_core::ipc::write_ipc_message(
+            &mut stream,
+            &gm_core::ipc::IpcMessage {
+                id: 1,
+                payload: gm_core::ipc::DaemonRequest::SubmitTask {
+                    instruction: instruction.into(),
+                },
+            },
+        )
+        .await?;
+        let response: gm_core::ipc::IpcMessage<gm_core::ipc::DaemonResponse> =
+            gm_core::ipc::read_ipc_message(&mut stream).await?;
+        match response.payload {
+            gm_core::ipc::DaemonResponse::Accepted { id } => Ok(Some(id)),
+            gm_core::ipc::DaemonResponse::Error(message) => Err(GmError::Ipc(message)),
+            _ => Err(GmError::Ipc("Unexpected task submission response".into())),
+        }
+    }
+    #[cfg(unix)]
+    let connection = tokio::net::UnixStream::connect(&config.daemon_socket_path).await;
+    #[cfg(windows)]
+    let connection =
+        tokio::net::windows::named_pipe::ClientOptions::new().open(&config.daemon_socket_path);
+    match connection {
+        Ok(stream) => tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            exchange(stream, instruction),
+        )
+        .await
+        .map_err(|_| GmError::Timeout("Daemon did not acknowledge task submission".into()))?,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn wait_for_queued_task(
+    supervisor: &gm_openbot::OpenBotSupervisor,
+    id: &str,
+) -> Result<String> {
+    loop {
+        let task = supervisor
+            .queue()
+            .get_task(id)?
+            .ok_or_else(|| GmError::Config("Task disappeared".into()))?;
+        match task.status {
+            gm_openbot::QueuedTaskStatus::Completed => {
+                return Ok(task.result_summary.unwrap_or_default());
+            }
+            gm_openbot::QueuedTaskStatus::Failed | gm_openbot::QueuedTaskStatus::Cancelled => {
+                return Err(GmError::Provider(
+                    task.result_summary
+                        .unwrap_or_else(|| task.status.as_str().into()),
+                ));
+            }
+            gm_openbot::QueuedTaskStatus::Paused
+            | gm_openbot::QueuedTaskStatus::WaitingForHuman => {
+                return Ok(format!(
+                    "Task {} needs human input: {}",
+                    id,
+                    task.blocker_note.unwrap_or_default()
+                ));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+}
+
 pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<()> {
-    let config = GmConfig::load_or_default(config_path.as_deref());
+    let config = GmConfig::load(config_path.as_deref())?;
+    if let Some(id) = submit_to_running_daemon(&config, instruction).await? {
+        println!("Task queued in the running daemon: {id}");
+        return Ok(());
+    }
+    let _runtime_lease = gm_openbot::runtime::RuntimeLease::acquire(&config.storage_dir)?;
     let _ = ensure_helper_running(&config).await;
 
     println!(
@@ -625,7 +811,10 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let router = LlmRouter::new(config.providers.clone());
 
     let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
@@ -641,6 +830,11 @@ pub async fn run_do(instruction: &str, config_path: Option<PathBuf>) -> Result<(
         blocklist,
         AgentLoopConfig::default(),
     )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: config.safety.allow_host_desktop,
+        allow_shell: false,
+        allow_network: true,
+    })
     .with_audit(Arc::new(audit_log.clone()));
 
     use std::io::IsTerminal;
@@ -711,7 +905,7 @@ pub async fn run_status() -> Result<()> {
         if perms.reminders { "OK" } else { "Missing" }
     );
 
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     let helper_socket = &config.socket_path;
     println!(
         "\nHelper Socket: {}",
@@ -727,19 +921,19 @@ pub async fn run_status() -> Result<()> {
 }
 
 pub async fn run_kill() -> Result<()> {
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     run_kill_with_config(&config).await
 }
 
-pub async fn run_kill_with_config(config: &GmConfig) -> Result<()> {
+pub async fn run_kill_with_config(_config: &GmConfig) -> Result<()> {
     println!("🚨 Grok-Muse Emergency Kill Switch Triggered");
 
     let daemon_kill = async {
         #[cfg(unix)]
-        if config.daemon_socket_path.exists()
+        if _config.daemon_socket_path.exists()
             && let Ok(Ok(mut stream)) = tokio::time::timeout(
                 tokio::time::Duration::from_millis(40),
-                tokio::net::UnixStream::connect(&config.daemon_socket_path),
+                tokio::net::UnixStream::connect(&_config.daemon_socket_path),
             )
             .await
         {
@@ -771,12 +965,12 @@ pub async fn run_kill_with_config(config: &GmConfig) -> Result<()> {
 
     let helper_kill = async {
         #[cfg(unix)]
-        if config.socket_path.exists() {
+        if _config.socket_path.exists() {
             println!(
                 "Connecting to CU Helper socket ({:?}) to drop active actions...",
-                config.socket_path
+                _config.socket_path
             );
-            let platform = IpcPlatformClient::new(&config.socket_path);
+            let platform = IpcPlatformClient::new(&_config.socket_path);
             match tokio::time::timeout(tokio::time::Duration::from_millis(40), platform.cancel())
                 .await
             {
@@ -809,15 +1003,7 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
     system_override: Option<String>,
     config_path: Option<PathBuf>,
 ) -> Result<()> {
-    let config = if let Some(p) = config_path {
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            GmConfig::default()
-        }
-    } else {
-        GmConfig::default()
-    };
+    let config = GmConfig::load(config_path.as_deref())?;
 
     let keychain = KeychainSecrets::default();
     let meta_key = keychain.get_meta_key().ok();
@@ -827,10 +1013,13 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
     let backend_name = if meta_key.is_some() || xai_key.is_some() {
         "Live API (Keychain / Environment)"
     } else {
-        "Offline / Conversational Simulator"
+        "Model unavailable (configure a provider or compatible local model)"
     };
 
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = Arc::new(HybridLlmClient::new(backend, Arc::clone(&budget)));
     let router = LlmRouter::new(config.providers.clone());
     let memory = Arc::new(
@@ -838,8 +1027,6 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap()),
     );
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
-    let kill_switch = KillSwitch::new();
-    let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
 
     let system_prompt = system_override.unwrap_or_else(|| {
         "You are Grok-Muse, a fast computer-use personal assistant for macOS. \
@@ -1114,28 +1301,12 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
             )?;
             writer.flush()?;
 
-            let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
-            let agent = AgentLoop::new(
-                platform,
-                llm_client.clone(),
-                router.clone(),
-                kill_switch.clone(),
-                blocklist.clone(),
-                AgentLoopConfig::default(),
-            )
-            .with_audit(Arc::new(audit_log.clone()));
-
-            match agent.run_task("repl_inline", task_instruction).await {
-                Ok(summary) => {
-                    writeln!(writer, "✔ Task succeeded: {}\n", summary)?;
-                    history.push(ChatMessage::text(
-                        "system",
-                        format!("Computer-use action executed: {summary}"),
-                    ));
-                }
-                Err(e) => {
-                    writeln!(writer, "✘ Task failed: {}\n", e)?;
-                }
+            match run_do(task_instruction, config_path.clone()).await {
+                Ok(()) => writeln!(
+                    writer,
+                    "✔ Task dispatched. Inspect its task history for completion.\n"
+                )?,
+                Err(error) => writeln!(writer, "✘ Task dispatch failed: {error}\n")?,
             }
             writer.flush()?;
             continue;
@@ -1201,14 +1372,17 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
 }
 
 pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> Result<()> {
-    let config = GmConfig::load_or_default(config_path.as_deref());
+    let config = GmConfig::load(config_path.as_deref())?;
 
     info!("Starting gm-daemon...");
     let _ = ensure_helper_running(&config).await;
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let kill_switch = KillSwitch::new();
     let blocklist = BlocklistManager::new(&config.safety.blocklisted_apps);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let router = LlmRouter::new(config.providers.clone());
 
     let platform = Arc::new(IpcPlatformClient::new(&config.socket_path));
@@ -1249,13 +1423,16 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
         Arc::clone(&platform),
     );
 
+    let runtime_task = control_server.start_runtime()?;
+
     let companion_task = if config.openbot.enabled && config.openbot.companion_enabled {
         if let Some(sup) = control_server.openbot().cloned() {
             let bind_addr = config.openbot.companion_bind_addr.clone();
             let bridges_cfg = config.openbot.bridges.clone();
+            let (token, slack_secret) = companion_web_credentials(&config)?;
             Some(tokio::spawn(async move {
                 let bridge = gm_openbot::BridgeRouter::new(sup.clone(), bridges_cfg);
-                let web = gm_openbot::CompanionWebServer::new(sup, bridge, None, None);
+                let web = gm_openbot::CompanionWebServer::new(sup, bridge, token, slack_secret);
                 match web.bind_and_serve(&bind_addr).await {
                     Ok((_addr, handle)) => {
                         let _ = handle.await;
@@ -1272,6 +1449,11 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
         None
     };
 
+    let task_supervisor = control_server
+        .openbot()
+        .cloned()
+        .ok_or_else(|| GmError::Config("Task runtime unavailable".into()))?;
+
     let server_task = tokio::spawn(async move {
         if let Err(e) = control_server.run().await {
             warn!("Daemon control server stopped: {e}");
@@ -1280,17 +1462,8 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
 
     if let Some(task_instruction) = task {
         info!("Running one-shot task: {}", task_instruction);
-        let agent = AgentLoop::new(
-            platform,
-            llm_client,
-            router,
-            kill_switch,
-            blocklist,
-            AgentLoopConfig::default(),
-        )
-        .with_audit(Arc::new(audit_log.clone()));
-
-        match agent.run_task("cli_task", &task_instruction).await {
+        let queued = task_supervisor.submit_task(None, Some("general"), &task_instruction, 0)?;
+        match wait_for_queued_task(&task_supervisor, &queued.id).await {
             Ok(summary) => {
                 println!("Task completed: {summary}");
             }
@@ -1300,6 +1473,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
                     ct.abort();
                 }
                 server_task.abort();
+                runtime_task.abort();
                 tick_task.abort();
                 return Err(e);
             }
@@ -1313,6 +1487,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
         ct.abort();
     }
     server_task.abort();
+    runtime_task.abort();
     tick_task.abort();
     Ok(())
 }
@@ -1367,7 +1542,7 @@ pub async fn run_dogfood(action: Option<DogfoodSubcommand>, json: bool) -> Resul
 }
 
 pub async fn run_stats(json: bool) -> Result<()> {
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     let spend_cap = config.budget.daily_spend_cap_usd;
     let tracker = gm_goals::DogfoodTracker::default_tracker(spend_cap)?;
     let metrics = tracker.compute_metrics();
@@ -1413,7 +1588,7 @@ pub async fn run_review(date_str: Option<String>) -> Result<()> {
         date
     );
 
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     let audit = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
     let memory = PersonalMemoryStore::default_store()
         .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
@@ -1423,7 +1598,10 @@ pub async fn run_review(date_str: Option<String>) -> Result<()> {
 
     let secrets = KeychainSecrets::default();
     let llm_backend = build_llm_backend(&secrets);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = HybridLlmClient::new(llm_backend, budget);
     let router = LlmRouter::new(config.providers.clone());
     let llm_ctx = Some((&llm_client, &router));
@@ -1527,10 +1705,13 @@ pub async fn run_feed(limit: usize, json: bool) -> Result<()> {
 pub async fn run_ideas(json: bool) -> Result<()> {
     let memory = PersonalMemoryStore::default_store()
         .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(None)?;
     let secrets = KeychainSecrets::default();
     let llm_backend = build_llm_backend(&secrets);
-    let budget = Arc::new(BudgetManager::new(config.budget.clone()));
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
     let llm_client = HybridLlmClient::new(llm_backend, budget);
     let router = LlmRouter::new(config.providers.clone());
     let llm_ctx = Some((&llm_client, &router));
@@ -1631,7 +1812,7 @@ pub async fn run_models_with_registry(
 fn open_default_openbot_supervisor(
     config_path: Option<PathBuf>,
 ) -> Result<gm_openbot::OpenBotSupervisor> {
-    let config = GmConfig::load_or_default(config_path.as_deref());
+    let config = GmConfig::load(config_path.as_deref())?;
     let audit =
         Arc::new(AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory()));
     let (event_tx, _) = tokio::sync::broadcast::channel(64);
@@ -1836,6 +2017,24 @@ pub async fn run_channels(
             sup.channels().reassign_owner(&channel, &bot)?;
             println!("✔ Assigned channel {channel} owner to @{bot}");
         }
+        ChannelsSubcommand::SetInstructions {
+            channel,
+            instructions,
+        } => {
+            sup.update_channel_instructions(&channel, &instructions)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "channel": channel,
+                        "instructions": instructions,
+                        "updated": true
+                    })
+                );
+            } else {
+                println!("✔ Updated instructions for channel {channel}");
+            }
+        }
         ChannelsSubcommand::Archive { channel } => {
             sup.channels().set_archived(&channel, true)?;
             println!("✔ Archived channel {channel}");
@@ -1848,20 +2047,292 @@ pub async fn run_channels(
     Ok(())
 }
 
+pub async fn run_team(
+    action: Option<TeamSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let sup = open_default_openbot_supervisor(config_path)?;
+    match action.unwrap_or(TeamSubcommand::Export {
+        name: "Grok Muse Team".into(),
+        description: "Exported team configuration".into(),
+        output: None,
+    }) {
+        TeamSubcommand::Export {
+            name,
+            description,
+            output,
+        } => {
+            let template = gm_openbot::templates::export_team(
+                sup.roster(),
+                sup.channels(),
+                sup.queue(),
+                &name,
+                &description,
+            )?;
+            let json_str = serde_json::to_string_pretty(&template)?;
+            if let Some(out_path) = output {
+                std::fs::write(&out_path, &json_str)?;
+                println!("✔ Team template exported to {}", out_path.display());
+            } else {
+                println!("{json_str}");
+            }
+        }
+        TeamSubcommand::Preview { path } => {
+            let content = std::fs::read_to_string(&path)?;
+            let preview = gm_openbot::templates::preview_template(&content)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                println!("Team Template: {}", preview.team_name);
+                println!("  Description: {}", preview.description);
+                println!("  Bots to import: {}", preview.bots.len());
+                for b in &preview.bots {
+                    println!("    - @{}", b);
+                }
+                println!("  Channels to import: {}", preview.channels.len());
+                for c in &preview.channels {
+                    println!("    - #{}", c);
+                }
+                println!("  Routines to import: {}", preview.routines.len());
+                for r in &preview.routines {
+                    println!("    - {} (triggers disabled on import)", r);
+                }
+                if !preview.warnings.is_empty() {
+                    println!("  Warnings ({}):", preview.warnings.len());
+                    for w in &preview.warnings {
+                        println!("    ⚠ {w}");
+                    }
+                }
+            }
+        }
+        TeamSubcommand::Import {
+            path,
+            dry_run,
+            overwrite,
+        } => {
+            let content = std::fs::read_to_string(&path)?;
+            if dry_run {
+                let preview = gm_openbot::templates::preview_template(&content)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&preview)?);
+                } else {
+                    println!("✔ Team template validation passed (DRY RUN):");
+                    println!(
+                        "  {} bots, {} channels, {} routines ready to import",
+                        preview.bots.len(),
+                        preview.channels.len(),
+                        preview.routines.len()
+                    );
+                }
+            } else {
+                let template: gm_openbot::templates::TeamTemplate = serde_json::from_str(&content)
+                    .map_err(|e| GmError::Config(format!("Invalid team template file: {e}")))?;
+                let summary = gm_openbot::templates::import_team(&sup, &template, overwrite)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!(
+                        "✔ Team template '{}' imported successfully:",
+                        summary.team_name
+                    );
+                    println!(
+                        "  Imported {} bots, {} channels, {} routines (all triggers initially disabled)",
+                        summary.bots_imported, summary.channels_imported, summary.routines_imported,
+                    );
+                    for notice in summary.notices {
+                        println!("  ℹ {notice}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_routines(
+    action: Option<RoutinesSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let sup = open_default_openbot_supervisor(config_path)?;
+    match action.unwrap_or(RoutinesSubcommand::List) {
+        RoutinesSubcommand::List => {
+            let routines = sup.queue().list_routines()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&routines)?);
+            } else {
+                println!("Configured Routines ({}):", routines.len());
+                for r in routines {
+                    let quiet_info = match &r.routine.quiet_hours {
+                        Some(q) => format!(
+                            " (quiet hours: {:02}:00-{:02}:00)",
+                            q.start_hour, q.end_hour
+                        ),
+                        None => String::new(),
+                    };
+                    println!(
+                        "  • {:<16} bot: @{:<12} next_due: {} enabled: {}{}",
+                        r.routine.id,
+                        r.routine.bot_id,
+                        r.next_run_utc,
+                        r.routine.enabled,
+                        quiet_info
+                    );
+                }
+            }
+        }
+        RoutinesSubcommand::Runs { id, limit } => {
+            let runs = sup.queue().list_routine_runs(&id, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+            } else {
+                println!("Run History for Routine '{}' ({} runs):", id, runs.len());
+                for run in runs {
+                    println!(
+                        "  [{}] status: {:<20} scheduled: {} fired: {} task: {}",
+                        run.id,
+                        run.status,
+                        run.scheduled_for,
+                        run.fired_at,
+                        run.task_id.as_deref().unwrap_or("none")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_diagnostics(
+    action: Option<DiagnosticsSubcommand>,
+    json: bool,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = GmConfig::load(config_path.as_deref())?;
+    match action.unwrap_or(DiagnosticsSubcommand::Check) {
+        DiagnosticsSubcommand::Check => {
+            let report = run_health_diagnostics(&config);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Grok Muse System Health Diagnostics:");
+                println!("Overall Status: {:?}", report.overall);
+                println!("Timestamp:      {}", report.timestamp);
+                println!("--------------------------------------------------");
+                for check in &report.checks {
+                    let status_badge = match check.status {
+                        DiagnosticStatus::Ok => "✔ OK",
+                        DiagnosticStatus::Warning => "⚠ WARN",
+                        DiagnosticStatus::Error => "✘ ERROR",
+                    };
+                    println!(
+                        "{:<8} [{:<12}] {}",
+                        status_badge, check.category, check.name
+                    );
+                    println!("         {}", check.message);
+                    if let Some(ref rem) = check.remediation {
+                        println!("         Action: {rem}");
+                    }
+                }
+                println!("--------------------------------------------------");
+            }
+        }
+        DiagnosticsSubcommand::Export { output } => {
+            println!("Generating sanitized diagnostic support bundle...");
+            let bundle = export_support_bundle(&config, &output)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+            } else {
+                println!(
+                    "✔ Sanitized diagnostic bundle exported to {}",
+                    output.display()
+                );
+                println!("  Version:           {}", bundle.grok_muse_version);
+                println!("  Platform:          {} ({})", bundle.os, bundle.arch);
+                println!(
+                    "  Redaction status:  VERIFIED ({} secret values scrubbed)",
+                    bundle.scrubbed_secret_count
+                );
+                println!("  SHA-256 Checksum:  {}", bundle.sha256_fingerprint);
+                println!("  Review the file before sharing for technical support.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn companion_web_credentials(config: &GmConfig) -> Result<(Option<String>, Option<String>)> {
+    let read = |name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let token = if let Some(token) = read("GROK_MUSE_COMPANION_TOKEN") {
+        token
+    } else {
+        let path = config.storage_dir.join("companion-token");
+        match std::fs::read_to_string(&path) {
+            Ok(token) if !token.trim().is_empty() => token.trim().to_string(),
+            Ok(_) => {
+                return Err(GmError::Config(
+                    "Companion token file is empty; restore or remove it to pair again".into(),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let token = format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                );
+                gm_core::storage::atomic_write_private(&path, token.as_bytes())?;
+                info!(path=%path.display(),"Companion pairing token created");
+                token
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    Ok((Some(token), read("GROK_MUSE_SLACK_SIGNING_SECRET")))
+}
+
 pub async fn run_serve(bind: &str, config_path: Option<PathBuf>) -> Result<()> {
-    let config = GmConfig::load_or_default(config_path.as_deref());
+    let config = GmConfig::load(config_path.as_deref())?;
     let sup = open_default_openbot_supervisor(config_path)?;
     println!("==> Starting OpenBot Companion Web / AG-UI / A2A server on http://{bind} ...");
-    let bridge = gm_openbot::BridgeRouter::new(sup.clone(), config.openbot.bridges);
-    let web = gm_openbot::CompanionWebServer::new(sup, bridge, None, None);
-    let (_addr, handle) = web.bind_and_serve(bind).await?;
-    let _ = handle.await;
+    let secrets = KeychainSecrets::default();
+    let budget = Arc::new(BudgetManager::open(
+        config.budget.clone(),
+        &config.storage_dir,
+    )?);
+    let llm = Arc::new(HybridLlmClient::new(build_llm_backend(&secrets), budget));
+    let runtime = sup.start_runtime(
+        Arc::new(IpcPlatformClient::new(&config.socket_path)),
+        llm,
+        LlmRouter::new(config.providers.clone()),
+        KillSwitch::new(),
+        BlocklistManager::new(&config.safety.blocklisted_apps),
+        None,
+    )?;
+    let bridge = gm_openbot::BridgeRouter::new(sup.clone(), config.openbot.bridges.clone());
+    let (token, slack_secret) = companion_web_credentials(&config)?;
+    let web = gm_openbot::CompanionWebServer::new(sup, bridge, token, slack_secret);
+    let (_addr, handle) = match web.bind_and_serve(bind).await {
+        Ok(server) => server,
+        Err(error) => {
+            runtime.abort();
+            return Err(error);
+        }
+    };
+    tokio::select! { _ = handle => {}, _ = tokio::signal::ctrl_c() => {} }
+    runtime.abort();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use gm_core::ipc::DaemonEvent;
 
     static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2019,6 +2490,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(gm_agent::AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_audit(audit.clone());
 
         let res = agent.run_task("test_t1", "Click test").await;
@@ -2055,11 +2531,17 @@ mod tests {
     #[tokio::test]
     async fn test_chat_repl_edge_cases_unknown_and_boundaries() {
         let _env_guard = ENV_MUTEX.lock().await;
+        unsafe {
+            std::env::set_var("GM_FORCE_MOCK_LLM", "1");
+        }
         let input = "   \n/unknown_cmd\n/document code\n/members in team\n/do\n/memory\nWhat is your role?\n/history\n/quit\n";
         let reader = std::io::Cursor::new(input);
         let mut output = Vec::new();
 
         let res = run_chat_loop(reader, &mut output, None, None).await;
+        unsafe {
+            std::env::remove_var("GM_FORCE_MOCK_LLM");
+        }
         assert!(res.is_ok());
 
         let out_str = String::from_utf8_lossy(&output);
@@ -2100,6 +2582,8 @@ mod tests {
             dmg_size_bytes: Some(1024),
             checksum_download_url: None,
             expected_sha256: None,
+            manifest_download_url: None,
+            signature_download_url: None,
             published_at: None,
             release_notes: Some("Release notes".into()),
         };
@@ -2141,7 +2625,7 @@ mod tests {
         let backend_live = build_llm_backend(&secrets);
         assert!(!backend_live.is_mock());
 
-        // Scenario 3: No keys falls back to MockLlmBackend
+        // Scenario 3: Missing credentials cannot silently simulate successful work
         unsafe {
             std::env::remove_var("META_API_KEY");
             std::env::remove_var("XAI_API_KEY");
@@ -2149,16 +2633,38 @@ mod tests {
             std::env::remove_var("GROK_API_KEY");
         }
         let backend_empty = build_llm_backend(&secrets);
-        assert!(backend_empty.is_mock());
+        assert!(!backend_empty.is_mock());
+        assert!(
+            backend_empty
+                .complete(
+                    &LlmRouter::new(gm_core::config::ProvidersConfig::default())
+                        .route(TaskType::Planning)
+                        .0,
+                    &[]
+                )
+                .await
+                .is_err()
+        );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_daemon_control_server_streaming_and_protocol() {
         let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let daemon_socket = std::path::PathBuf::from(format!("/tmp/gmd_{}.sock", short_id));
         let helper_socket = std::path::PathBuf::from(format!("/tmp/gmh_{}.sock", short_id));
 
+        let runtime_dir = std::env::temp_dir().join(format!("gm-runtime-test-{short_id}"));
         let config = GmConfig {
+            storage_dir: runtime_dir.clone(),
+            openbot: gm_core::config::OpenBotConfig {
+                bots_dir: runtime_dir.join("bots"),
+                ..Default::default()
+            },
+            safety: gm_core::config::SafetyConfig {
+                allow_host_desktop: false,
+                ..Default::default()
+            },
             daemon_socket_path: daemon_socket.clone(),
             socket_path: helper_socket.clone(),
             ..Default::default()
@@ -2166,7 +2672,9 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(config.budget.clone()));
         let mock_backend = Arc::new(MockLlmBackend::new());
-        mock_backend.set_response("Mock LLM response for test");
+        mock_backend.queue_response("Mock LLM response for test");
+        mock_backend
+            .queue_response(r#"{"action":"Done","params":{"summary":"Protocol task completed"}}"#);
         let llm_client = Arc::new(HybridLlmClient::new(mock_backend, Arc::clone(&budget)));
         let router = LlmRouter::new(config.providers.clone());
         let kill_switch = KillSwitch::new();
@@ -2185,6 +2693,7 @@ mod tests {
             platform,
         );
 
+        let runtime = server.start_runtime().unwrap();
         let srv = server.clone();
         let srv_handle = tokio::spawn(async move {
             let _ = srv.run().await;
@@ -2294,6 +2803,7 @@ mod tests {
             other => panic!("Expected HudStateChanged event, got {:?}", other),
         }
 
+        server.openbot().unwrap().set_runtime_paused(false).unwrap();
         // Test 6: SubmitTask & Task Event Streaming
         let task_req = IpcMessage {
             id: 7,
@@ -2306,14 +2816,15 @@ mod tests {
         assert_eq!(task_resp.id, 7);
         let spawned_task_id = match task_resp.payload {
             DaemonResponse::Accepted { id } => {
-                assert!(id.starts_with("task_"));
+                assert!(id.starts_with("task-"));
                 id
             }
             other => panic!("Expected Accepted, got {:?}", other),
         };
 
         let mut got_task_progress = false;
-        for _ in 0..5 {
+        let progress_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < progress_deadline {
             if let Ok(Ok(frame)) = tokio::time::timeout(
                 tokio::time::Duration::from_millis(500),
                 read_ipc_message::<_, IpcMessage<DaemonResponse>>(&mut sub_stream),
@@ -2368,16 +2879,29 @@ mod tests {
         assert!(kill_switch.is_triggered());
 
         srv_handle.abort();
+        runtime.abort();
+        let _ = runtime.await;
         let _ = std::fs::remove_file(&daemon_socket);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_daemon_end_to_end_approval_requested_and_respond() {
         let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let daemon_socket = std::path::PathBuf::from(format!("/tmp/gmda_{}.sock", short_id));
         let helper_socket = std::path::PathBuf::from(format!("/tmp/gmha_{}.sock", short_id));
 
+        let runtime_dir = std::env::temp_dir().join(format!("gm-runtime-test-{short_id}"));
         let config = GmConfig {
+            storage_dir: runtime_dir.clone(),
+            openbot: gm_core::config::OpenBotConfig {
+                bots_dir: runtime_dir.join("bots"),
+                ..Default::default()
+            },
+            safety: gm_core::config::SafetyConfig {
+                allow_host_desktop: true,
+                ..Default::default()
+            },
             daemon_socket_path: daemon_socket.clone(),
             socket_path: helper_socket.clone(),
             ..Default::default()
@@ -2436,6 +2960,7 @@ mod tests {
             platform,
         );
 
+        let runtime = server.start_runtime().unwrap();
         let srv = server.clone();
         let srv_handle = tokio::spawn(async move {
             let _ = srv.run().await;
@@ -2541,11 +3066,14 @@ mod tests {
         );
 
         srv_handle.abort();
+        runtime.abort();
+        let _ = runtime.await;
         helper_handle.abort();
         let _ = std::fs::remove_file(&daemon_socket);
         let _ = std::fs::remove_file(&helper_socket);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_dual_socket_run_kill_with_config_under_50ms() {
         let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
@@ -2666,6 +3194,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_openbot_cli_subcommands_and_daemon_ipc() {
         let temp_dir = tempfile::tempdir().unwrap();

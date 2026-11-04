@@ -25,3 +25,6 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS native bindings can be added here or via objc2
+
+[dev-dependencies]
+uuid = { workspace = true }

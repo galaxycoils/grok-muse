@@ -27,6 +27,12 @@ pub fn verify_slack_signature(
     raw_body: &str,
     signature_header: &str,
 ) -> bool {
+    let Ok(timestamp_value) = timestamp.parse::<i64>() else {
+        return false;
+    };
+    if signing_secret.is_empty() || chrono::Utc::now().timestamp().abs_diff(timestamp_value) > 300 {
+        return false;
+    }
     let expected = compute_hmac_sha256_hex(
         signing_secret.as_bytes(),
         format!("v0:{timestamp}:{raw_body}").as_bytes(),
@@ -67,7 +73,7 @@ pub fn compute_hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     hex::encode(outer.finalize())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -96,8 +102,8 @@ impl BridgeRouter {
         match platform.to_lowercase().as_str() {
             "telegram" => {
                 self.config.telegram_enabled
-                    && (self.config.telegram_allowed_chat_ids.is_empty()
-                        || self
+                    && (!self.config.telegram_allowed_chat_ids.is_empty()
+                        && self
                             .config
                             .telegram_allowed_chat_ids
                             .iter()
@@ -105,8 +111,8 @@ impl BridgeRouter {
             }
             "slack" => {
                 self.config.slack_enabled
-                    && (self.config.slack_allowed_channel_ids.is_empty()
-                        || self
+                    && (!self.config.slack_allowed_channel_ids.is_empty()
+                        && self
                             .config
                             .slack_allowed_channel_ids
                             .iter()
@@ -114,8 +120,8 @@ impl BridgeRouter {
             }
             "discord" => {
                 self.config.discord_enabled
-                    && (self.config.discord_allowed_channel_ids.is_empty()
-                        || self
+                    && (!self.config.discord_allowed_channel_ids.is_empty()
+                        && self
                             .config
                             .discord_allowed_channel_ids
                             .iter()

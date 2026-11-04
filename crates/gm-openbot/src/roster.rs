@@ -34,15 +34,31 @@ pub struct BotRoster {
 impl BotRoster {
     pub fn open(bots_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = bots_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        gm_core::storage::ensure_private_dir(&dir)?;
+        let _lease = Self::lock_directory(&dir)?;
         let roster_file = dir.join("roster.json");
 
         let mut loaded: BTreeMap<String, BotProfile> = if roster_file.exists() {
             let content = std::fs::read_to_string(&roster_file)?;
-            serde_json::from_str(&content).unwrap_or_default()
+            // A damaged roster must never be replaced by defaults on the next read.
+            serde_json::from_str(&content)?
         } else {
             BTreeMap::new()
         };
+
+        for (key, profile) in &loaded {
+            if key != &profile.id
+                || key.is_empty()
+                || key.len() > 64
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+            {
+                return Err(GmError::Config(
+                    "Roster contains an invalid bot identifier; original file preserved".into(),
+                ));
+            }
+        }
 
         if loaded.is_empty() {
             for profile in Self::default_coworkers() {
@@ -94,7 +110,7 @@ impl BotRoster {
                 display_name: "Atlas Engineer".into(),
                 avatar_emoji: "🛠️".into(),
                 role_title: "Sandboxed Workspace Software Engineer".into(),
-                system_prompt: "You are Atlas, a software engineer operating in a Seatbelt-confined workspace. Write clean code, generate unified diff previews, run tests via WorkspaceShell, and place deliverables in outbox/.".into(),
+                system_prompt: "You are Atlas, a software engineer operating in an isolated project workspace. Write clean code, generate unified diff previews, run tests via WorkspaceShell, and place deliverables in outbox/.".into(),
                 preferred_provider: None,
                 preferred_model: None,
                 allow_gui: false,
@@ -118,10 +134,40 @@ impl BotRoster {
         ]
     }
 
+    fn lock_directory(directory: &Path) -> Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(directory.join(".roster.lock"))?;
+        file.lock()?;
+        Ok(file)
+    }
+    pub fn refresh(&self) -> Result<()> {
+        let raw = std::fs::read_to_string(&self.roster_file)?;
+        let map: BTreeMap<String, BotProfile> = serde_json::from_str(&raw)?;
+        for (key, profile) in &map {
+            if key != &profile.id
+                || key.is_empty()
+                || key.len() > 64
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+            {
+                return Err(GmError::Config("Invalid bot identifier in roster".into()));
+            }
+        }
+        *self.bots.lock() = map;
+        Ok(())
+    }
+
     fn persist(&self) -> Result<()> {
         let map = self.bots.lock();
         let json = serde_json::to_string_pretty(&*map)?;
-        std::fs::write(&self.roster_file, json)?;
+        gm_core::storage::atomic_write_private(&self.roster_file, json.as_bytes())?;
         Ok(())
     }
 
@@ -163,28 +209,72 @@ impl BotRoster {
     }
 
     pub fn list_bots(&self) -> Vec<BotProfile> {
+        if let Err(error) = self.refresh() {
+            tracing::error!(%error,"Roster could not be refreshed; admission disabled");
+            return Vec::new();
+        }
         self.bots.lock().values().cloned().collect()
     }
 
     pub fn get_bot(&self, bot_id: &str) -> Option<BotProfile> {
+        self.refresh().ok()?;
         self.bots.lock().get(bot_id).cloned()
     }
 
     pub fn upsert_bot(&self, profile: BotProfile) -> Result<BotProfile> {
+        let _lease = Self::lock_directory(&self.bots_dir)?;
+        self.refresh()?;
         let id = profile.id.trim().to_lowercase();
-        if id.is_empty() || id.contains('/') || id.contains("..") {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        {
             return Err(GmError::Config(format!("Invalid bot ID '{}'", profile.id)));
+        }
+        if profile.display_name.trim().is_empty()
+            || profile.display_name.len() > 256
+            || profile.role_title.len() > 512
+            || profile.system_prompt.len() > 64 * 1024
+            || profile.avatar_emoji.len() > 64
+            || profile
+                .preferred_model
+                .as_ref()
+                .is_some_and(|s| s.len() > 256)
+            || profile.preferred_provider.as_ref().is_some_and(|s| {
+                !matches!(
+                    s.as_str(),
+                    "meta" | "muse" | "xai" | "grok" | "claude" | "codex" | "anthropic" | "openai"
+                )
+            })
+        {
+            return Err(GmError::Config(
+                "Bot profile fields exceed limits or the preferred provider is unsupported".into(),
+            ));
+        }
+        if profile.preferred_model.is_some() && profile.preferred_provider.is_none() {
+            return Err(GmError::Config(
+                "Choose a provider when setting a preferred model".into(),
+            ));
         }
         let mut normalized = profile;
         normalized.id = id.clone();
-        self.bots.lock().insert(id.clone(), normalized.clone());
-        self.persist()?;
         let _ = BotWorkspaceSandbox::new(&id, self.bot_root(&id))?
             .with_network(normalized.allow_network);
+        let mut updated = self.bots.lock().clone();
+        updated.insert(id.clone(), normalized.clone());
+        gm_core::storage::atomic_write_private(
+            &self.roster_file,
+            &serde_json::to_vec_pretty(&updated)?,
+        )?;
+        *self.bots.lock() = updated;
         Ok(normalized)
     }
 
     pub fn remove_bot(&self, bot_id: &str) -> Result<bool> {
+        let _lease = Self::lock_directory(&self.bots_dir)?;
+        self.refresh()?;
         if bot_id == "muse" {
             return Err(GmError::Config(
                 "Cannot remove the default 'muse' operator bot".into(),

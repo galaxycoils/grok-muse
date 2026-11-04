@@ -19,6 +19,7 @@ use tokio::net::windows::named_pipe::NamedPipeClient as IpcStream;
 pub struct IpcPlatformClient {
     socket_path: PathBuf,
     req_counter: AtomicU64,
+    active_task: std::sync::RwLock<Option<(String, String)>>,
     stream: Arc<tokio::sync::Mutex<Option<IpcStream>>>,
 }
 
@@ -27,55 +28,38 @@ impl IpcPlatformClient {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
             req_counter: AtomicU64::new(1),
+            active_task: std::sync::RwLock::new(None),
             stream: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     async fn send_request(&self, req_body: HelperRequest) -> Result<HelperResponse> {
         let mut guard = self.stream.lock().await;
-        if guard.is_none() {
+        // Own the stream locally while awaiting IO. Cancellation drops it instead of caching a partial frame.
+        let mut stream = if let Some(stream) = guard.take() {
+            stream
+        } else {
             #[cfg(unix)]
-            let stream = tokio::net::UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|e| {
-                    GmError::Platform(format!(
-                        "Failed to connect to cu-helper socket {:?}: {e}",
-                        self.socket_path
-                    ))
-                })?;
-
+            let stream = tokio::net::UnixStream::connect(&self.socket_path).await?;
             #[cfg(windows)]
-            let stream = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&self.socket_path)
-                .map_err(|e| {
-                    GmError::Platform(format!(
-                        "Failed to connect to cu-helper named pipe {:?}: {e}",
-                        self.socket_path
-                    ))
-                })?;
-
-            *guard = Some(stream);
-        }
-
-        let stream = guard.as_mut().unwrap();
+            let stream =
+                tokio::net::windows::named_pipe::ClientOptions::new().open(&self.socket_path)?;
+            stream
+        };
         let id = self.req_counter.fetch_add(1, Ordering::SeqCst);
         let msg = IpcMessage {
             id,
             payload: req_body,
         };
 
-        if let Err(e) = write_ipc_message(stream, &msg).await {
-            *guard = None; // reset stream on failure
-            return Err(e);
+        write_ipc_message(&mut stream, &msg).await?;
+        let response: IpcMessage<HelperResponse> = read_ipc_message(&mut stream).await?;
+        if response.id != id {
+            return Err(GmError::Ipc(
+                "Helper response does not match the outstanding request".into(),
+            ));
         }
-
-        let response: IpcMessage<HelperResponse> = match read_ipc_message(stream).await {
-            Ok(res) => res,
-            Err(e) => {
-                *guard = None;
-                return Err(e);
-            }
-        };
+        *guard = Some(stream);
 
         match response.payload {
             HelperResponse::Error(msg) => Err(GmError::Platform(msg)),
@@ -96,6 +80,50 @@ impl IpcPlatformClient {
 
 #[async_trait]
 impl Platform for IpcPlatformClient {
+    async fn begin_task(&self, task_id: &str) -> Result<()> {
+        let session_id = format!("{task_id}:{}", uuid::Uuid::new_v4());
+        match self
+            .send_request(HelperRequest::BeginTask {
+                task_id: session_id.clone(),
+            })
+            .await?
+        {
+            HelperResponse::ActionExecuted { success: true, .. } => {
+                *self
+                    .active_task
+                    .write()
+                    .map_err(|_| GmError::Ipc("Task session lock failed".into()))? =
+                    Some((task_id.into(), session_id));
+                Ok(())
+            }
+            _ => Err(GmError::Ipc(
+                "Helper could not begin task session; update/restart matching helper binaries"
+                    .into(),
+            )),
+        }
+    }
+    async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        let session = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let Some((logical, session)) = session else {
+            return Ok(());
+        };
+        if logical != task_id {
+            return Ok(());
+        }
+        match IpcPlatformClient::new(&self.socket_path)
+            .send_request(HelperRequest::CancelTask { task_id: session })
+            .await?
+        {
+            HelperResponse::Cancelled => Ok(()),
+            _ => Err(GmError::Ipc(
+                "Helper did not acknowledge task cancellation".into(),
+            )),
+        }
+    }
     async fn permissions(&self) -> Result<PermissionStatus> {
         match self.send_request(HelperRequest::GetPermissions).await? {
             HelperResponse::Permissions(status) => Ok(status),
@@ -119,13 +147,23 @@ impl Platform for IpcPlatformClient {
         max_long_edge: Option<u32>,
         quality: Option<u8>,
     ) -> Result<FrameCapture> {
-        match self
-            .send_request(HelperRequest::CaptureLatestFrame {
+        let task = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let request = match task {
+            Some((_, task_id)) => HelperRequest::CaptureTaskFrame {
+                task_id,
                 max_long_edge,
                 quality,
-            })
-            .await?
-        {
+            },
+            None => HelperRequest::CaptureLatestFrame {
+                max_long_edge,
+                quality,
+            },
+        };
+        match self.send_request(request).await? {
             HelperResponse::Frame(frame) => Ok(frame),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for capture: {other:?}"
@@ -134,10 +172,16 @@ impl Platform for IpcPlatformClient {
     }
 
     async fn ax_snapshot(&self, window_id: Option<u32>) -> Result<AxSnapshot> {
-        match self
-            .send_request(HelperRequest::GetAxSnapshot { window_id })
-            .await?
-        {
+        let task = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let request = match task {
+            Some((_, task_id)) => HelperRequest::GetTaskAxSnapshot { task_id, window_id },
+            None => HelperRequest::GetAxSnapshot { window_id },
+        };
+        match self.send_request(request).await? {
             HelperResponse::AxSnapshot(snap) => Ok(snap),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for ax_snapshot: {other:?}"
@@ -146,10 +190,19 @@ impl Platform for IpcPlatformClient {
     }
 
     async fn act(&self, action: &ComputerAction) -> Result<()> {
-        match self
-            .send_request(HelperRequest::ExecuteAction(action.clone()))
-            .await?
-        {
+        let task_id = self
+            .active_task
+            .read()
+            .map_err(|_| GmError::Ipc("Task session lock failed".into()))?
+            .clone();
+        let request = match task_id {
+            Some((_, task_id)) => HelperRequest::ExecuteTaskAction {
+                task_id,
+                action: action.clone(),
+            },
+            None => HelperRequest::ExecuteAction(action.clone()),
+        };
+        match self.send_request(request).await? {
             HelperResponse::ActionExecuted { success: true, .. } => Ok(()),
             HelperResponse::ActionExecuted {
                 success: false,
@@ -164,7 +217,10 @@ impl Platform for IpcPlatformClient {
     }
 
     async fn cancel(&self) -> Result<()> {
-        match self.send_request(HelperRequest::CancelActions).await? {
+        match IpcPlatformClient::new(&self.socket_path)
+            .send_request(HelperRequest::CancelActions)
+            .await?
+        {
             HelperResponse::Cancelled => Ok(()),
             other => Err(GmError::Ipc(format!(
                 "Unexpected response for cancel: {other:?}"

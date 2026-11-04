@@ -1,16 +1,18 @@
 pub mod client;
 pub mod mock;
 pub mod permissions;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod pixels;
 pub mod shm;
 pub mod traits;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub mod linux;
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 pub mod windows;
 
 pub use client::IpcPlatformClient;
@@ -22,8 +24,8 @@ pub use traits::Platform;
 #[cfg(target_os = "macos")]
 pub use mac::MacPlatform;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 pub use windows::WindowsPlatform;

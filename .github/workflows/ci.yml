@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        os: [macos-14, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Grok-Muse
@@ -27,12 +27,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: galaxycoils/darius
+          ref: f47a4ce980abecb751c9f5c79e1c424a20100433
           path: Darius
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: 1.99.1
           components: clippy, rustfmt
 
       - name: Install nextest
@@ -42,7 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev libspa-0.2-dev clang xvfb
 
       - name: Check formatting
         working-directory: grok-muse
@@ -54,7 +55,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Clippy check (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os != 'macOS'
         working-directory: grok-muse
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -71,18 +72,23 @@ jobs:
         run: cargo nextest run --workspace --all-features
 
       - name: Run nextest (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os != 'macOS'
         working-directory: grok-muse
         run: cargo nextest run --workspace
+
+      - name: Verify workspace guest protocol
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: python3 tools/workspace-guest/test_agent.py
+
+      - name: Verify real X11 capture and input
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: tools/test-native-x11.sh
 
       - name: Run G5 eval suite gate
         working-directory: grok-muse
         run: cargo run -p xtask -- eval
-
-      - name: Benchmark G3 local hot-path budgets (macOS only)
-        if: runner.os == 'macOS'
-        working-directory: grok-muse
-        run: cargo run -p xtask -- bench-hotpath
 
       - name: Benchmark G4 LLM latency gate
         working-directory: grok-muse

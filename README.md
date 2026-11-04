@@ -1,7 +1,9 @@
 # Grok-Muse Hybrid Agent (`v0.3.0` — OpenBot Multi-Agent & Coworker Suite)
 
 > **Fast computer-use + proactive personal agent + OpenBot multi-agent coworker suite for macOS.**  
-> Built in Rust with native macOS ScreenCaptureKit, Accessibility APIs, CoreGraphics, EventKit, Seatbelt (`sandbox-exec`) workspace confinement, Candle Metal local VLM inference, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
+> Built in Rust with native Rust desktop rendering, macOS ScreenCaptureKit/Accessibility integration, scoped workspace file access, an offline workspace VM transport, Candle model support, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
+
+The current branch adds a durable task dispatcher, native desktop client, persistent conversations, bot/channel editing, attachments, scheduled routines, durable usage accounting and authenticated update staging. Windows UI Automation/GDI/input and Linux X11/AT-SPI plus Wayland portal/PipeWire backends are implemented; native Windows/macOS and real Wayland certification remain outstanding. The VM transport requires a separately provisioned signed image. See [implementation status](docs/implementation-status.md) for implemented behavior, setup, and remaining public-release work. Performance/quality numbers below are targets, not certified results.
 
 ---
 
@@ -36,12 +38,12 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 3. **Multi-Bot Channels, A2A Artifact Handoffs & Context Compaction**:
    - Persistent `#general`, `#research`, and `#ops` channels (`gm channels`) with automatic `@<bot_id>` mention parsing and task spawning.
    - Structured Agent-to-Agent (`A2aCoordinator`) handoffs that copy artifacts from `<from_bot>/outbox/` into `<to_bot>/inbox/` with loop-depth guards (`max_handoff_depth = 4`), paired with `ContextCompactor` token-budget summarization.
-4. **macOS Kernel Seatbelt (`sandbox-exec`) Confinement & Governance Gateway**:
-   - Every bot shell tool (`WorkspaceShell`) executes inside a dynamically generated macOS Seatbelt SBPL profile (`/usr/bin/sandbox-exec`) restricting file writes strictly to the bot's `workspace/` and `outbox/`.
+4. **Scoped Workspace Tools & Governance Gateway**:
+   - Native file tools use directory capabilities. `WorkspaceShell` requires the separately provisioned offline VM transport; there is no host-shell fallback.
    - `SecurityGateway` evaluates every GUI, MCP, and workspace action against explicit policy rules (`RULE-BLK-001` through `RULE-SEC-006`) and logs `Permitted`, `Refused`, and `Failed` records with rule citations.
 5. ***"Take the Wheel"* Human Handoff & Opaque Vault Secrets**:
    - Detects 2FA/MFA/CAPTCHA/login walls, pauses the bot (`WaitingForHuman`), surfaces a `🛞 Take the Wheel` HUD/alert prompt, and resumes seamlessly once the human hands control back.
-   - Supports opaque `secret://keychain/<account>` and `secret://1password/<vault>/<item>/<field>` secret leases injected directly into target fields while `SecretScrubber` guarantees `0` plaintext leaks in LLM prompts, trajectories, or audit logs.
+   - Supports opaque `secret://keychain/<account>` and `secret://1password/<vault>/<item>/<field>` secret leases injected directly into target fields with registered-secret scrubbing. Credential injection requires explicit approval; leakage resistance still requires adversarial verification.
 6. **Loopback Companion Web / AG-UI SSE Server & Chat Bridges**:
    - Built-in `axum` server (`gm serve`, default `127.0.0.1:7433`) serving the live Companion Web UI (`/`), Governance Audit Dashboard (`/admin/audit`), A2A Agent Card (`/.well-known/agent.json`), AG-UI SSE stream (`/ag-ui/events`), and HMAC-SHA256 verified Slack / Telegram / Discord webhook bridges.
 
@@ -51,7 +53,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 | Metric | Target | Description & Measurement |
 |---|---|---|
-| **G1 Native** | Zero Electron/Chromium | Signed App Bundle = daemon + CU helper (`.app`) + native AppKit UI (`gm-ui`). |
+| **G1 Native** | Zero Electron/Chromium | Signed App Bundle = daemon + CU helper (`.app`) + shared native Rust UI (`gm-ui`), with legacy AppKit commands retained. |
 | **G2 Footprint** | `< 50 MB` idle RSS | Whole process tree idle RSS measured via `footprint`/`ps` (< 120 MB with UI open). |
 | **G3 Hot Path** | `< 2 ms` capture, `< 30 ms` AX | ScreenCaptureKit frame fetch < 2ms, AX snapshot < 30ms, JPEG q=70 < 15ms, action dispatch < 5ms. |
 | **G4 Agent Step** | `< 1.5 s` median | Fast route median step latency including routed model inference. |
@@ -66,7 +68,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 ```text
  ┌─────────────────────────────────────────────────────────────┐
- │           gm-ui: AppKit Desktop Shell (Tray & UI)           │
+ │           gm-ui: Native Rust UI (WGPU / AccessKit)           │
  │      • Status Item Tray Menu     • Floating Action Overlay  │
  │      • Floating Chat Window      • Global Hotkey Monitors   │
  └──────────────────────────────┬──────────────────────────────┘
@@ -86,7 +88,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
  └──────────────────────────────┬──────────────────────────────┘
                                 │ UDS JSON-RPC (/tmp/grok-muse-helper.sock)
  ┌──────────────────────────────▼──────────────────────────────┐
- │       GrokMuseCUHelper.app (Privileged, Signed Bundle)      │
+ │       GrokMuseCUHelper.app (Per-user Native Helper)      │
  │      • ScreenCaptureKit: Zero-copy in-memory/file frame     │
  │      • Accessibility (AXUIElement): Window tree & tokens    │
  │      • Input (CGEvent / AXPress): Low-latency action dispatch│
@@ -100,7 +102,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 - **[`crates/gm-core`](crates/gm-core)**: Shared domain types (`AxSnapshot`, `ComputerAction`, `MailItem`, `CalendarItem`), IPC protocol, config schemas.
 - **[`crates/gm-platform`](crates/gm-platform)**: `Platform` trait (`capture`, `ax_snapshot`, `act`, `windows`, `user_idle`, `permissions`), native `MacPlatform`, and offline `MockPlatform`.
-- **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Privileged macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
+- **[`crates/gm-cu-helper`](crates/gm-cu-helper)**: Per-user macOS helper binary running as `GrokMuseCUHelper.app` to hold stable TCC permissions across daemon updates.
 - **[`crates/gm-llm`](crates/gm-llm)**: OpenAI-compatible wire client, provider router (Meta Muse + xAI Grok), budget governor, Keychain secret integration, and pluggable `LocalVlmBackend` interface with `local-vlm` feature flag (Action A12 prep, Candle/MLX ready).
 - **[`crates/gm-safety`](crates/gm-safety)**: Approval tier classifier, emergency kill switch, secure text field redaction, blocklist manager, append-only `AuditLogger`, weekly/monthly report synthesis.
 - **[`crates/gm-memory`](crates/gm-memory)**: SQLite FTS memory store, deduplication, knowledge clustering, and stale observation pruning.
@@ -117,6 +119,21 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 ---
 
 ## Installation & Packaging (DMG)
+
+### Source checkout prerequisites
+
+The workspace currently expects the separate Darius repository beside this checkout
+(the same layout used by CI):
+
+```bash
+git clone https://github.com/galaxycoils/darius.git Darius
+git clone https://github.com/galaxycoils/grok-muse.git grok-muse
+cd grok-muse
+cargo test -p gm-openbot --locked
+```
+
+The dependency is not pinned to a Darius revision yet; this is tracked in the
+[reliability review](docs/openmausbot-comparison.md).
 
 ### Building the DMG
 ```bash
@@ -224,12 +241,29 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 | `gm models` | `<list\|pull\|rm> [--json]` | Manage offline local Vision-Language Models (`qwen2-vl-2b`, `smolvlm2-2.2b`). |
 | `gm bots` | `<list\|show\|create\|rm> [--json]` | Manage OpenBot persistent agent roster and isolated per-bot workspaces. |
 | `gm queue` | `<list\|add\|pause\|resume\|cancel\|reassign\|backup\|restore>` | Manage crash-safe SQLite FIFO task queues across bots. |
-| `gm channels` | `<list\|post\|history\|assign\|archive\|restore>` | Post to multi-bot channels (`#general`, `#research`, `#ops`) and trigger `@bot` mentions. |
+| `gm channels` | `<list\|post\|history\|assign\|set-instructions\|archive\|restore>` | Manage multi-bot channels, persistent instructions, and `@bot` mentions. |
+| `gm team` | `<export\|preview\|import> [--json]` | Safe portable team templates (credential-scrubbed, disabled triggers on import). |
+| `gm routines` | `<list\|runs> [--json]` | Scheduled recurring routines, quiet hours, and execution run history. |
+| `gm diagnostics` | `<check\|export> [--json]` | Local health checks and redacted support bundle export with SHA-256 fingerprint. |
 | `gm serve` | `[--bind 127.0.0.1:7433]` | Launch the loopback OpenBot Companion Web UI, AG-UI SSE stream, and `/admin/audit` dashboard. |
 
 ---
 
 ## OpenBot Multi-Agent Coworkers, Queue, Channels & Companion Web UI
+
+The companion now supports channel conversations and creating channels with a topic,
+members, and default responder. It refreshes automatically, preserves failed sends,
+and supports the server's optional bearer token. **Automatic queue execution is not
+connected yet:** messages and tasks are persisted, but `gm serve` does not run agents.
+See the [OpenMausBot comparison and reliability review](docs/openmausbot-comparison.md)
+for the feature roadmap and runtime blockers.
+
+For token-protected local use, set `GROK_MUSE_COMPANION_TOKEN` in the server process's
+environment before starting `gm serve` or `gm daemon`, then enter that token in the
+companion's Connect form. The page keeps it only until reload. Keep the default
+loopback bind; remote access/pairing is not established by this setting. Slack's
+optional signing secret uses `GROK_MUSE_SLACK_SIGNING_SECRET`; replay protection is
+still outstanding (see the review).
 
 ```bash
 # List the persistent bot roster (muse, researcher, coder, guardian)

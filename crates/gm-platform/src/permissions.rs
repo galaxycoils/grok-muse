@@ -122,7 +122,7 @@ impl PrivacyPane {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            true
+            false
         }
     }
 
@@ -139,7 +139,7 @@ impl PrivacyPane {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            true
+            false
         }
     }
 }

@@ -102,7 +102,13 @@ impl ContextCompactor {
             summary_lines.push(format!("- Turn {}: [{}] {}", idx + 1, m.role, clean));
         }
 
-        let checkpoint_msg = ChatMessage::text("system", summary_lines.join("\n"));
+        let checkpoint_msg = ChatMessage::text(
+            "user",
+            gm_safety::format_untrusted_context(
+                &summary_lines.join("\n"),
+                "compacted_session_history",
+            ),
+        );
 
         messages.extend(system_msgs);
         messages.push(checkpoint_msg);

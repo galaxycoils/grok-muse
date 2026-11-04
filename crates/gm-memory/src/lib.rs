@@ -32,12 +32,10 @@ impl PersonalMemoryStore {
     pub fn default_store() -> Result<Self> {
         let dir = if let Ok(custom) = std::env::var("GROK_MUSE_DATA_DIR") {
             std::path::PathBuf::from(custom)
-        } else if let Ok(home) = std::env::var("HOME") {
-            std::path::PathBuf::from(home).join("Library/Application Support/GrokMuse")
         } else {
-            std::path::PathBuf::from(".")
+            gm_core::config::GmConfig::load(None)?.storage_dir
         };
-        std::fs::create_dir_all(&dir).map_err(GmError::Io)?;
+        gm_core::storage::ensure_private_dir(&dir)?;
         Self::open(dir.join("memory.sqlite"))
     }
 

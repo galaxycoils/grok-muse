@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+uuid = { workspace = true }
 gm-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "io-util", "time"] }
@@ -22,3 +24,14 @@ cc = "1.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13.2", features = ["xtest", "screensaver", "randr"] }
+atspi = { version = "0.25", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+pipewire = { version = "0.8", features = ["v0_3_65"] }
+futures-util = "0.3"
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_WinRT", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_SystemInformation", "UI_Notifications", "Data_Xml_Dom"] }

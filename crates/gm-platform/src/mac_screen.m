@@ -257,7 +257,9 @@ int gm_mac_start_stream(void) {
                 return;
             }
             
-            SCDisplay *display = content.displays.firstObject;
+            SCDisplay *display = nil;
+            for (SCDisplay *candidate in content.displays) { if (candidate.displayID == CGMainDisplayID()) { display = candidate; break; } }
+            if (!display) { dispatch_semaphore_signal(sem); return; }
             g_cached_backing_scale = gm_query_display_backing_scale(display.displayID);
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
             SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
@@ -381,7 +383,9 @@ int gm_mac_capture_jpeg_scaled(
                     dispatch_semaphore_signal(sem);
                     return;
                 }
-                SCDisplay *display = content.displays.firstObject;
+                SCDisplay *display = nil;
+            for (SCDisplay *candidate in content.displays) { if (candidate.displayID == CGMainDisplayID()) { display = candidate; break; } }
+            if (!display) { dispatch_semaphore_signal(sem); return; }
                 SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
                 SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
                 config.width = (size_t)((display.width > 0 ? display.width : 1680) * backingScale);
@@ -536,7 +540,9 @@ int gm_mac_get_latest_frame(uint8_t **out_data, size_t *out_len, uint32_t *out_w
                 dispatch_semaphore_signal(sem);
                 return;
             }
-            SCDisplay *display = content.displays.firstObject;
+            SCDisplay *display = nil;
+            for (SCDisplay *candidate in content.displays) { if (candidate.displayID == CGMainDisplayID()) { display = candidate; break; } }
+            if (!display) { dispatch_semaphore_signal(sem); return; }
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
             SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
             config.width = display.width > 0 ? display.width : 1680;
@@ -1408,4 +1414,10 @@ int gm_mac_send_notification(const char *title, const char *subtitle, const char
         [appleScript executeAndReturnError:&errorInfo];
         return 0;
     }
+}
+
+// Coordinate space of the primary display selected by the capture stream.
+void gm_mac_primary_display_bounds(double *x, double *y, double *w, double *h) {
+    CGRect r = CGDisplayBounds(CGMainDisplayID());
+    *x = r.origin.x; *y = r.origin.y; *w = r.size.width; *h = r.size.height;
 }

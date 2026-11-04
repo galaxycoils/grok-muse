@@ -1,9 +1,10 @@
+mod native;
 use clap::{Parser, Subcommand};
 use gm_core::config::GmConfig;
 use gm_core::error::Result;
-use gm_core::ipc::{
-    DaemonEvent, DaemonRequest, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message,
-};
+use gm_core::ipc::DaemonRequest;
+#[cfg(unix)]
+use gm_core::ipc::{DaemonEvent, DaemonResponse, IpcMessage, read_ipc_message, write_ipc_message};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::path::Path;
@@ -57,12 +58,16 @@ unsafe extern "C" {
     about = "Grok-Muse Desktop Shell UI (Tray, Action Overlay, Onboarding & Hotkeys)"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Launch the shared native desktop application
+    Native,
     /// Launch tray icon, action overlay, and global hotkey monitor
     Tray,
     /// Open floating chat / action window
@@ -174,6 +179,7 @@ extern "C" fn approval_decision_callback(
     }
 }
 
+#[cfg(unix)]
 fn handle_daemon_event(ev: DaemonEvent) {
     #[cfg(target_os = "macos")]
     match ev {
@@ -196,7 +202,7 @@ fn handle_daemon_event(ev: DaemonEvent) {
                 gm_ui_set_hud_state(state_code, c_status.as_ptr(), c_detail.as_ptr());
             }
         }
-        DaemonEvent::ChatToken { delta, done } => {
+        DaemonEvent::ChatToken { delta, done } | DaemonEvent::ChatTokenV1 { delta, done, .. } => {
             let c_delta = CString::new(delta.replace('\0', "")).unwrap_or_default();
             unsafe {
                 gm_ui_append_chat_delta(c_delta.as_ptr());
@@ -288,6 +294,7 @@ fn handle_daemon_event(ev: DaemonEvent) {
                 gm_ui_append_chat_message(role.as_ptr(), msg.as_ptr());
             }
         }
+        DaemonEvent::ApprovalResolved { .. } => {}
         DaemonEvent::ChannelMessage {
             channel_id,
             author,
@@ -307,13 +314,9 @@ fn handle_daemon_event(ev: DaemonEvent) {
     }
 }
 
-async fn ensure_daemon_running(config: &GmConfig) {
-    #[cfg(unix)]
+async fn ensure_daemon_running(config: &GmConfig, config_path: Option<&Path>) {
     {
-        if tokio::net::UnixStream::connect(&config.daemon_socket_path)
-            .await
-            .is_ok()
-        {
+        if native::is_running(config).await {
             return;
         }
 
@@ -328,15 +331,15 @@ async fn ensure_daemon_running(config: &GmConfig) {
 
         info!("Auto-spawning gm-daemon at {:?}", daemon_bin);
         let mut cmd = std::process::Command::new(&daemon_bin);
+        if let Some(path) = config_path {
+            cmd.arg("--config").arg(path);
+        }
         cmd.arg("daemon");
         if let Ok(_child) = cmd.spawn() {
             let start = tokio::time::Instant::now();
             while start.elapsed() < tokio::time::Duration::from_millis(2000) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                if tokio::net::UnixStream::connect(&config.daemon_socket_path)
-                    .await
-                    .is_ok()
-                {
+                if native::is_running(config).await {
                     info!("gm-daemon auto-spawned and responding");
                     return;
                 }
@@ -381,41 +384,45 @@ async fn run_ui_tokio_client(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
 ) {
     // 1. Ensure daemon is running
-    ensure_daemon_running(&config).await;
+    ensure_daemon_running(&config, None).await;
 
     // 2. Background event subscriber with auto-reconnect
-    let daemon_socket = config.daemon_socket_path.clone();
-    tokio::spawn(async move {
-        loop {
-            #[cfg(unix)]
-            if let Ok(mut stream) = tokio::net::UnixStream::connect(&daemon_socket).await {
-                info!("Connected to gm-daemon event bus");
-                let sub_req = IpcMessage {
-                    id: 1,
-                    payload: DaemonRequest::SubscribeEvents,
-                };
-                if write_ipc_message(&mut stream, &sub_req).await.is_ok() {
-                    // Read initial Ack
-                    let _ack: Result<IpcMessage<DaemonResponse>> =
-                        read_ipc_message(&mut stream).await;
-                    loop {
-                        match read_ipc_message::<_, IpcMessage<DaemonResponse>>(&mut stream).await {
-                            Ok(msg) => {
-                                if let DaemonResponse::Event(ev) = msg.payload {
-                                    handle_daemon_event(ev);
+    #[cfg(unix)]
+    {
+        let daemon_socket = config.daemon_socket_path.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(mut stream) = tokio::net::UnixStream::connect(&daemon_socket).await {
+                    info!("Connected to gm-daemon event bus");
+                    let sub_req = IpcMessage {
+                        id: 1,
+                        payload: DaemonRequest::SubscribeEvents,
+                    };
+                    if write_ipc_message(&mut stream, &sub_req).await.is_ok() {
+                        // Read initial Ack
+                        let _ack: Result<IpcMessage<DaemonResponse>> =
+                            read_ipc_message(&mut stream).await;
+                        loop {
+                            match read_ipc_message::<_, IpcMessage<DaemonResponse>>(&mut stream)
+                                .await
+                            {
+                                Ok(msg) => {
+                                    if let DaemonResponse::Event(ev) = msg.payload {
+                                        handle_daemon_event(ev);
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("Daemon event stream disconnected: {e}");
-                                break;
+                                Err(e) => {
+                                    warn!("Daemon event stream disconnected: {e}");
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    });
+        });
+    }
 
     // 3. Process commands dispatched from AppKit callbacks
     while let Some(cmd) = cmd_rx.recv().await {
@@ -500,9 +507,18 @@ async fn run_ui_tokio_client(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Commands::Tray);
+    let cmd = cli.command.unwrap_or(Commands::Native);
 
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(cli.config.as_deref())?;
+    if matches!(cmd, Commands::Native) {
+        ensure_daemon_running(&config, cli.config.as_deref()).await;
+        return native::run(
+            config,
+            cli.config
+                .clone()
+                .unwrap_or_else(gm_core::config::default_config_path),
+        );
+    }
     let _ = CONFIG.set(config.clone());
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
 
@@ -536,6 +552,7 @@ async fn main() -> Result<()> {
     });
 
     match cmd {
+        Commands::Native => unreachable!(),
         Commands::Tray => {
             info!("Launching Grok-Muse tray desktop shell");
             #[cfg(target_os = "macos")]

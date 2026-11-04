@@ -62,11 +62,10 @@ impl AuditLogger {
     pub fn default_logger() -> std::io::Result<Self> {
         let dir = if let Ok(custom) = std::env::var("GROK_MUSE_DATA_DIR") {
             PathBuf::from(custom)
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join("Library/Application Support/GrokMuse")
         } else {
-            PathBuf::from(".")
+            gm_core::config::GmConfig::default().storage_dir
         };
+        gm_core::storage::ensure_private_dir(&dir).map_err(std::io::Error::other)?;
         Self::with_file(dir.join("audit.jsonl"))
     }
 

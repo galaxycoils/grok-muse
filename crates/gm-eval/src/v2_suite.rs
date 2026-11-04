@@ -95,7 +95,12 @@ async fn eval_som_sparse_ui_grounding() -> TaskResult {
             sparse_ax_threshold: 5,
             ..Default::default()
         },
-    );
+    )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: true,
+        allow_shell: false,
+        allow_network: true,
+    });
 
     let res = agent
         .run_task("v2_som_01", "Compute 42 * 19 in Calculator")
@@ -159,7 +164,11 @@ async fn eval_stagnation_vision_escalation() -> TaskResult {
 
     let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
     let llm = Arc::new(HybridLlmClient::new(mock_llm, budget));
-    let router = LlmRouter::new(ProvidersConfig::default());
+    let router = LlmRouter::new(ProvidersConfig {
+        allow_screenshot_egress_meta: true,
+        allow_screenshot_egress_xai: true,
+        ..Default::default()
+    });
 
     let agent = AgentLoop::new(
         platform,
@@ -173,7 +182,12 @@ async fn eval_stagnation_vision_escalation() -> TaskResult {
             capture_frames: true,
             ..Default::default()
         },
-    );
+    )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: true,
+        allow_shell: false,
+        allow_network: true,
+    });
 
     let res = agent
         .run_task("v2_stag_02", "Create a new note in Apple Notes")
@@ -229,7 +243,11 @@ async fn eval_interactive_irreversible_approval() -> TaskResult {
     let approval_handler = Arc::new(CallbackInteractionHandler::with_approval_always(true));
     let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
     let llm = Arc::new(HybridLlmClient::new(mock_llm, budget));
-    let router = LlmRouter::new(ProvidersConfig::default());
+    let router = LlmRouter::new(ProvidersConfig {
+        allow_screenshot_egress_meta: true,
+        allow_screenshot_egress_xai: true,
+        ..Default::default()
+    });
 
     let agent = AgentLoop::new(
         platform,
@@ -243,6 +261,11 @@ async fn eval_interactive_irreversible_approval() -> TaskResult {
             ..Default::default()
         },
     )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: true,
+        allow_shell: false,
+        allow_network: true,
+    })
     .with_audit(audit.clone())
     .with_interaction_handler(approval_handler);
 
@@ -339,7 +362,11 @@ async fn eval_hybrid_mcp_and_gui_workflow() -> TaskResult {
     let audit = Arc::new(AuditLogger::in_memory());
     let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
     let llm = Arc::new(HybridLlmClient::new(mock_llm, budget));
-    let router = LlmRouter::new(ProvidersConfig::default());
+    let router = LlmRouter::new(ProvidersConfig {
+        allow_screenshot_egress_meta: true,
+        allow_screenshot_egress_xai: true,
+        ..Default::default()
+    });
 
     let agent = AgentLoop::new(
         platform,
@@ -353,6 +380,11 @@ async fn eval_hybrid_mcp_and_gui_workflow() -> TaskResult {
             ..Default::default()
         },
     )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: true,
+        allow_shell: false,
+        allow_network: true,
+    })
     .with_mcp_bridge(mcp_bridge)
     .with_audit(audit.clone());
 

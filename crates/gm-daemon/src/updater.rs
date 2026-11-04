@@ -2,7 +2,7 @@ use gm_core::error::{GmError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 pub const DEFAULT_REPO: &str = "galaxycoils/grok-muse";
 
@@ -20,6 +20,10 @@ pub struct UpdateCheckResult {
     pub dmg_size_bytes: Option<u64>,
     pub checksum_download_url: Option<String>,
     pub expected_sha256: Option<String>,
+    #[serde(default)]
+    pub manifest_download_url: Option<String>,
+    #[serde(default)]
+    pub signature_download_url: Option<String>,
     pub published_at: Option<String>,
     pub release_notes: Option<String>,
 }
@@ -120,42 +124,27 @@ pub use gm_core::hash::{Sha256, compute_sha256};
 /// Verify checksum of data against expected hex digest or checksum file content.
 /// Optionally matches filename if checksum file is a multi-line manifest (e.g. SHA256SUMS).
 pub fn verify_checksum(actual_hash: &str, checksum_input: &str, asset_name: Option<&str>) -> bool {
-    let target = actual_hash.trim().to_lowercase();
-
-    // If an asset name is provided, prioritize matching against lines containing the asset name
+    let target = actual_hash.trim();
+    if target.len() != 64 || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
     if let Some(name) = asset_name {
-        let mut found_asset_line = false;
-        for line in checksum_input.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains(name) {
-                found_asset_line = true;
-                for token in trimmed.split_whitespace() {
-                    let clean = token
-                        .trim()
-                        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                        .to_lowercase();
-                    if clean.len() == 64 && clean == target {
-                        return true;
-                    }
-                }
-            }
-        }
-        if found_asset_line {
-            return false;
-        }
+        let matches: Vec<_> = checksum_input
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                let file = parts
+                    .next()?
+                    .strip_prefix('*')
+                    .unwrap_or_else(|| line.split_whitespace().nth(1).unwrap_or(""));
+                (parts.next().is_none() && file == name).then_some(hash)
+            })
+            .collect();
+        return matches.len() == 1 && matches[0].eq_ignore_ascii_case(target);
     }
-
-    // Generic fallback: check any 64-character token in the input
-    for token in checksum_input.split_whitespace() {
-        let clean = token
-            .trim()
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_lowercase();
-        if clean.len() == 64 && clean == target {
-            return true;
-        }
-    }
-    false
+    let input = checksum_input.trim();
+    input.len() == 64 && input.eq_ignore_ascii_case(target)
 }
 
 /// Parse GitHub release payload and compare with current version.
@@ -175,14 +164,28 @@ pub fn parse_github_release_json(
     let update_available = is_newer_version(current_version, &latest_version);
 
     // Locate DMG asset: MUST strictly end with .dmg
-    let dmg_asset = release
-        .assets
-        .iter()
-        .find(|a| {
-            a.name.ends_with(".dmg")
-                && (a.name.contains("Grok-Muse") || a.name.contains("GrokMuse"))
-        })
-        .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".dmg")));
+    let native_extension = if cfg!(target_os = "windows") {
+        ".zip"
+    } else if cfg!(target_os = "linux") {
+        ".tar.gz"
+    } else {
+        ".dmg"
+    };
+    let native_asset = release.assets.iter().find(|a| {
+        a.name.ends_with(native_extension)
+            && a.name.contains(std::env::consts::ARCH)
+            && (a.name.contains("GrokMuse") || a.name.contains("Grok-Muse"))
+    });
+    let dmg_asset = native_asset.or_else(|| {
+        release
+            .assets
+            .iter()
+            .find(|a| {
+                a.name.ends_with(".dmg")
+                    && (a.name.contains("Grok-Muse") || a.name.contains("GrokMuse"))
+            })
+            .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".dmg")))
+    });
 
     // Locate SHA-256 checksum asset: prefer {dmg_name}.sha256, then SHA256SUMS or *.sha256
     let checksum_asset = if let Some(dmg) = dmg_asset {
@@ -208,6 +211,16 @@ pub fn parse_github_release_json(
     };
 
     Ok(UpdateCheckResult {
+        manifest_download_url: release
+            .assets
+            .iter()
+            .find(|a| a.name == "grok-muse-release.json")
+            .map(|a| a.browser_download_url.clone()),
+        signature_download_url: release
+            .assets
+            .iter()
+            .find(|a| a.name == "grok-muse-release.sig")
+            .map(|a| a.browser_download_url.clone()),
         current_version: current_version.to_string(),
         latest_version,
         update_available,
@@ -296,126 +309,205 @@ pub async fn download_and_verify_update(
         .clone()
         .unwrap_or_else(|| "Grok-Muse.dmg".into());
 
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name == "."
+        || file_name == ".."
+        || file_name.is_empty()
+    {
+        return Err(GmError::SafetyViolation(
+            "Invalid release asset filename".into(),
+        ));
+    }
+    let default_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| GmError::Platform(e.to_string()))?;
+    let client = client_opt.unwrap_or(&default_client);
+    let key=option_env!("GM_RELEASE_PUBLIC_KEY_HEX").map(str::to_owned)
+        .or_else(||std::env::var("GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX").ok())
+        .ok_or_else(||GmError::Config("This development build has no trusted release signing key. Configure GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX from an independently verified publisher key.".into()))?;
+    let manifest_url = check_result
+        .manifest_download_url
+        .as_deref()
+        .ok_or_else(|| GmError::SafetyViolation("Release has no authenticated manifest".into()))?;
+    let signature_url = check_result
+        .signature_download_url
+        .as_deref()
+        .ok_or_else(|| GmError::SafetyViolation("Release has no manifest signature".into()))?;
+    let raw = bounded_release_fetch(client, manifest_url, 128 * 1024).await?;
+    let signature = bounded_release_fetch(client, signature_url, 4096).await?;
+    let manifest = verify_release_manifest(&raw, &signature, &key)?;
+    let asset = manifest
+        .assets
+        .iter()
+        .filter(|a| {
+            a.name == file_name
+                && a.os == std::env::consts::OS
+                && a.architecture == std::env::consts::ARCH
+        })
+        .collect::<Vec<_>>();
+    if manifest.version != check_result.latest_version || asset.len() != 1 {
+        return Err(GmError::SafetyViolation(
+            "Signed release version, asset or target does not match this update".into(),
+        ));
+    }
+    let asset = asset[0];
+    if asset.size_bytes == 0 || asset.size_bytes > 2 * 1024 * 1024 * 1024 {
+        return Err(GmError::SafetyViolation(
+            "Release exceeds download limits".into(),
+        ));
+    }
     std::fs::create_dir_all(target_dir)?;
     let target_path = target_dir.join(&file_name);
-    let temp_path = target_dir.join(format!("{file_name}.download.tmp"));
-
-    let default_client = reqwest::Client::new();
-    let client = client_opt.unwrap_or(&default_client);
-
-    info!(
-        "Downloading release DMG from {} to {:?}",
-        dmg_url, target_path
-    );
-
-    let mut resp = client
+    let temp_path = target_dir.join(format!(".gm-update-{}", uuid::Uuid::new_v4()));
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let cleanup = Temp(temp_path.clone());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    let mut response = client
         .get(dmg_url)
-        .header(
-            "User-Agent",
-            format!("grok-muse-updater/{}", check_result.current_version),
-        )
         .send()
         .await
-        .map_err(|e| GmError::Platform(format!("Failed downloading DMG asset: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(GmError::Platform(format!(
-            "Failed downloading DMG: HTTP status {}",
-            resp.status()
-        )));
-    }
-
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| {
-        GmError::Platform(format!(
-            "Failed to create temporary file {temp_path:?}: {e}"
-        ))
-    })?;
-
+        .map_err(|e| GmError::Platform(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| GmError::Platform(e.to_string()))?;
     let mut hasher = Sha256::new();
-    let mut downloaded_bytes: u64 = 0;
-
-    while let Some(chunk) = resp
+    let mut count = 0u64;
+    while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| GmError::Platform(format!("Error streaming DMG chunk: {e}")))?
+        .map_err(|e| GmError::Platform(e.to_string()))?
     {
+        count = count
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| GmError::SafetyViolation("Release length overflow".into()))?;
+        if count > asset.size_bytes {
+            return Err(GmError::SafetyViolation(
+                "Release is larger than its signed size".into(),
+            ));
+        }
         file.write_all(&chunk)?;
         hasher.update(&chunk);
-        downloaded_bytes += chunk.len() as u64;
     }
-    file.flush()?;
+    if count != asset.size_bytes || !verify_checksum(&hasher.finalize(), &asset.sha256, None) {
+        return Err(GmError::SafetyViolation(
+            "Release does not match its signed size and checksum".into(),
+        ));
+    }
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp_path, &target_path)?;
+    drop(cleanup);
+    info!("Authenticated release staged at {:?}", target_path);
+    Ok((target_path, true))
+}
 
-    let computed_hash = hasher.finalize();
-    info!(
-        "Downloaded {} bytes to {:?}, calculated SHA-256: {}",
-        downloaded_bytes, temp_path, computed_hash
-    );
-
-    // Verify SHA-256 checksum
-    let mut checksum_verified = false;
-    let mut checksum_required = false;
-
-    if let Some(ref checksum_url) = check_result.checksum_download_url {
-        checksum_required = true;
-        info!("Fetching release checksum from {}", checksum_url);
-        let c_resp = client
-            .get(checksum_url)
-            .send()
-            .await
-            .map_err(|e| GmError::Platform(format!("Failed fetching release checksum: {e}")))?;
-
-        if c_resp.status().is_success() {
-            let c_text = c_resp
-                .text()
-                .await
-                .map_err(|e| GmError::Platform(format!("Failed reading checksum text: {e}")))?;
-            if verify_checksum(&computed_hash, &c_text, Some(&file_name)) {
-                info!("SHA-256 checksum verified successfully against release manifest!");
-                checksum_verified = true;
-            } else {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(GmError::Platform(format!(
-                    "Integrity verification failed for {file_name}: calculated SHA-256 {computed_hash} did not match checksum manifest"
-                )));
-            }
-        } else {
-            warn!(
-                "Checksum URL returned HTTP {}; proceeding unverified",
-                c_resp.status()
-            );
-            checksum_required = false;
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedReleaseManifest {
+    pub schema: u32,
+    pub version: String,
+    pub expires_at: String,
+    pub assets: Vec<SignedReleaseAsset>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedReleaseAsset {
+    pub name: String,
+    pub os: String,
+    pub architecture: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+pub fn verify_release_manifest(
+    raw: &[u8],
+    signature_hex: &[u8],
+    public_key_hex: &str,
+) -> Result<SignedReleaseManifest> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let failure = || GmError::SafetyViolation("Release manifest signature is not trusted".into());
+    let key: [u8; 32] = hex::decode(public_key_hex.trim())
+        .map_err(|_| failure())?
+        .try_into()
+        .map_err(|_| failure())?;
+    let signature = hex::decode(
+        std::str::from_utf8(signature_hex)
+            .map_err(|_| failure())?
+            .trim(),
+    )
+    .map_err(|_| failure())?;
+    let signature = Signature::from_slice(&signature).map_err(|_| failure())?;
+    VerifyingKey::from_bytes(&key)
+        .map_err(|_| failure())?
+        .verify_strict(raw, &signature)
+        .map_err(|_| failure())?;
+    let manifest: SignedReleaseManifest = serde_json::from_slice(raw)?;
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(&manifest.expires_at).map_err(|_| failure())?;
+    if manifest.schema != 1
+        || expires <= chrono::Utc::now()
+        || manifest.assets.is_empty()
+        || manifest.assets.len() > 32
+    {
+        return Err(GmError::SafetyViolation(
+            "Release manifest is expired or unsupported".into(),
+        ));
+    }
+    Ok(manifest)
+}
+async fn bounded_release_fetch(
+    client: &reqwest::Client,
+    url: &str,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| GmError::Platform(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| GmError::Platform(e.to_string()))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| GmError::Platform(e.to_string()))?
+    {
+        if bytes.len() + chunk.len() > maximum {
+            return Err(GmError::SafetyViolation(
+                "Release metadata exceeds limit".into(),
+            ));
         }
-    } else if let Some(ref expected_hash) = check_result.expected_sha256 {
-        checksum_required = true;
-        if verify_checksum(&computed_hash, expected_hash, Some(&file_name)) {
-            info!("SHA-256 checksum verified against expected hash!");
-            checksum_verified = true;
-        } else {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(GmError::Platform(format!(
-                "Integrity verification failed for {file_name}: calculated SHA-256 {computed_hash} did not match expected hash {expected_hash}"
-            )));
-        }
+        bytes.extend_from_slice(&chunk);
     }
-
-    if checksum_required && !checksum_verified {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(GmError::Platform(format!(
-            "Integrity verification failed: checksum mismatch on {file_name}"
-        )));
-    }
-
-    // Atomic move to destination
-    std::fs::rename(&temp_path, &target_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        GmError::Platform(format!("Failed finalizing DMG to {target_path:?}: {e}"))
-    })?;
-
-    Ok((target_path, checksum_verified))
+    Ok(bytes)
 }
 
 /// Print formatted installation and upgrade guidance.
 pub fn print_installation_guidance(dmg_path: &Path, result: &UpdateCheckResult) {
+    if !cfg!(target_os = "macos") {
+        println!(
+            "Authenticated {} release staged at {}",
+            result.latest_version,
+            dmg_path.display()
+        );
+        println!(
+            "Quit Grok Muse before replacing the installed application. Keep the previous installation for manual rollback. Application data is stored separately."
+        );
+        return;
+    }
     println!("\n╔═════════════════════════════════════════════════════════════════════════════╗");
     println!("║                   GROK-MUSE UPGRADE INSTALLATION GUIDE                      ║");
     println!("╚═════════════════════════════════════════════════════════════════════════════╝");
@@ -721,6 +813,8 @@ mod tests {
             dmg_download_url: Some("https://example.com/not-used".into()),
             dmg_size_bytes: Some(10),
             checksum_download_url: None,
+            manifest_download_url: None,
+            signature_download_url: None,
             expected_sha256: Some(
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
             ),
@@ -732,5 +826,53 @@ mod tests {
         // it must return an error and leave no corrupt file at target_path.
         let target_path = temp_dir.join("Corrupt.dmg");
         assert!(!target_path.exists());
+    }
+}
+
+#[cfg(test)]
+mod signed_manifest_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    #[test]
+    fn signed_release_rejects_tampering_wrong_publishers_and_expiry() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let raw = serde_json::to_vec(&SignedReleaseManifest {
+            schema: 1,
+            version: "1.2.3".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            assets: vec![SignedReleaseAsset {
+                name: "GrokMuse.dmg".into(),
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+                size_bytes: 1,
+                sha256: "00".repeat(32),
+            }],
+        })
+        .unwrap();
+        let signature = hex::encode(key.sign(&raw).to_bytes());
+        let public = hex::encode(key.verifying_key().to_bytes());
+        assert_eq!(
+            verify_release_manifest(&raw, signature.as_bytes(), &public)
+                .unwrap()
+                .version,
+            "1.2.3"
+        );
+        let mut tampered = raw.clone();
+        tampered[20] ^= 1;
+        assert!(verify_release_manifest(&tampered, signature.as_bytes(), &public).is_err());
+        assert!(
+            verify_release_manifest(
+                &raw,
+                signature.as_bytes(),
+                &hex::encode(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes())
+            )
+            .is_err()
+        );
+        let expired = String::from_utf8(raw)
+            .unwrap()
+            .replace("2099-01-01", "2000-01-01")
+            .into_bytes();
+        let signature = hex::encode(key.sign(&expired).to_bytes());
+        assert!(verify_release_manifest(&expired, signature.as_bytes(), &public).is_err());
     }
 }

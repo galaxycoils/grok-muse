@@ -79,7 +79,11 @@ impl EvalRunner {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -97,7 +101,12 @@ impl EvalRunner {
                 capture_frames: false,
                 ..Default::default()
             },
-        );
+        )
+        .with_capabilities(gm_agent::AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let start = Instant::now();
         let outcome = agent
