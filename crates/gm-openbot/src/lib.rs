@@ -6,6 +6,7 @@ pub mod channels;
 pub mod compaction;
 pub mod queue;
 pub mod roster;
+pub mod runtime;
 pub mod supervisor;
 pub mod web;
 
@@ -442,8 +443,8 @@ mod tests {
         assert_eq!(audit_res[0]["rule_id"], "RULE-PATH-002");
 
         // 3. Verify Slack webhook HMAC-SHA256 signature + @coder task enqueue
-        let slack_body = r#"{"event":{"channel":"C123","user":"U99","text":"@coder run linter"}}"#;
-        let ts = "1700000000";
+        let slack_body = r#"{"event_id":"Ev-test-1","event":{"channel":"C123","user":"U99","text":"@coder run linter"}}"#;
+        let ts = chrono::Utc::now().timestamp().to_string();
         let sig = format!(
             "v0={}",
             compute_hmac_sha256_hex(

@@ -242,6 +242,11 @@ impl Drop for MacPlatform {
 
 #[async_trait]
 impl Platform for MacPlatform {
+    async fn begin_task(&self, _task_id: &str) -> Result<()> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn permissions(&self) -> Result<PermissionStatus> {
         let sc_ok = unsafe { gm_mac_check_screen_recording_permission() } == 1;
         let ax_ok = unsafe { gm_mac_check_ax_permission() } == 1;

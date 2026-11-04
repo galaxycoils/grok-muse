@@ -3,6 +3,7 @@ pub mod loop_engine;
 pub mod mcp_bridge;
 pub mod som;
 pub mod trajectory;
+pub mod vm;
 pub mod wheel;
 pub mod workspace_tools;
 

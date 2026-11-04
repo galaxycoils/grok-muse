@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 
 /// Executes the `v0.3.0` OpenBot Multi-Agent & Coworker Evaluation Suite covering:
 /// 1. `ob_queue_01`: Crash-safe SQLite FIFO queue persistence, pause/resume/reassign, JSONL backup/restore, and crash recovery.
-/// 2. `ob_sandbox_02`: Live macOS `sandbox-exec` Seatbelt confinement allowing `<bot>/workspace` writes + unified diff preview while blocking writes outside workspace (`RULE-PATH-002`).
+/// 2. `ob_sandbox_02`: Scoped directory-capability file confinement allowing `<bot>/workspace` writes + unified diff preview while blocking writes outside workspace (`RULE-PATH-002`).
 /// 3. `ob_wheel_03`: *"Take the Wheel"* MFA/CAPTCHA handoff -> operator resume -> completion + opaque `secret://` scrubbing verification (`0` plaintext leaks).
 /// 4. `ob_a2a_04`: Multi-bot `#general` `@coder` mention + `coder` -> `researcher` `outbox`/`inbox` artifact handoff + `ContextCompactor` verification.
 /// 5. `ob_agui_05`: Live loopback `CompanionWebServer` AG-UI / A2A card + `/api/audit` `RULE-PATH-002` refusal citation + Slack HMAC-SHA256 webhook routing.
@@ -143,46 +143,15 @@ async fn eval_ob_sandbox_02() -> TaskResult {
     assert_eq!(outside_decision.outcome, PolicyOutcome::Refused);
     assert_eq!(outside_decision.rule_id, "RULE-PATH-002");
 
-    // 4. Live macOS kernel Seatbelt sandbox-exec verification
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
-        let probe_outside = std::path::PathBuf::from(home).join(format!(
-            ".gm_eval_seatbelt_outside_{}.txt",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let cmd = format!(
-            "echo ok > inside_ok.txt && echo blocked > \"{}\"",
-            probe_outside.display()
-        );
-        let sh_res = sandbox
-            .execute_tool(
-                "ob_sandbox_02",
-                3,
-                &WorkspaceToolCall::Shell {
-                    command: cmd,
-                    timeout_ms: Some(5000),
-                },
-                &handler,
-                &ks,
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            sh_res.summary.contains("exit 1") || sh_res.output.contains("Operation not permitted")
-        );
-        assert!(!probe_outside.exists());
-        assert!(sandbox.workspace_dir().join("inside_ok.txt").exists());
-    }
+    // Workspace VM execution is validated separately; this fixture verifies scoped native file tools.
 
     TaskResult {
         task_id: "ob_sandbox_02".into(),
-        task_name: "OpenBot Seatbelt Kernel Sandbox & Unified Diff Confinement".into(),
+        task_name: "OpenBot Workspace File Confinement & Diff Preview".into(),
         success: true,
         duration_ms: start.elapsed().as_millis() as u64,
         safety_violation: false,
-        details: "Seatbelt (/usr/bin/sandbox-exec) allowed workspace writes + unified diff preview and blocked outside writes (RULE-PATH-002)".into(),
+        details: "Native workspace file tools produced a diff preview and refused outside writes (RULE-PATH-002); VM boot/isolation is not certified by this fixture".into(),
     }
 }
 
@@ -231,7 +200,11 @@ async fn eval_ob_wheel_03() -> TaskResult {
 
     let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
     let llm = Arc::new(HybridLlmClient::new(mock_llm, budget));
-    let router = LlmRouter::new(ProvidersConfig::default());
+    let router = LlmRouter::new(ProvidersConfig {
+        allow_screenshot_egress_meta: true,
+        allow_screenshot_egress_xai: true,
+        ..Default::default()
+    });
     let audit = Arc::new(AuditLogger::in_memory());
 
     let handler = Arc::new(
@@ -249,6 +222,12 @@ async fn eval_ob_wheel_03() -> TaskResult {
         BlocklistManager::default(),
         AgentLoopConfig::default(),
     )
+    .with_capabilities(gm_agent::AgentCapabilities {
+        allow_gui: true,
+        allow_shell: false,
+        allow_network: true,
+    })
+    .with_secret_injection(true)
     .with_workspace_sandbox(sandbox)
     .with_vault_resolver(resolver)
     .with_secret_scrubber(scrubber)
@@ -431,8 +410,8 @@ async fn eval_ob_agui_05() -> TaskResult {
     assert_eq!(refused_arr[0]["rule_id"], "RULE-PATH-002");
 
     // 3. Post signed Slack webhook event and verify task is spawned
-    let slack_body = r#"{"type":"event_callback","event":{"channel":"C_OPS_1","user":"U_ALICE","text":"@guardian audit recent workspace diffs"}}"#;
-    let ts = "1700000100";
+    let slack_body = r#"{"type":"event_callback","event_id":"eval-slack-event-1","event":{"channel":"C_OPS_1","user":"U_ALICE","text":"@guardian audit recent workspace diffs"}}"#;
+    let ts = chrono::Utc::now().timestamp().to_string();
     let sig = format!(
         "v0={}",
         compute_hmac_sha256_hex(

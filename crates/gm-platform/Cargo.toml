@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+uuid = { workspace = true }
 gm-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "io-util", "time"] }

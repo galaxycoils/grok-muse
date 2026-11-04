@@ -22,7 +22,7 @@ impl std::fmt::Display for VlmModelArchitecture {
 /// Execution mode for `CandleVlmEngine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VlmBackendMode {
-    /// Automatically run real autoregressive weights when loaded, or calibrated spatial fallback otherwise.
+    /// Use compatible weights and a tokenizer, or report unavailable. Never silently synthesize production output.
     #[default]
     Auto,
     /// Require real non-zero checkpoint weights and HuggingFace tokenizer vocabulary.

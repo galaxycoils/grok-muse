@@ -95,12 +95,7 @@ pub fn estimate_cost_usd(
     image_count: usize,
 ) -> f64 {
     let m = model.to_lowercase();
-    if m.starts_with("local")
-        || m.contains("candle")
-        || m.contains("mlx")
-        || m.contains("smol")
-        || m.contains("qwen")
-    {
+    if m.starts_with("local") {
         0.0
     } else if m.contains("spark") {
         let prompt_cost = (prompt_tokens as f64 / 1_000_000.0) * 0.80;
@@ -118,6 +113,19 @@ pub fn estimate_cost_usd(
         let image_cost = image_count as f64 * 0.002;
         prompt_cost + completion_cost + image_cost
     }
+}
+
+pub fn estimate_api_cost_usd(model: &str, prompt: u32, completion: u32, images: usize) -> f64 {
+    estimate_cost_usd(
+        if model.to_lowercase().starts_with("local") {
+            "unknown-hosted-model"
+        } else {
+            model
+        },
+        prompt,
+        completion,
+        images,
+    )
 }
 
 #[async_trait]
@@ -138,10 +146,10 @@ pub trait LlmBackend: Send + Sync {
         messages: &[ChatMessage],
         _max_tokens: u32,
         _temperature: f32,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        delta_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<LlmResponse> {
         let resp = self.complete(target, messages).await?;
-        let _ = delta_tx.send(resp.content.clone());
+        let _ = delta_tx.send(resp.content.clone()).await;
         Ok(resp)
     }
 }
@@ -237,7 +245,7 @@ impl LlmBackend for MockLlmBackend {
         let content = queued
             .or_else(|| self.next_response.lock().clone())
             .unwrap_or_else(|| {
-                "{\"action\":\"done\",\"params\":{\"summary\":\"mock completed\"}}".into()
+                "{\"action\":\"Done\",\"params\":{\"summary\":\"mock completed\"}}".into()
             });
 
         let cost = estimate_cost_usd(&target.model, 50, 20, img_count);
@@ -258,10 +266,10 @@ impl LlmBackend for MockLlmBackend {
         messages: &[ChatMessage],
         _max_tokens: u32,
         _temperature: f32,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        delta_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<LlmResponse> {
         let resp = self.complete(target, messages).await?;
-        let _ = delta_tx.send(resp.content.clone());
+        let _ = delta_tx.send(resp.content.clone()).await;
         Ok(resp)
     }
 
@@ -455,11 +463,18 @@ impl LlmBackend for ReqwestLlmBackend {
             .unwrap_or_default()
             .to_string();
 
-        let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-        let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+        let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or_else(|| {
+            messages
+                .iter()
+                .map(|m| m.content.len().saturating_add(m.images.len() * 8192) as u64)
+                .sum()
+        }) as u32;
+        let completion_tokens = val["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap_or(content.len() as u64) as u32;
         let image_count = messages.iter().map(|m| m.images.len()).sum();
         let estimated_cost_usd =
-            estimate_cost_usd(&target.model, prompt_tokens, completion_tokens, image_count);
+            estimate_api_cost_usd(&target.model, prompt_tokens, completion_tokens, image_count);
 
         Ok(ChatCompletionResponse {
             id: val["id"].as_str().unwrap_or("resp").to_string(),
@@ -477,7 +492,7 @@ impl LlmBackend for ReqwestLlmBackend {
         messages: &[ChatMessage],
         max_tokens: u32,
         temperature: f32,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        delta_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<LlmResponse> {
         let api_key = match target.provider {
             crate::router::ProviderKind::Meta => self.meta_api_key.clone().or_else(|| {
@@ -521,14 +536,27 @@ impl LlmBackend for ReqwestLlmBackend {
         }
 
         let mut full_text = String::new();
-        let mut buffer = String::new();
+        let mut buffer = Vec::<u8>::new();
+        let mut finished = false;
         let mut parsed_prompt_tokens: Option<u32> = None;
         let mut parsed_completion_tokens: Option<u32> = None;
 
-        'stream: while let Ok(Some(chunk)) = resp.chunk().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
+        'stream: while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| GmError::Provider(format!("Interrupted provider stream: {e}")))?
+        {
+            buffer.extend_from_slice(&chunk);
+            if buffer.len() > 1024 * 1024 {
+                return Err(GmError::Provider(
+                    "Provider stream frame exceeds its limit".into(),
+                ));
+            }
+            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                let line = std::str::from_utf8(&buffer[..pos])
+                    .map_err(|_| GmError::Provider("Invalid UTF-8 in provider stream".into()))?
+                    .trim()
+                    .to_string();
                 buffer.drain(..pos + 1);
 
                 if line.is_empty() {
@@ -538,13 +566,32 @@ impl LlmBackend for ReqwestLlmBackend {
                 if let Some(payload) = line.strip_prefix("data:") {
                     let data = payload.trim();
                     if data == "[DONE]" {
+                        finished = true;
                         break 'stream;
                     }
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                    {
+                        let val: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+                            GmError::Provider(format!("Malformed provider stream: {e}"))
+                        })?;
+                        if val.get("error").is_some() {
+                            return Err(GmError::Provider(
+                                "Provider returned a streaming error".into(),
+                            ));
+                        }
+                        if val["choices"][0]["finish_reason"].is_string() {
+                            finished = true;
+                        }
                         if let Some(delta) = val["choices"][0]["delta"]["content"].as_str()
                             && !delta.is_empty()
                         {
-                            let _ = delta_tx.send(delta.to_string());
+                            if full_text.len() + delta.len() > 8 * 1024 * 1024 {
+                                return Err(GmError::Provider(
+                                    "Provider response exceeds its limit".into(),
+                                ));
+                            }
+                            delta_tx.send(delta.to_string()).await.map_err(|_| {
+                                GmError::Provider("Stream consumer disconnected".into())
+                            })?;
                             full_text.push_str(delta);
                         }
 
@@ -561,12 +608,24 @@ impl LlmBackend for ReqwestLlmBackend {
             }
         }
 
-        let completion_tokens = parsed_completion_tokens
-            .unwrap_or_else(|| (full_text.split_whitespace().count() as f64 * 1.3).ceil() as u32);
-        let prompt_tokens = parsed_prompt_tokens.unwrap_or(50);
+        if !finished {
+            return Err(GmError::Provider(
+                "Provider stream ended before completion".into(),
+            ));
+        }
+
+        let completion_tokens =
+            parsed_completion_tokens.unwrap_or(full_text.len().min(u32::MAX as usize) as u32);
+        let prompt_tokens = parsed_prompt_tokens.unwrap_or_else(|| {
+            messages
+                .iter()
+                .map(|m| m.content.len().saturating_add(m.images.len() * 8192))
+                .sum::<usize>()
+                .min(u32::MAX as usize) as u32
+        });
         let image_count = messages.iter().map(|m| m.images.len()).sum();
         let estimated_cost_usd =
-            estimate_cost_usd(&target.model, prompt_tokens, completion_tokens, image_count);
+            estimate_api_cost_usd(&target.model, prompt_tokens, completion_tokens, image_count);
 
         Ok(ChatCompletionResponse {
             id: "live_stream_resp".into(),
@@ -632,10 +691,10 @@ impl LlmBackend for CalibratedFastRouteBackend {
         messages: &[ChatMessage],
         _max_tokens: u32,
         _temperature: f32,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        delta_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<LlmResponse> {
         let (resp, _) = self.complete_metrics(target, messages).await?;
-        let _ = delta_tx.send(resp.content.clone());
+        let _ = delta_tx.send(resp.content.clone()).await;
         Ok(resp)
     }
 }
@@ -668,7 +727,7 @@ impl CalibratedFastRouteBackend {
         } else {
             self.tokens_per_second
         };
-        let cost = estimate_cost_usd(&target.model, 45, tokens, 0);
+        let cost = estimate_api_cost_usd(&target.model, 45, tokens, 0);
         let resp = ChatCompletionResponse {
             id: "calibrated_resp".into(),
             content: self.action_content.clone(),
@@ -718,6 +777,39 @@ impl HybridLlmClient {
             circuit_breaker,
             stripped_images_count: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn scoped_job(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            budget: Arc::new(self.budget.scoped_job()),
+            circuit_breaker: self.circuit_breaker.clone(),
+            stripped_images_count: self.stripped_images_count.clone(),
+        }
+    }
+
+    fn reserve_request(
+        &self,
+        target: &ModelTarget,
+        messages: &[ChatMessage],
+        max_tokens: u32,
+    ) -> Result<crate::budget::BudgetReservation> {
+        let input = messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .len()
+                    .saturating_add(m.images.len().saturating_mul(8192))
+            })
+            .sum::<usize>()
+            .min(u32::MAX as usize) as u32;
+        let images = messages.iter().map(|m| m.images.len()).sum();
+        let estimate = if self.backend.is_mock() {
+            0.0
+        } else {
+            estimate_api_cost_usd(&target.model, input, max_tokens, images)
+        };
+        self.budget.reserve(estimate)
     }
 
     pub fn backend(&self) -> Arc<dyn LlmBackend> {
@@ -774,10 +866,11 @@ impl HybridLlmClient {
             );
             if let Some(fb) = fallback {
                 let prepared_fb = self.prepare_messages_for_target(fb, messages);
+                let reservation = self.reserve_request(fb, &prepared_fb, 4096)?;
                 match self.backend.complete(fb, &prepared_fb).await {
                     Ok(resp) => {
                         self.circuit_breaker.record_success(fb.provider.clone());
-                        self.budget.record_spend(resp.estimated_cost_usd)?;
+                        reservation.settle(resp.estimated_cost_usd)?;
                         return Ok(resp);
                     }
                     Err(e) => {
@@ -794,14 +887,26 @@ impl HybridLlmClient {
         }
 
         let prepared_primary = self.prepare_messages_for_target(primary, messages);
+        let reservation = self.reserve_request(primary, &prepared_primary, 4096)?;
         match self.backend.complete(primary, &prepared_primary).await {
             Ok(resp) => {
                 self.circuit_breaker
                     .record_success(primary.provider.clone());
-                self.budget.record_spend(resp.estimated_cost_usd)?;
+                reservation.settle(resp.estimated_cost_usd)?;
                 Ok(resp)
             }
             Err(e) => {
+                if matches!(
+                    e,
+                    GmError::Config(_)
+                        | GmError::PermissionDenied(_)
+                        | GmError::SafetyViolation(_)
+                        | GmError::BudgetExceeded(_)
+                ) {
+                    reservation.release();
+                } else {
+                    drop(reservation);
+                }
                 self.circuit_breaker
                     .record_failure(primary.provider.clone());
                 warn!("Primary provider {:?} failed: {e}", primary.provider);
@@ -811,11 +916,13 @@ impl HybridLlmClient {
                         fallback_target.provider
                     );
                     let prepared_fb = self.prepare_messages_for_target(fallback_target, messages);
+                    let fallback_reservation =
+                        self.reserve_request(fallback_target, &prepared_fb, 4096)?;
                     match self.backend.complete(fallback_target, &prepared_fb).await {
                         Ok(resp) => {
                             self.circuit_breaker
                                 .record_success(fallback_target.provider.clone());
-                            self.budget.record_spend(resp.estimated_cost_usd)?;
+                            fallback_reservation.settle(resp.estimated_cost_usd)?;
                             Ok(resp)
                         }
                         Err(fb_err) => {
@@ -838,7 +945,7 @@ impl HybridLlmClient {
         messages: &[ChatMessage],
         max_tokens: u32,
         temperature: f32,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        delta_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<LlmResponse> {
         // Check circuit breaker for primary provider
         if self.circuit_breaker.is_open(&primary.provider) {
@@ -848,6 +955,7 @@ impl HybridLlmClient {
             );
             if let Some(fb) = fallback {
                 let prepared_fb = self.prepare_messages_for_target(fb, messages);
+                let reservation = self.reserve_request(fb, &prepared_fb, max_tokens)?;
                 match self
                     .backend
                     .complete_stream(fb, &prepared_fb, max_tokens, temperature, delta_tx)
@@ -855,7 +963,7 @@ impl HybridLlmClient {
                 {
                     Ok(resp) => {
                         self.circuit_breaker.record_success(fb.provider.clone());
-                        self.budget.record_spend(resp.estimated_cost_usd)?;
+                        reservation.settle(resp.estimated_cost_usd)?;
                         return Ok(resp);
                     }
                     Err(e) => {
@@ -872,6 +980,7 @@ impl HybridLlmClient {
         }
 
         let prepared_primary = self.prepare_messages_for_target(primary, messages);
+        let reservation = self.reserve_request(primary, &prepared_primary, max_tokens)?;
         match self
             .backend
             .complete_stream(
@@ -886,45 +995,26 @@ impl HybridLlmClient {
             Ok(resp) => {
                 self.circuit_breaker
                     .record_success(primary.provider.clone());
-                self.budget.record_spend(resp.estimated_cost_usd)?;
+                reservation.settle(resp.estimated_cost_usd)?;
                 Ok(resp)
             }
             Err(e) => {
+                if matches!(
+                    e,
+                    GmError::Config(_)
+                        | GmError::PermissionDenied(_)
+                        | GmError::SafetyViolation(_)
+                        | GmError::BudgetExceeded(_)
+                ) {
+                    reservation.release();
+                } else {
+                    drop(reservation);
+                }
                 self.circuit_breaker
                     .record_failure(primary.provider.clone());
                 warn!("Primary stream {:?} failed: {e}", primary.provider);
-                if let Some(fallback_target) = fallback {
-                    info!(
-                        "Failing over stream to fallback provider {:?}",
-                        fallback_target.provider
-                    );
-                    let prepared_fb = self.prepare_messages_for_target(fallback_target, messages);
-                    match self
-                        .backend
-                        .complete_stream(
-                            fallback_target,
-                            &prepared_fb,
-                            max_tokens,
-                            temperature,
-                            delta_tx,
-                        )
-                        .await
-                    {
-                        Ok(resp) => {
-                            self.circuit_breaker
-                                .record_success(fallback_target.provider.clone());
-                            self.budget.record_spend(resp.estimated_cost_usd)?;
-                            Ok(resp)
-                        }
-                        Err(fb_err) => {
-                            self.circuit_breaker
-                                .record_failure(fallback_target.provider.clone());
-                            Err(fb_err)
-                        }
-                    }
-                } else {
-                    Err(e)
-                }
+                // The backend may already have emitted tokens. Never append a different provider's answer.
+                Err(e)
             }
         }
     }
@@ -935,7 +1025,7 @@ impl HybridLlmClient {
         fallback: Option<&ModelTarget>,
         messages: &[ChatMessage],
     ) -> Result<(ChatCompletionResponse, LlmStreamMetrics)> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
         let drain_handle = tokio::spawn(async move {
             let mut buf = String::new();
             while let Some(chunk) = rx.recv().await {

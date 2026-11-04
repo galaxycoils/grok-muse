@@ -1,7 +1,9 @@
 # Grok-Muse Hybrid Agent (`v0.3.0` — OpenBot Multi-Agent & Coworker Suite)
 
 > **Fast computer-use + proactive personal agent + OpenBot multi-agent coworker suite for macOS.**  
-> Built in Rust with native macOS ScreenCaptureKit, Accessibility APIs, CoreGraphics, EventKit, Seatbelt (`sandbox-exec`) workspace confinement, Candle Metal local VLM inference, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
+> Built in Rust with native Rust desktop rendering, macOS ScreenCaptureKit/Accessibility integration, scoped workspace file access, an offline workspace VM transport, Candle model support, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
+
+The current branch adds a working durable task dispatcher and a shared native desktop client. Windows/Linux desktop automation is unavailable until native backends are implemented; the VM transport requires a separately provisioned signed image. See [implementation status](docs/implementation-status.md) for implemented behavior, setup, and remaining public-release work. Performance/quality numbers below are targets, not certified results.
 
 ---
 
@@ -36,12 +38,12 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 3. **Multi-Bot Channels, A2A Artifact Handoffs & Context Compaction**:
    - Persistent `#general`, `#research`, and `#ops` channels (`gm channels`) with automatic `@<bot_id>` mention parsing and task spawning.
    - Structured Agent-to-Agent (`A2aCoordinator`) handoffs that copy artifacts from `<from_bot>/outbox/` into `<to_bot>/inbox/` with loop-depth guards (`max_handoff_depth = 4`), paired with `ContextCompactor` token-budget summarization.
-4. **macOS Kernel Seatbelt (`sandbox-exec`) Confinement & Governance Gateway**:
-   - Every bot shell tool (`WorkspaceShell`) executes inside a dynamically generated macOS Seatbelt SBPL profile (`/usr/bin/sandbox-exec`) restricting file writes strictly to the bot's `workspace/` and `outbox/`.
+4. **Scoped Workspace Tools & Governance Gateway**:
+   - Native file tools use directory capabilities. `WorkspaceShell` requires the separately provisioned offline VM transport; there is no host-shell fallback.
    - `SecurityGateway` evaluates every GUI, MCP, and workspace action against explicit policy rules (`RULE-BLK-001` through `RULE-SEC-006`) and logs `Permitted`, `Refused`, and `Failed` records with rule citations.
 5. ***"Take the Wheel"* Human Handoff & Opaque Vault Secrets**:
    - Detects 2FA/MFA/CAPTCHA/login walls, pauses the bot (`WaitingForHuman`), surfaces a `🛞 Take the Wheel` HUD/alert prompt, and resumes seamlessly once the human hands control back.
-   - Supports opaque `secret://keychain/<account>` and `secret://1password/<vault>/<item>/<field>` secret leases injected directly into target fields while `SecretScrubber` guarantees `0` plaintext leaks in LLM prompts, trajectories, or audit logs.
+   - Supports opaque `secret://keychain/<account>` and `secret://1password/<vault>/<item>/<field>` secret leases injected directly into target fields with registered-secret scrubbing. Credential injection requires explicit approval; leakage resistance still requires adversarial verification.
 6. **Loopback Companion Web / AG-UI SSE Server & Chat Bridges**:
    - Built-in `axum` server (`gm serve`, default `127.0.0.1:7433`) serving the live Companion Web UI (`/`), Governance Audit Dashboard (`/admin/audit`), A2A Agent Card (`/.well-known/agent.json`), AG-UI SSE stream (`/ag-ui/events`), and HMAC-SHA256 verified Slack / Telegram / Discord webhook bridges.
 
@@ -51,7 +53,7 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 | Metric | Target | Description & Measurement |
 |---|---|---|
-| **G1 Native** | Zero Electron/Chromium | Signed App Bundle = daemon + CU helper (`.app`) + native AppKit UI (`gm-ui`). |
+| **G1 Native** | Zero Electron/Chromium | Signed App Bundle = daemon + CU helper (`.app`) + shared native Rust UI (`gm-ui`), with legacy AppKit commands retained. |
 | **G2 Footprint** | `< 50 MB` idle RSS | Whole process tree idle RSS measured via `footprint`/`ps` (< 120 MB with UI open). |
 | **G3 Hot Path** | `< 2 ms` capture, `< 30 ms` AX | ScreenCaptureKit frame fetch < 2ms, AX snapshot < 30ms, JPEG q=70 < 15ms, action dispatch < 5ms. |
 | **G4 Agent Step** | `< 1.5 s` median | Fast route median step latency including routed model inference. |

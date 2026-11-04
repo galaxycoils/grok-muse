@@ -7,6 +7,15 @@ use gm_core::types::{
 
 #[async_trait]
 pub trait Platform: Send + Sync {
+    /// Start a new managed action session after previous actions have drained.
+    async fn begin_task(&self, _task_id: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Cancel only this session; emergency cancellation remains separately latched.
+    async fn cancel_task(&self, _task_id: &str) -> Result<()> {
+        self.cancel().await
+    }
+
     /// Retrieve current OS accessibility/screen recording permissions.
     async fn permissions(&self) -> Result<PermissionStatus>;
 

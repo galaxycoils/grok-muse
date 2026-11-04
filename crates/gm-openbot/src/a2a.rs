@@ -65,12 +65,10 @@ impl A2aCoordinator {
             protocol: "a2a/1.0 + ag-ui/1.0".into(),
             bots,
             capabilities: vec![
-                "computer_use_ax_som".into(),
-                "seatbelt_workspace_shell".into(),
+                "scoped_workspace_files".into(),
                 "durable_fifo_queues".into(),
                 "multi_bot_channels".into(),
                 "take_the_wheel_handoff".into(),
-                "opaque_vault_secrets".into(),
             ],
         }
     }
@@ -96,6 +94,23 @@ impl A2aCoordinator {
             )));
         }
 
+        let from = self
+            .roster
+            .get_bot(from_bot_id)
+            .ok_or_else(|| GmError::Config("Unknown delegating bot".into()))?;
+        let to = self
+            .roster
+            .get_bot(to_bot_id)
+            .ok_or_else(|| GmError::Config("Unknown target bot".into()))?;
+        if (to.allow_gui && !from.allow_gui)
+            || (to.allow_shell && !from.allow_shell)
+            || (to.allow_network && !from.allow_network)
+        {
+            return Err(GmError::PermissionDenied(
+                "Delegation cannot increase the originating bot's permissions".into(),
+            ));
+        }
+
         let from_sandbox = self.roster.workspace_sandbox(from_bot_id)?;
         let to_sandbox = self.roster.workspace_sandbox(to_bot_id)?;
 
@@ -105,22 +120,8 @@ impl A2aCoordinator {
                 .file_name()
                 .ok_or_else(|| GmError::Config(format!("Invalid artifact filename '{name}'")))?;
 
-            // Check sender's outbox first, then sender's workspace
-            let src_outbox = from_sandbox.outbox_dir().join(clean_name);
-            let src_ws = from_sandbox.workspace_dir().join(clean_name);
-            let src = if src_outbox.exists() {
-                src_outbox
-            } else if src_ws.exists() {
-                src_ws
-            } else {
-                return Err(GmError::Config(format!(
-                    "Artifact '{}' not found in @{} outbox or workspace",
-                    name, from_bot_id
-                )));
-            };
-
-            let dst = to_sandbox.inbox_dir().join(clean_name);
-            std::fs::copy(&src, &dst)?;
+            let data = from_sandbox.read_artifact(clean_name)?;
+            let dst = to_sandbox.receive_artifact(clean_name, &data)?;
             transferred.push(dst);
         }
 

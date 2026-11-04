@@ -1,3 +1,4 @@
+mod native;
 use clap::{Parser, Subcommand};
 use gm_core::config::GmConfig;
 use gm_core::error::Result;
@@ -57,12 +58,16 @@ unsafe extern "C" {
     about = "Grok-Muse Desktop Shell UI (Tray, Action Overlay, Onboarding & Hotkeys)"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Launch the shared native desktop application
+    Native,
     /// Launch tray icon, action overlay, and global hotkey monitor
     Tray,
     /// Open floating chat / action window
@@ -307,13 +312,9 @@ fn handle_daemon_event(ev: DaemonEvent) {
     }
 }
 
-async fn ensure_daemon_running(config: &GmConfig) {
-    #[cfg(unix)]
+async fn ensure_daemon_running(config: &GmConfig, config_path: Option<&Path>) {
     {
-        if tokio::net::UnixStream::connect(&config.daemon_socket_path)
-            .await
-            .is_ok()
-        {
+        if native::is_running(config).await {
             return;
         }
 
@@ -328,15 +329,15 @@ async fn ensure_daemon_running(config: &GmConfig) {
 
         info!("Auto-spawning gm-daemon at {:?}", daemon_bin);
         let mut cmd = std::process::Command::new(&daemon_bin);
+        if let Some(path) = config_path {
+            cmd.arg("--config").arg(path);
+        }
         cmd.arg("daemon");
         if let Ok(_child) = cmd.spawn() {
             let start = tokio::time::Instant::now();
             while start.elapsed() < tokio::time::Duration::from_millis(2000) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                if tokio::net::UnixStream::connect(&config.daemon_socket_path)
-                    .await
-                    .is_ok()
-                {
+                if native::is_running(config).await {
                     info!("gm-daemon auto-spawned and responding");
                     return;
                 }
@@ -381,7 +382,7 @@ async fn run_ui_tokio_client(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
 ) {
     // 1. Ensure daemon is running
-    ensure_daemon_running(&config).await;
+    ensure_daemon_running(&config, None).await;
 
     // 2. Background event subscriber with auto-reconnect
     let daemon_socket = config.daemon_socket_path.clone();
@@ -500,9 +501,13 @@ async fn run_ui_tokio_client(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Commands::Tray);
+    let cmd = cli.command.unwrap_or(Commands::Native);
 
-    let config = GmConfig::load_or_default(None);
+    let config = GmConfig::load(cli.config.as_deref())?;
+    if matches!(cmd, Commands::Native) {
+        ensure_daemon_running(&config, cli.config.as_deref()).await;
+        return native::run(config);
+    }
     let _ = CONFIG.set(config.clone());
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
 
@@ -536,6 +541,7 @@ async fn main() -> Result<()> {
     });
 
     match cmd {
+        Commands::Native => unreachable!(),
         Commands::Tray => {
             info!("Launching Grok-Muse tray desktop shell");
             #[cfg(target_os = "macos")]

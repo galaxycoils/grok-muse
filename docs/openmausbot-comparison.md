@@ -1,3 +1,5 @@
+> Follow-up: the original comparison below describes the initial snapshot. The task dispatcher, interruption controls, capability gates, persona/model routing and native UI foundation have since changed. See [current implementation status](implementation-status.md) for the authoritative progress and remaining blockers.
+
 # OpenMausBot comparison and reliability review
 
 Reviewed 2026-11-04. Grok Muse baseline: `6f60b76` (v0.3.0, including the upstream Linux CI, bundle-binary and Metal-device fixes).

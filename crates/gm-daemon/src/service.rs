@@ -401,7 +401,7 @@ pub fn show_services_status() -> Result<()> {
     print_row("Daemon (gm-daemon)", &d_status);
     print_row("Computer-Use Helper (gm-cu-helper)", &h_status);
 
-    let config = gm_core::config::GmConfig::load_or_default(None);
+    let config = gm_core::config::GmConfig::load(None)?;
     let socket_path = &config.socket_path;
     println!(
         "Helper Socket: {}",

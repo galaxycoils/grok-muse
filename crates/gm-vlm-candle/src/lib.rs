@@ -61,7 +61,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_smolvlm_scaffolding_and_tensors() {
-        let config = CandleVlmConfig::smolvlm_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = CandleVlmEngine::new(config).unwrap();
         assert_eq!(engine.config().architecture, VlmModelArchitecture::SmolVlm);
         assert_eq!(engine.model_name(), "HuggingFaceTB/SmolVLM-Instruct");
@@ -83,7 +85,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_qwen2_vl_scaffolding_and_tensors() {
-        let config = CandleVlmConfig::qwen2_vl_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::qwen2_vl_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = CandleVlmEngine::new(config).unwrap();
         assert_eq!(engine.config().architecture, VlmModelArchitecture::Qwen2Vl);
         assert_eq!(engine.model_name(), "Qwen/Qwen2-VL-2B-Instruct");
@@ -123,6 +127,7 @@ mod tests {
 
         // Initialize engine pointing to the created safetensors weights
         let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
             .with_device(VlmDevice::Cpu)
             .with_weights_path(&weights_path);
 
@@ -136,7 +141,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_offline_visual_triage_states() {
-        let config = CandleVlmConfig::smolvlm_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = CandleVlmEngine::new(config).unwrap();
         let dummy_jpeg = vec![0x77u8; 1024];
 
@@ -169,7 +176,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_offline_image_grounding_coordinates_and_bounds() {
-        let config = CandleVlmConfig::smolvlm_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = CandleVlmEngine::new(config).unwrap();
         let dummy_jpeg = vec![0xAAu8; 512];
 
@@ -202,7 +211,9 @@ mod tests {
     async fn test_local_vlm_backend_adapter_integration() {
         use gm_llm::{ChatMessage, LlmBackend, ModelTarget, ProviderKind};
 
-        let config = CandleVlmConfig::smolvlm_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = Arc::new(CandleVlmEngine::new(config).unwrap());
         let adapter = LocalVlmLlmAdapter::new(engine);
 
@@ -223,7 +234,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_image_error_handling() {
-        let config = CandleVlmConfig::smolvlm_preset().with_device(VlmDevice::Cpu);
+        let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
+            .with_device(VlmDevice::Cpu);
         let engine = CandleVlmEngine::new(config).unwrap();
 
         let triage_err = engine.triage(&[], "test prompt").await;
@@ -241,17 +254,20 @@ mod tests {
 
     #[test]
     fn test_zero_dimension_and_patch_size_validation() {
-        let mut invalid_patch = CandleVlmConfig::smolvlm_preset();
+        let mut invalid_patch =
+            CandleVlmConfig::smolvlm_preset().with_backend_mode(VlmBackendMode::SyntheticTest);
         invalid_patch.patch_size = 0;
         assert!(invalid_patch.validate().is_err());
         assert!(CandleVlmEngine::new(invalid_patch).is_err());
 
-        let mut invalid_dims = CandleVlmConfig::smolvlm_preset();
+        let mut invalid_dims =
+            CandleVlmConfig::smolvlm_preset().with_backend_mode(VlmBackendMode::SyntheticTest);
         invalid_dims.image_size = (300, 400); // 300 not divisible by 16
         assert!(invalid_dims.validate().is_err());
         assert!(CandleVlmEngine::new(invalid_dims).is_err());
 
-        let mut zero_dim = CandleVlmConfig::smolvlm_preset();
+        let mut zero_dim =
+            CandleVlmConfig::smolvlm_preset().with_backend_mode(VlmBackendMode::SyntheticTest);
         zero_dim.vision_dim = 0;
         assert!(zero_dim.validate().is_err());
     }
@@ -259,6 +275,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonexistent_weights_path_error() {
         let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
             .with_device(VlmDevice::Cpu)
             .with_weights_path("/nonexistent/path/to/model.safetensors");
 
@@ -297,6 +314,7 @@ mod tests {
         SafetensorsWeightLoader::save_safetensors(&map, &weights_path).unwrap();
 
         let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
             .with_device(VlmDevice::Cpu)
             .with_weights_path(&weights_path);
 
@@ -316,6 +334,7 @@ mod tests {
         std::fs::write(&corrupt_path, b"not_a_valid_safetensors_file_data").unwrap();
 
         let config = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
             .with_device(VlmDevice::Cpu)
             .with_weights_path(&corrupt_path);
 
@@ -517,6 +536,7 @@ mod tests {
         SafetensorsWeightLoader::save_safetensors(&map, &weights_path).unwrap();
 
         let mut cfg = CandleVlmConfig::smolvlm_preset()
+            .with_backend_mode(VlmBackendMode::SyntheticTest)
             .with_device(VlmDevice::Cpu)
             .with_weights_path(&weights_path)
             .with_tokenizer_path(&tok_path)
@@ -564,7 +584,8 @@ mod tests {
 
         // Build synthetic safetensors payload in memory for mock HF endpoint
         let weights_tmp = temp_dir.path().join("mock_weights.safetensors");
-        let preset = CandleVlmConfig::smolvlm_preset();
+        let preset =
+            CandleVlmConfig::smolvlm_preset().with_backend_mode(VlmBackendMode::SyntheticTest);
         SafetensorsWeightLoader::create_synthetic_weights_file(
             &weights_tmp,
             3 * preset.patch_size * preset.patch_size,
@@ -629,11 +650,8 @@ mod tests {
         assert!(smol_status.has_tokenizer);
 
         let loaded_engine = registry.find_installed_engine();
-        assert!(loaded_engine.is_some());
-        assert_eq!(
-            loaded_engine.unwrap().model_name(),
-            "HuggingFaceTB/SmolVLM-Instruct"
-        );
+        // This download fixture contains zero/untrained weights. Installation is not model readiness.
+        assert!(loaded_engine.is_none());
 
         let table = format_models_table(&listed);
         assert!(table.contains("qwen2-vl-2b *"));

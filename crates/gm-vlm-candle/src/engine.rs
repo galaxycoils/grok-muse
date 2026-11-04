@@ -31,6 +31,13 @@ impl CandleVlmEngine {
             .validate()
             .map_err(|e| GmError::Platform(format!("Invalid CandleVlmConfig: {e}")))?;
 
+        if config.backend_mode != VlmBackendMode::SyntheticTest
+            && ((config.weights_path.is_none() && config.shard_paths.is_empty())
+                || config.tokenizer_path.is_none())
+        {
+            return Err(GmError::Config("Production local VLM requires compatible checkpoint weights and a tokenizer. SyntheticTest mode is for offline tests only.".into()));
+        }
+
         let device_ctx = VlmDeviceContext::resolve(config.device);
         let dtype = device_ctx.candle_dtype(config.precision);
 
@@ -190,7 +197,9 @@ impl CandleVlmEngine {
             engine.has_real_weights = max_abs > 1e-6;
         }
 
-        if engine.config.backend_mode == VlmBackendMode::RealWeights && !engine.has_real_weights {
+        if engine.config.backend_mode != VlmBackendMode::SyntheticTest
+            && (!engine.has_real_weights || !engine.tokenizer.has_loaded_vocab())
+        {
             return Err(GmError::Platform(
                 "VlmBackendMode::RealWeights requested, but loaded checkpoint contains no non-zero LM head weights".into(),
             ));

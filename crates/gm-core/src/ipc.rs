@@ -25,6 +25,16 @@ pub enum HelperRequest {
     GetAxSnapshot {
         window_id: Option<u32>,
     },
+    BeginTask {
+        task_id: String,
+    },
+    ExecuteTaskAction {
+        task_id: String,
+        action: ComputerAction,
+    },
+    CancelTask {
+        task_id: String,
+    },
     ExecuteAction(ComputerAction),
     CancelActions,
     GetCalendarEvents {
@@ -83,6 +93,10 @@ pub enum DaemonRequest {
     SendChatMessage {
         text: String,
     },
+    SendChatMessageV1 {
+        message_id: String,
+        text: String,
+    },
     SetPaused {
         paused: bool,
     },
@@ -133,6 +147,10 @@ pub enum DaemonResponse {
     ChatReply {
         text: String,
     },
+    ChatReplyV1 {
+        message_id: String,
+        text: String,
+    },
     JsonPayload(serde_json::Value),
     Killed,
     Ack,
@@ -152,10 +170,18 @@ pub enum DaemonEvent {
         delta: String,
         done: bool,
     },
+    ChatTokenV1 {
+        message_id: String,
+        delta: String,
+        done: bool,
+    },
     TaskProgress {
         task_id: String,
         step: u32,
         action_summary: String,
+    },
+    ApprovalResolved {
+        request_id: String,
     },
     ApprovalRequested {
         request_id: String,

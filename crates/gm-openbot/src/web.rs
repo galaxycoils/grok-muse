@@ -1,7 +1,7 @@
 use crate::bridges::{BridgeInboundMessage, BridgeRouter, verify_slack_signature};
 use crate::supervisor::OpenBotSupervisor;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json};
@@ -79,17 +79,17 @@ fn check_auth(
     headers: &HeaderMap,
     expected_token: Option<&str>,
 ) -> std::result::Result<(), StatusCode> {
-    let Some(expected) = expected_token else {
-        return Ok(());
+    let Some(expected) = expected_token.filter(|t| !t.trim().is_empty()) else {
+        return Err(StatusCode::UNAUTHORIZED);
     };
-    if expected.trim().is_empty() {
-        return Ok(());
-    }
     let auth_val = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if auth_val == format!("Bearer {expected}") {
+    if crate::bridges::constant_time_eq(
+        auth_val.as_bytes(),
+        format!("Bearer {expected}").as_bytes(),
+    ) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -105,6 +105,8 @@ pub fn build_companion_router(state: CompanionWebState) -> Router {
         .route("/a2a/card", get(serve_agent_card))
         .route("/a2a/tasks", post(create_a2a_task))
         .route("/a2a/tasks/:id", get(get_a2a_task))
+        .route("/api/runtime", get(runtime_status))
+        .route("/api/events", get(replay_events))
         .route("/api/bots", get(list_bots))
         .route("/api/queue", get(list_queue).post(enqueue_task))
         .route("/api/tasks/:id/:action", post(control_task_route))
@@ -118,6 +120,14 @@ pub fn build_companion_router(state: CompanionWebState) -> Router {
         .route("/ag-ui/events", get(stream_agui_events))
         .route("/bridges/inbound", post(handle_bridge_inbound))
         .route("/bridges/slack/events", post(handle_slack_webhook))
+        .layer(axum::middleware::from_fn(|request:axum::extract::Request,next:axum::middleware::Next| async move {
+            let mut response=next.run(request).await;
+            for (key,value) in [("x-content-type-options","nosniff"),("referrer-policy","no-referrer"),("cache-control","no-store"),("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'")] {
+                response.headers_mut().insert(axum::http::HeaderName::from_static(key),axum::http::HeaderValue::from_static(value));
+            }
+            response
+        }))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
 
@@ -146,7 +156,25 @@ impl CompanionWebServer {
         self,
         bind_addr: &str,
     ) -> gm_core::error::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-        let listener = TcpListener::bind(bind_addr).await?;
+        if self
+            .state
+            .bearer_token
+            .as_ref()
+            .is_none_or(|t| t.trim().is_empty())
+        {
+            return Err(gm_core::error::GmError::Config(
+                "Companion authentication token is required".into(),
+            ));
+        }
+        let requested: SocketAddr = bind_addr.parse().map_err(|_| {
+            gm_core::error::GmError::Config("Use an explicit loopback IP and port".into())
+        })?;
+        if !requested.ip().is_loopback() {
+            return Err(gm_core::error::GmError::Config(
+                "Remote companion access requires a TLS pairing gateway; bind to loopback".into(),
+            ));
+        }
+        let listener = TcpListener::bind(requested).await?;
         let local_addr = listener.local_addr()?;
         let router = build_companion_router(self.state);
         let handle = tokio::spawn(async move {
@@ -169,6 +197,43 @@ async fn serve_script() -> impl IntoResponse {
 
 async fn serve_agent_card(State(state): State<CompanionWebState>) -> impl IntoResponse {
     Json(state.supervisor.a2a().agent_card())
+}
+
+async fn runtime_status(
+    headers: HeaderMap,
+    State(state): State<CompanionWebState>,
+) -> std::result::Result<impl IntoResponse, StatusCode> {
+    check_auth(&headers, state.bearer_token.as_deref())?;
+    Ok(Json(state.supervisor.runtime_status()))
+}
+
+#[derive(Deserialize)]
+struct EventCursor {
+    #[serde(default)]
+    after: u64,
+}
+async fn replay_events(
+    headers: HeaderMap,
+    Query(cursor): Query<EventCursor>,
+    State(state): State<CompanionWebState>,
+) -> std::result::Result<impl IntoResponse, StatusCode> {
+    check_auth(&headers, state.bearer_token.as_deref())?;
+    let events = state
+        .supervisor
+        .queue()
+        .events_after(cursor.after, 1000)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let next = events.last().map(|(id, _)| *id).unwrap_or(cursor.after);
+    let events: Vec<_> = events
+        .into_iter()
+        .map(|(id, mut e)| {
+            e["sequence"] = id.into();
+            e
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({"protocol_version":1,"events":events,"next_cursor":next}),
+    ))
 }
 
 async fn list_bots(
@@ -424,7 +489,10 @@ async fn stream_agui_events(
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
         Ok(evt) => {
             let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".into());
-            Some(Ok(Event::default().event(evt.event_type).data(json)))
+            Some(Ok(Event::default()
+                .id(evt.sequence.to_string())
+                .event(evt.event_type)
+                .data(json)))
         }
         // A lagged client must reload snapshots rather than silently miss state changes.
         Err(_) => Some(Ok(Event::default().event("RESYNC_REQUIRED").data("{}"))),
@@ -454,7 +522,12 @@ async fn handle_slack_webhook(
     State(state): State<CompanionWebState>,
     raw_body: String,
 ) -> std::result::Result<impl IntoResponse, StatusCode> {
-    if let Some(ref secret) = state.slack_signing_secret {
+    {
+        let secret = state
+            .slack_signing_secret
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         let ts = headers
             .get("x-slack-request-timestamp")
             .and_then(|v| v.to_str().ok())
@@ -475,6 +548,25 @@ async fn handle_slack_webhook(
     if val.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
         let challenge = val.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
         return Ok(Json(serde_json::json!({ "challenge": challenge })));
+    }
+
+    let event = val.get("event").ok_or(StatusCode::BAD_REQUEST)?;
+    if event.get("bot_id").is_some() || event.get("subtype").is_some() {
+        return Ok(Json(serde_json::json!({"accepted":false,"ignored":true})));
+    }
+    let event_id = val
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    // Delivery admission is durable across daemon restarts.
+    if !state
+        .supervisor
+        .queue()
+        .claim_delivery(&format!("slack:{event_id}"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Ok(Json(serde_json::json!({"accepted":true,"duplicate":true})));
     }
 
     let channel_id = val

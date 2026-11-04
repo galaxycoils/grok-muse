@@ -117,6 +117,25 @@ pub fn format_action_summary(action: &ComputerAction) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AgentCapabilities {
+    pub allow_gui: bool,
+    pub allow_shell: bool,
+    pub allow_network: bool,
+}
+
+impl Default for AgentCapabilities {
+    fn default() -> Self {
+        Self {
+            allow_gui: false,
+            allow_shell: false,
+            allow_network: true,
+        }
+    }
+}
+
+pub type CheckpointCallback = Arc<dyn Fn(&[StepRecord]) -> Result<()> + Send + Sync>;
+pub type MutationCallback = Arc<dyn Fn(bool) -> Result<()> + Send + Sync>;
 pub type ProgressCallback = Arc<dyn Fn(u32, &str) + Send + Sync>;
 pub type DelegationCallback = Arc<dyn Fn(&str, &str, &[String]) -> Result<String> + Send + Sync>;
 
@@ -135,6 +154,12 @@ pub struct AgentLoop<P: Platform> {
     vault_resolver: Option<VaultSecretResolver>,
     secret_scrubber: SecretScrubber,
     delegation_callback: Option<DelegationCallback>,
+    capabilities: AgentCapabilities,
+    secret_injection_enabled: bool,
+    system_prompt: String,
+    mutation_callback: Option<MutationCallback>,
+    checkpoint_callback: Option<CheckpointCallback>,
+    initial_history: Vec<StepRecord>,
 }
 
 fn action_type_name(action: &ComputerAction) -> &'static str {
@@ -177,7 +202,58 @@ impl<P: Platform> AgentLoop<P> {
             vault_resolver: None,
             secret_scrubber: SecretScrubber::new(),
             delegation_callback: None,
+            capabilities: AgentCapabilities::default(),
+            secret_injection_enabled: false,
+            system_prompt: String::new(),
+            mutation_callback: None,
+            checkpoint_callback: None,
+            initial_history: Vec::new(),
         }
+    }
+
+    pub fn with_checkpoint<F>(mut self, history: Vec<StepRecord>, callback: F) -> Self
+    where
+        F: Fn(&[StepRecord]) -> Result<()> + Send + Sync + 'static,
+    {
+        self.initial_history = history;
+        self.checkpoint_callback = Some(Arc::new(callback));
+        self
+    }
+    fn checkpoint(&self, history: &[StepRecord]) -> Result<()> {
+        if let Some(callback) = &self.checkpoint_callback {
+            callback(history)?;
+        }
+        Ok(())
+    }
+
+    pub fn with_secret_injection(mut self, enabled: bool) -> Self {
+        self.secret_injection_enabled = enabled;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt = prompt;
+        self
+    }
+
+    pub fn with_mutation_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(bool) -> Result<()> + Send + Sync + 'static,
+    {
+        self.mutation_callback = Some(Arc::new(callback));
+        self
+    }
+
+    fn mark_mutation(&self, in_flight: bool) -> Result<()> {
+        if let Some(cb) = &self.mutation_callback {
+            cb(in_flight)?;
+        }
+        Ok(())
     }
 
     pub fn with_mcp_bridge(mut self, bridge: McpToolBridge) -> Self {
@@ -239,7 +315,18 @@ impl<P: Platform> AgentLoop<P> {
             );
         }
 
-        let res = self.run_task_loop(task_id, instruction).await;
+        let mut kill_events = self.kill_switch.subscribe();
+        let res = if self.kill_switch.is_triggered() {
+            Err(GmError::SafetyViolation(
+                "Execution stopped by Kill Switch".into(),
+            ))
+        } else {
+            tokio::select! {
+                biased;
+                _ = kill_events.recv() => Err(GmError::SafetyViolation("Execution stopped by Kill Switch".into())),
+                result = self.run_task_loop(task_id, instruction) => result,
+            }
+        };
         match &res {
             Ok(summary) => {
                 if let Some(audit) = &self.audit {
@@ -272,6 +359,9 @@ impl<P: Platform> AgentLoop<P> {
     }
 
     async fn run_task_loop(&self, task_id: &str, instruction: &str) -> Result<String> {
+        if self.capabilities.allow_gui {
+            self.platform.begin_task(task_id).await?;
+        }
         let recorder = if let Some(ref dir) = self.config.trajectory_dir {
             TrajectoryRecorder::with_directory(task_id, instruction, dir.clone())
         } else {
@@ -281,7 +371,7 @@ impl<P: Platform> AgentLoop<P> {
         let mut step = 0;
         let mut consecutive_no_change_retries = 0;
         let mut last_action_feedback: Option<String> = None;
-        let mut step_history: Vec<StepRecord> = Vec::new();
+        let mut step_history: Vec<StepRecord> = self.initial_history.clone();
         let mut prev_action_was_mutating = false;
 
         while step < self.config.max_steps {
@@ -309,7 +399,19 @@ impl<P: Platform> AgentLoop<P> {
             }
 
             // 2. Snapshot AX tree
-            let raw_snapshot = self.platform.ax_snapshot(None).await?;
+            let raw_snapshot = if self.capabilities.allow_gui {
+                self.platform.ax_snapshot(None).await?
+            } else {
+                // A workspace agent must never inspect the host screen.
+                AxSnapshot {
+                    window_id: 0,
+                    app_name: String::new(),
+                    window_title: String::new(),
+                    bounds: gm_core::types::Rect::new(0.0, 0.0, 0.0, 0.0),
+                    elements: Vec::new(),
+                    timestamp_ms: 0,
+                }
+            };
 
             // 3. Blocklist check on frontmost window
             if self
@@ -358,17 +460,25 @@ impl<P: Platform> AgentLoop<P> {
                     .map(|prev| prev.ax_digest == current_ax_digest)
                     .unwrap_or(false);
 
-            let should_escalate_vision =
-                self.config.always_include_vision || is_sparse_ui || is_stagnated;
+            let (vision_primary, vision_fallback) = self.router.route(TaskType::CuVisionStep);
+            let vision_permitted = vision_primary.allow_vision
+                || vision_fallback.is_some_and(|target| target.allow_vision);
+            let should_escalate_vision = self.capabilities.allow_gui
+                && vision_permitted
+                && (self.config.always_include_vision || is_sparse_ui || is_stagnated);
 
-            let task_type = if should_escalate_vision {
+            let task_type = if !self.capabilities.allow_gui {
+                TaskType::Planning
+            } else if should_escalate_vision {
                 TaskType::CuVisionStep
             } else {
                 TaskType::CuAxStep
             };
 
             // 6. Frame capture (required if vision escalated or capture_frames enabled)
-            let frame_capture = if should_escalate_vision || self.config.capture_frames {
+            let frame_capture = if self.capabilities.allow_gui
+                && (should_escalate_vision || self.config.capture_frames)
+            {
                 self.platform.capture(Some(1280), Some(70)).await.ok()
             } else {
                 None
@@ -406,7 +516,9 @@ impl<P: Platform> AgentLoop<P> {
                 for rec in &step_history {
                     history_block.push_str(&format!(
                         "- Step {}: {} -> {}\n",
-                        rec.step, rec.action_summary, rec.outcome
+                        rec.step,
+                        rec.action_summary.chars().take(500).collect::<String>(),
+                        rec.outcome.chars().take(8000).collect::<String>()
                     ));
                 }
             }
@@ -431,16 +543,21 @@ impl<P: Platform> AgentLoop<P> {
             };
 
             let mcp_tools_block = if let Some(ref bridge) = self.mcp_bridge {
-                bridge.format_tools_prompt()
+                if self.capabilities.allow_network {
+                    bridge.format_tools_prompt()
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
 
+            let history_block = format_untrusted_context(&history_block, "observed_tool_history");
             let prompt_text = format!(
                 "Goal: {instruction}\n\nCurrent window state:\n{untrusted_block}{history_block}{feedback_block}{stagnation_block}{som_legend_block}{mcp_tools_block}\n\nPick the next action in JSON format."
             );
 
-            let messages = match &som_annotation {
+            let mut messages = match &som_annotation {
                 Some(som) => vec![
                     ChatMessage::text(
                         "system",
@@ -456,6 +573,15 @@ impl<P: Platform> AgentLoop<P> {
                     ChatMessage::text("user", prompt_text),
                 ],
             };
+
+            let tool_contract = format!(
+                "{}\nCapabilities: GUI={}, shell={}, network={}. Workspace calls use {{\"action\":\"WorkspaceReadFile\",\"params\":{{\"path\":\"relative/path\"}}}}; also WorkspaceWriteFile (path, content), WorkspaceListFiles (path), WorkspaceShell (command, timeout_ms). Completion must use {{\"action\":\"Done\",\"params\":{{\"summary\":\"result and evidence\"}}}}. Never claim an action succeeded without its observed result.",
+                self.system_prompt,
+                self.capabilities.allow_gui,
+                self.capabilities.allow_shell,
+                self.capabilities.allow_network
+            );
+            messages[0].content.push_str(&format!("\n{tool_contract}"));
 
             // 11. Route and execute LLM step
             let (primary, fallback) = self.router.route(task_type);
@@ -486,6 +612,12 @@ impl<P: Platform> AgentLoop<P> {
             if let Some(ref bridge) = self.mcp_bridge
                 && let Some(mcp_inv) = try_parse_mcp_tool_call(&response.content)
             {
+                if !self.capabilities.allow_network {
+                    return Err(GmError::PermissionDenied(
+                        "MCP/network access is disabled for this bot".into(),
+                    ));
+                }
+                self.mark_mutation(true)?;
                 let mcp_summary = format!("McpTool({})", mcp_inv.name);
                 if let Some(ref cb) = self.progress_callback {
                     cb(step, &mcp_summary);
@@ -499,6 +631,7 @@ impl<P: Platform> AgentLoop<P> {
                         self.audit.as_ref(),
                     )
                     .await?;
+                self.mark_mutation(false)?;
                 step_history.push(StepRecord {
                     step,
                     action_summary: mcp_summary,
@@ -508,6 +641,7 @@ impl<P: Platform> AgentLoop<P> {
                 if step_history.len() > self.config.max_history_steps {
                     step_history.remove(0);
                 }
+                self.checkpoint(&step_history)?;
                 prev_action_was_mutating = false;
                 last_action_feedback = None;
                 continue;
@@ -517,8 +651,47 @@ impl<P: Platform> AgentLoop<P> {
             if let Some(ob_action) = try_parse_openbot_step_action(&response.content) {
                 match ob_action {
                     OpenBotStepAction::WorkspaceTool(ref ws_call) => {
+                        if matches!(
+                            ws_call,
+                            crate::workspace_tools::WorkspaceToolCall::Shell { .. }
+                        ) && !self.capabilities.allow_shell
+                        {
+                            return Err(GmError::PermissionDenied(
+                                "Shell execution is disabled for this bot".into(),
+                            ));
+                        }
                         if let Some(ref sandbox) = self.workspace_sandbox {
-                            let ws_summary = format!("WorkspaceTool({ws_call:?})");
+                            let mutating = matches!(
+                                ws_call,
+                                crate::workspace_tools::WorkspaceToolCall::WriteFile { .. }
+                                    | crate::workspace_tools::WorkspaceToolCall::Shell { .. }
+                            );
+                            if mutating {
+                                self.mark_mutation(true)?;
+                            }
+                            let ws_summary = match ws_call {
+                                crate::workspace_tools::WorkspaceToolCall::ReadFile { path } => {
+                                    format!("ReadFile({path})")
+                                }
+                                crate::workspace_tools::WorkspaceToolCall::WriteFile {
+                                    path,
+                                    content,
+                                } => format!("WriteFile({path}, {} bytes)", content.len()),
+                                crate::workspace_tools::WorkspaceToolCall::ListFiles { path } => {
+                                    format!("ListFiles({path:?})")
+                                }
+                                crate::workspace_tools::WorkspaceToolCall::Shell {
+                                    command,
+                                    ..
+                                } => format!(
+                                    "Shell({})",
+                                    self.secret_scrubber
+                                        .scrub_str(command)
+                                        .chars()
+                                        .take(300)
+                                        .collect::<String>()
+                                ),
+                            };
                             if let Some(ref cb) = self.progress_callback {
                                 cb(step, &ws_summary);
                             }
@@ -532,6 +705,9 @@ impl<P: Platform> AgentLoop<P> {
                                     self.audit.as_ref(),
                                 )
                                 .await?;
+                            if mutating {
+                                self.mark_mutation(false)?;
+                            }
                             step_history.push(StepRecord {
                                 step,
                                 action_summary: ws_outcome.summary,
@@ -541,6 +717,7 @@ impl<P: Platform> AgentLoop<P> {
                             if step_history.len() > self.config.max_history_steps {
                                 step_history.remove(0);
                             }
+                            self.checkpoint(&step_history)?;
                             prev_action_was_mutating = false;
                             last_action_feedback = None;
                             continue;
@@ -550,6 +727,29 @@ impl<P: Platform> AgentLoop<P> {
                         ref token,
                         ref secret_ref,
                     } => {
+                        if !self.capabilities.allow_gui {
+                            return Err(GmError::PermissionDenied(
+                                "Secret injection requires desktop access".into(),
+                            ));
+                        }
+                        if !self.secret_injection_enabled {
+                            return Err(GmError::PermissionDenied("Credential injection is disabled; use human handoff to enter credentials".into()));
+                        }
+                        let approval = ApprovalRequest {
+                            task_id: task_id.into(),
+                            step,
+                            action: ComputerAction::Type {
+                                text: format!("[credential: {secret_ref}]"),
+                            },
+                            target_label: token.clone(),
+                            reason: "Inject this credential into the selected desktop field".into(),
+                        };
+                        if !self.interaction_handler.request_approval(&approval).await? {
+                            return Err(GmError::PermissionDenied(
+                                "Credential injection was not approved".into(),
+                            ));
+                        }
+                        self.mark_mutation(true)?;
                         let resolver = self.vault_resolver.clone().unwrap_or_default();
                         let lease_start = Instant::now();
                         let leased = resolver.resolve(secret_ref)?;
@@ -570,6 +770,7 @@ impl<P: Platform> AgentLoop<P> {
                                 text: leased.value.clone(),
                             })
                             .await?;
+                        self.mark_mutation(false)?;
                         let lease_ms = lease_start.elapsed().as_millis() as u64;
                         let summary = format!("FillSecret({secret_ref})");
                         if let Some(ref cb) = self.progress_callback {
@@ -603,6 +804,7 @@ impl<P: Platform> AgentLoop<P> {
                         if step_history.len() > self.config.max_history_steps {
                             step_history.remove(0);
                         }
+                        self.checkpoint(&step_history)?;
                         prev_action_was_mutating = true;
                         last_action_feedback = None;
                         continue;
@@ -688,10 +890,13 @@ impl<P: Platform> AgentLoop<P> {
                         if let Some(ref cb) = self.progress_callback {
                             cb(step, &summary);
                         }
+                        self.mark_mutation(true)?;
                         let outcome = if let Some(ref del_cb) = self.delegation_callback {
                             del_cb(target_bot_id, goal, artifacts)?
                         } else {
-                            format!("Queued A2A handoff to @{target_bot_id}: {goal}")
+                            return Err(GmError::Config(
+                                "Delegation is unavailable in this session".into(),
+                            ));
                         };
                         step_history.push(StepRecord {
                             step,
@@ -699,9 +904,12 @@ impl<P: Platform> AgentLoop<P> {
                             outcome,
                             ax_digest: current_ax_digest,
                         });
+                        self.checkpoint(&step_history)?;
+                        self.mark_mutation(false)?;
                         if step_history.len() > self.config.max_history_steps {
                             step_history.remove(0);
                         }
+                        self.checkpoint(&step_history)?;
                         prev_action_was_mutating = false;
                         last_action_feedback = None;
                         continue;
@@ -712,10 +920,24 @@ impl<P: Platform> AgentLoop<P> {
             // 12b. Parse GUI action and resolve Set-of-Marks badge references
             let mut action: ComputerAction = match serde_json::from_str(&response.content) {
                 Ok(a) => a,
-                Err(_) => ComputerAction::Done {
-                    summary: response.content.clone(),
-                },
+                Err(e) => {
+                    last_action_feedback = Some(format!(
+                        "Invalid action JSON: {e}. Return a supported action; this response did not execute."
+                    ));
+                    continue;
+                }
             };
+
+            if !self.capabilities.allow_gui
+                && !matches!(
+                    action,
+                    ComputerAction::Done { .. } | ComputerAction::AskUser { .. }
+                )
+            {
+                return Err(GmError::PermissionDenied(
+                    "Host desktop access is disabled for this bot".into(),
+                ));
+            }
 
             // Resolve SoM badge tokens (e.g. "#1", "1", "som_1") to ax_token and coordinates
             if let ComputerAction::Click {
@@ -806,6 +1028,15 @@ impl<P: Platform> AgentLoop<P> {
                     .await?;
 
                 if approved {
+                    let current = sanitize_ax_snapshot(self.platform.ax_snapshot(None).await?);
+                    if current.window_id != sanitized_snapshot.window_id
+                        || compute_ax_digest(&current) != current_ax_digest
+                    {
+                        return Err(GmError::SafetyViolation(
+                            "The target changed while approval was pending; request approval again"
+                                .into(),
+                        ));
+                    }
                     info!("Action {:?} approved by interaction handler", action);
                     if let Some(audit) = &self.audit {
                         audit.log(
@@ -878,7 +1109,11 @@ impl<P: Platform> AgentLoop<P> {
                 ComputerAction::Done { summary } => {
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        frame_capture.clone(),
+                        if self.config.capture_frames {
+                            frame_capture.clone()
+                        } else {
+                            None
+                        },
                         Some(sanitized_snapshot),
                         action.clone(),
                         None,
@@ -908,7 +1143,11 @@ impl<P: Platform> AgentLoop<P> {
                         None => {
                             let duration_ms = step_start.elapsed().as_millis() as u64;
                             recorder.record_step(
-                                frame_capture.clone(),
+                                if self.config.capture_frames {
+                                    frame_capture.clone()
+                                } else {
+                                    None
+                                },
                                 Some(sanitized_snapshot),
                                 action.clone(),
                                 None,
@@ -916,7 +1155,7 @@ impl<P: Platform> AgentLoop<P> {
                                 duration_ms,
                             );
                             recorder.finish(Some(format!("Asked user: {question}")));
-                            return Ok(question.clone());
+                            return Ok(format!("[WAITING_FOR_HUMAN] {question}"));
                         }
                     }
                 }
@@ -935,7 +1174,9 @@ impl<P: Platform> AgentLoop<P> {
                             }),
                         );
                     }
+                    self.mark_mutation(true)?;
                     self.platform.act(other).await?;
+                    self.mark_mutation(false)?;
 
                     // 18. Verify-after-act: capture post-action snapshot and compute diff
                     let raw_post = self.platform.ax_snapshot(None).await?;
@@ -944,7 +1185,11 @@ impl<P: Platform> AgentLoop<P> {
 
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        frame_capture.clone(),
+                        if self.config.capture_frames {
+                            frame_capture.clone()
+                        } else {
+                            None
+                        },
                         Some(sanitized_snapshot.clone()),
                         action.clone(),
                         Some(diff.clone()),
@@ -970,6 +1215,7 @@ impl<P: Platform> AgentLoop<P> {
                         ax_digest: current_ax_digest,
                     };
                     step_history.push(rec);
+                    self.checkpoint(&step_history)?;
                     if step_history.len() > self.config.max_history_steps {
                         step_history.remove(0);
                     }
@@ -1030,7 +1276,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1041,7 +1291,12 @@ mod tests {
             kill_switch,
             blocklist,
             AgentLoopConfig::default(),
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent
             .run_task("test_1", "Open Notes and write a poem")
@@ -1056,7 +1311,11 @@ mod tests {
         let mock_backend = Arc::new(MockLlmBackend::new());
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         kill_switch.trigger();
 
@@ -1068,7 +1327,12 @@ mod tests {
             kill_switch,
             blocklist,
             AgentLoopConfig::default(),
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent.run_task("test_ks", "Run something dangerous").await;
         assert!(res.is_err());
@@ -1088,7 +1352,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1099,7 +1367,12 @@ mod tests {
             kill_switch,
             blocklist,
             AgentLoopConfig::default(),
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent.run_task("test_send", "Send important email").await;
         assert!(res.is_err());
@@ -1118,7 +1391,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1129,7 +1406,12 @@ mod tests {
             kill_switch,
             blocklist,
             AgentLoopConfig::default(),
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent.run_task("test_focus", "Open password vault").await;
         assert!(res.is_err());
@@ -1155,7 +1437,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend.clone(), budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1175,7 +1461,12 @@ mod tests {
             kill_switch,
             blocklist,
             config,
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent.run_task("test_coexistence", "Click button").await;
         assert!(res.is_ok());
@@ -1194,7 +1485,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1207,7 +1502,12 @@ mod tests {
             ..Default::default()
         };
 
-        let agent = AgentLoop::new(platform, llm, router, kill_switch, blocklist, config);
+        let agent = AgentLoop::new(platform, llm, router, kill_switch, blocklist, config)
+            .with_capabilities(AgentCapabilities {
+                allow_gui: true,
+                allow_shell: false,
+                allow_network: true,
+            });
 
         let res = agent.run_task("test_retry_bound", "Type something").await;
         assert!(res.is_ok());
@@ -1226,7 +1526,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
         let audit = Arc::new(AuditLogger::in_memory());
@@ -1239,6 +1543,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_audit(audit.clone());
 
         let res = agent.run_task("test_audit_task", "Test instruction").await;
@@ -1292,7 +1601,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1306,7 +1619,12 @@ mod tests {
                 sparse_ax_threshold: 5, // 2 elements < 5 threshold triggers SoM vision!
                 ..Default::default()
             },
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent.run_task("test_som_res", "Click submit badge").await;
         assert!(res.is_ok());
@@ -1357,7 +1675,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend.clone(), budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1371,7 +1693,12 @@ mod tests {
                 sparse_ax_threshold: 2, // 10 elements > 2 -> starts as CuAxStep
                 ..Default::default()
             },
-        );
+        )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        });
 
         let res = agent
             .run_task("test_stagnation", "Test stagnation vision")
@@ -1396,7 +1723,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
         let audit = Arc::new(AuditLogger::in_memory());
@@ -1411,6 +1742,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_audit(audit.clone())
         .with_interaction_handler(interactive_handler);
 
@@ -1438,7 +1774,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
         let audit = Arc::new(AuditLogger::in_memory());
@@ -1453,6 +1793,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_audit(audit.clone())
         .with_interaction_handler(interactive_handler);
 
@@ -1490,7 +1835,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1506,6 +1855,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_interaction_handler(handler);
 
         let res = agent.run_task("test_ask_continue", "Process payment").await;
@@ -1524,7 +1878,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
 
@@ -1539,6 +1897,11 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
         .with_progress_callback(move |step, action_summary| {
             progress_steps_clone
                 .lock()
@@ -1591,7 +1954,11 @@ mod tests {
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
         let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
-        let router = LlmRouter::new(ProvidersConfig::default());
+        let router = LlmRouter::new(ProvidersConfig {
+            allow_screenshot_egress_meta: true,
+            allow_screenshot_egress_xai: true,
+            ..Default::default()
+        });
         let kill_switch = KillSwitch::new();
         let blocklist = BlocklistManager::default();
         let audit = Arc::new(AuditLogger::in_memory());
@@ -1608,6 +1975,12 @@ mod tests {
             blocklist,
             AgentLoopConfig::default(),
         )
+        .with_capabilities(AgentCapabilities {
+            allow_gui: true,
+            allow_shell: false,
+            allow_network: true,
+        })
+        .with_secret_injection(true)
         .with_workspace_sandbox(sandbox.clone())
         .with_vault_resolver(resolver)
         .with_secret_scrubber(scrubber.clone())

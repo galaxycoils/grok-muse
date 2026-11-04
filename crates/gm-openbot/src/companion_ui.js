@@ -119,13 +119,14 @@ function renderQueue(tasks) {
     item.append(node('strong', `@${t.bot_id} · ${t.status.replaceAll('_', ' ').toUpperCase()}`), node('div', t.instruction, 'content'));
     if (t.result_summary) item.append(node('div', t.result_summary, 'content'));
     const actions = node('div', undefined, 'row');
-    if (t.status === 'waiting_for_human') {
+    if (t.status === 'waiting_for_human' || (t.mutating_in_flight && ['failed', 'cancelled'].includes(t.status))) {
       item.append(node('div', `Take the Wheel: ${t.blocker_note || 'Human intervention needed'}`, 'content'));
       actions.append(actionButton(t.id, 'wheel-resume', 'Hand Back to Bot'));
     }
-    if (t.status === 'queued') actions.append(actionButton(t.id, 'pause', 'Pause'));
-    if (t.status === 'paused' || t.status === 'failed') actions.append(actionButton(t.id, 'resume', 'Retry / Resume'));
-    if (['queued', 'paused', 'waiting_for_human'].includes(t.status)) actions.append(actionButton(t.id, 'cancel', 'Cancel'));
+    if (['queued', 'running'].includes(t.status)) actions.append(actionButton(t.id, 'pause', 'Pause'));
+    if (t.status === 'paused') actions.append(actionButton(t.id, 'wheel-resume', 'Review / Resume'));
+    if (['failed', 'cancelled'].includes(t.status) && !t.mutating_in_flight) actions.append(actionButton(t.id, 'retry', 'Retry')); 
+    if (['queued', 'running', 'pause_requested', 'paused', 'waiting_for_human'].includes(t.status)) actions.append(actionButton(t.id, 'cancel', 'Cancel'));
     item.append(actions);
     return item;
   }));
@@ -150,9 +151,9 @@ async function refreshAll() {
   const audit = ui.audit;
   const channel = ui.channel;
   try {
-    const [bots, channels, tasks, records] = await Promise.all([
+    const [bots, channels, tasks, records, runtime] = await Promise.all([
       api('/api/bots'), api('/api/channels'), api('/api/queue'),
-      api(`/api/audit${audit ? '?category=' + encodeURIComponent(audit) : ''}`),
+      api(`/api/audit${audit ? '?category=' + encodeURIComponent(audit) : ''}`), api('/api/runtime'),
     ]);
     if (epoch !== ui.epoch) return;
     renderBots(bots);
@@ -165,7 +166,8 @@ async function refreshAll() {
       if (epoch === ui.epoch && selected === ui.channel) renderMessages(messages, selected);
     } else renderMessages([], '');
     if (epoch === ui.epoch) {
-      status('Connected · refreshes every 3s', true);
+      status(runtime.worker_running ? (runtime.demo_mode ? 'Demo workers · simulated model' : 'Connected · workers active') : 'Connected · task worker unavailable', true);
+      $('runtime-status').textContent = runtime.worker_running ? `Tasks execute automatically. Host desktop control: ${runtime.host_desktop_opt_in ? 'enabled by opt-in' : 'disabled'}. Shell: ${runtime.shell_environment}.` : 'Task worker is unavailable; requests remain queued until a runtime starts.';
       if (ui.connectionError) notice();
       ui.connectionError = false;
     }

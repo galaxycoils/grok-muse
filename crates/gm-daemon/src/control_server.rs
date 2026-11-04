@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use gm_agent::{AgentLoop, AgentLoopConfig};
 use gm_core::config::GmConfig;
 use gm_core::error::{GmError, Result};
 use gm_core::ipc::{
@@ -47,11 +46,38 @@ impl DaemonApprovalHandler {
     }
 }
 
+struct PendingApprovalGuard {
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    request_id: String,
+    events: broadcast::Sender<DaemonEvent>,
+}
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(&self.request_id);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let pending = self.pending.clone();
+            let id = self.request_id.clone();
+            runtime.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+        let _ = self.events.send(DaemonEvent::ApprovalResolved {
+            request_id: self.request_id.clone(),
+        });
+    }
+}
+
 #[async_trait]
 impl gm_agent::InteractionHandler for DaemonApprovalHandler {
     async fn request_approval(&self, req: &gm_agent::ApprovalRequest) -> Result<bool> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
+        let _guard = PendingApprovalGuard {
+            pending: self.pending_approvals.clone(),
+            request_id: request_id.clone(),
+            events: self.event_tx.clone(),
+        };
         self.pending_approvals
             .lock()
             .await
@@ -137,8 +163,6 @@ pub struct DaemonControlServer {
     llm_client: Arc<HybridLlmClient>,
     router: LlmRouter,
     kill_switch: KillSwitch,
-    blocklist: BlocklistManager,
-    audit_log: Arc<AuditLogger>,
     platform: Arc<IpcPlatformClient>,
     openbot: Option<gm_openbot::OpenBotSupervisor>,
 }
@@ -151,7 +175,7 @@ impl DaemonControlServer {
         llm_client: Arc<HybridLlmClient>,
         router: LlmRouter,
         kill_switch: KillSwitch,
-        blocklist: BlocklistManager,
+        _blocklist: BlocklistManager,
         audit_log: Arc<AuditLogger>,
         platform: Arc<IpcPlatformClient>,
     ) -> Self {
@@ -173,11 +197,27 @@ impl DaemonControlServer {
             llm_client,
             router,
             kill_switch,
-            blocklist,
-            audit_log,
             platform,
             openbot,
         }
+    }
+
+    pub fn start_runtime(&self) -> Result<tokio::task::JoinHandle<()>> {
+        self.openbot
+            .as_ref()
+            .ok_or_else(|| GmError::Config("Task runtime could not initialize".into()))?
+            .start_runtime(
+                self.platform.clone(),
+                self.llm_client.clone(),
+                self.router.clone(),
+                self.kill_switch.clone(),
+                BlocklistManager::new(&self.config.safety.blocklisted_apps),
+                Some(Arc::new(DaemonApprovalHandler::new(
+                    self.pending_approvals.clone(),
+                    self.event_tx.clone(),
+                    std::time::Duration::from_secs(60),
+                ))),
+            )
     }
 
     pub fn openbot(&self) -> Option<&gm_openbot::OpenBotSupervisor> {
@@ -316,8 +356,6 @@ impl DaemonControlServer {
             llm_client: Arc::clone(&self.llm_client),
             router: self.router.clone(),
             kill_switch: self.kill_switch.clone(),
-            blocklist: self.blocklist.clone(),
-            audit_log: Arc::clone(&self.audit_log),
             platform: Arc::clone(&self.platform),
             openbot: self.openbot.clone(),
         }
@@ -336,10 +374,19 @@ struct DaemonControlServerState {
     llm_client: Arc<HybridLlmClient>,
     router: LlmRouter,
     kill_switch: KillSwitch,
-    blocklist: BlocklistManager,
-    audit_log: Arc<AuditLogger>,
     platform: Arc<IpcPlatformClient>,
     openbot: Option<gm_openbot::OpenBotSupervisor>,
+}
+
+fn chat_event(id: &Option<String>, delta: String, done: bool) -> DaemonEvent {
+    match id {
+        Some(id) => DaemonEvent::ChatTokenV1 {
+            message_id: id.clone(),
+            delta,
+            done,
+        },
+        None => DaemonEvent::ChatToken { delta, done },
+    }
 }
 
 impl DaemonControlServerState {
@@ -361,6 +408,10 @@ impl DaemonControlServerState {
                 ControlRequestEnvelope::Raw(req) => (0, req),
             };
 
+            let chat_id = match &request {
+                DaemonRequest::SendChatMessageV1 { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            };
             match request {
                 DaemonRequest::Ping => {
                     let res = IpcMessage {
@@ -395,6 +446,9 @@ impl DaemonControlServerState {
                 }
                 DaemonRequest::SetPaused { paused } => {
                     self.paused.store(paused, Ordering::SeqCst);
+                    if let Some(sup) = &self.openbot {
+                        sup.set_runtime_paused(paused)?;
+                    }
                     let _ = self.event_tx.send(DaemonEvent::HudStateChanged {
                         state: if paused {
                             "Paused".into()
@@ -465,7 +519,8 @@ impl DaemonControlServerState {
                     };
                     write_ipc_message(&mut stream, &res).await?;
                 }
-                DaemonRequest::SendChatMessage { text } => {
+                DaemonRequest::SendChatMessage { text }
+                | DaemonRequest::SendChatMessageV1 { text, .. } => {
                     let _ = self.event_tx.send(DaemonEvent::HudStateChanged {
                         state: "Thinking".into(),
                         detail: "Thinking...".into(),
@@ -475,34 +530,31 @@ impl DaemonControlServerState {
                     let messages = vec![ChatMessage::text("user", text.clone())];
                     let (primary, fallback) = self.router.route(TaskType::Planning);
 
-                    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
                     let event_tx_delta = self.event_tx.clone();
+                    let forward_id = chat_id.clone();
                     let forward_task = tokio::spawn(async move {
                         while let Some(delta) = delta_rx.recv().await {
-                            let _ =
-                                event_tx_delta.send(DaemonEvent::ChatToken { delta, done: false });
+                            let _ = event_tx_delta.send(chat_event(&forward_id, delta, false));
                         }
                     });
 
-                    match self
-                        .llm_client
-                        .complete_stream(
-                            &primary,
-                            fallback.as_ref(),
-                            &messages,
-                            1024,
-                            0.2,
-                            delta_tx,
-                        )
-                        .await
-                    {
+                    let mut kill_events = self.kill_switch.subscribe();
+                    let chat_client = self.llm_client.scoped_job();
+                    let result = if self.kill_switch.is_triggered() {
+                        drop(delta_tx);
+                        Err(GmError::SafetyViolation("Emergency stop is active".into()))
+                    } else {
+                        tokio::select! {biased; _=kill_events.recv()=>Err(GmError::SafetyViolation("Chat stopped by emergency stop".into())),
+                        result=chat_client.complete_stream(&primary,fallback.as_ref(),&messages,1024,0.2,delta_tx)=>result }
+                    };
+                    match result {
                         Ok(completion) => {
                             let _ = forward_task.await;
                             let reply = completion.content;
-                            let _ = self.event_tx.send(DaemonEvent::ChatToken {
-                                delta: String::new(),
-                                done: true,
-                            });
+                            let _ = self
+                                .event_tx
+                                .send(chat_event(&chat_id, String::new(), true));
                             let _ = self.event_tx.send(DaemonEvent::HudStateChanged {
                                 state: "Idle".into(),
                                 detail: "Ready".into(),
@@ -510,7 +562,13 @@ impl DaemonControlServerState {
                             });
                             let res = IpcMessage {
                                 id: request_id,
-                                payload: DaemonResponse::ChatReply { text: reply },
+                                payload: match &chat_id {
+                                    Some(id) => DaemonResponse::ChatReplyV1 {
+                                        message_id: id.clone(),
+                                        text: reply,
+                                    },
+                                    None => DaemonResponse::ChatReply { text: reply },
+                                },
                             };
                             write_ipc_message(&mut stream, &res).await?;
                         }
@@ -530,82 +588,26 @@ impl DaemonControlServerState {
                     }
                 }
                 DaemonRequest::SubmitTask { instruction } => {
-                    let task_id = format!("task_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-                    if self.kill_switch.is_triggered() {
-                        self.kill_switch.reset();
-                    }
-                    *self.active_task.lock().await = Some(instruction.clone());
-
-                    let _ = self.event_tx.send(DaemonEvent::HudStateChanged {
-                        state: "Acting".into(),
-                        detail: instruction.clone(),
-                        daily_spend_usd: self.budget.get_daily_spent(),
-                    });
-                    let _ = self.event_tx.send(DaemonEvent::TaskProgress {
-                        task_id: task_id.clone(),
-                        step: 0,
-                        action_summary: format!("Task started: {instruction}"),
-                    });
-
-                    let active_task = Arc::clone(&self.active_task);
-                    let event_tx = self.event_tx.clone();
-                    let budget = Arc::clone(&self.budget);
-
-                    let approval_handler = Arc::new(DaemonApprovalHandler::new(
-                        Arc::clone(&self.pending_approvals),
-                        self.event_tx.clone(),
-                        std::time::Duration::from_secs(60),
-                    ));
-
-                    let event_tx_progress = self.event_tx.clone();
-                    let tid_progress = task_id.clone();
-
-                    let agent = AgentLoop::new(
-                        Arc::clone(&self.platform),
-                        Arc::clone(&self.llm_client),
-                        self.router.clone(),
-                        self.kill_switch.clone(),
-                        self.blocklist.clone(),
-                        AgentLoopConfig::default(),
-                    )
-                    .with_audit(Arc::clone(&self.audit_log))
-                    .with_interaction_handler(approval_handler)
-                    .with_progress_callback(move |step, action_summary| {
-                        let _ = event_tx_progress.send(DaemonEvent::TaskProgress {
-                            task_id: tid_progress.clone(),
-                            step,
-                            action_summary: action_summary.to_string(),
-                        });
-                    });
-
-                    let tid = task_id.clone();
-                    let instr = instruction.clone();
-                    let handle = tokio::spawn(async move {
-                        let result = agent.run_task(&tid, &instr).await;
-                        let (ok, message) = match result {
-                            Ok(summary) => (true, summary),
-                            Err(e) => (false, e.to_string()),
-                        };
-                        *active_task.lock().await = None;
-                        let _ = event_tx.send(DaemonEvent::TaskFinished {
-                            task_id: tid,
-                            ok,
-                            message,
-                        });
-                        let _ = event_tx.send(DaemonEvent::HudStateChanged {
-                            state: "Idle".into(),
-                            detail: "Ready".into(),
-                            daily_spend_usd: budget.get_daily_spent(),
-                        });
-                    });
-
-                    *self.active_task_handle.lock().await = Some(handle);
-
-                    let res = IpcMessage {
-                        id: request_id,
-                        payload: DaemonResponse::Accepted { id: task_id },
+                    let payload = match self.openbot.as_ref() {
+                        Some(sup) if !self.kill_switch.is_triggered() => {
+                            match sup.submit_task(None, Some("general"), &instruction, 0) {
+                                Ok(task) => DaemonResponse::Accepted { id: task.id },
+                                Err(error) => DaemonResponse::Error(error.to_string()),
+                            }
+                        }
+                        Some(_) => DaemonResponse::Error(
+                            "Emergency stop is active; restart the runtime to resume".into(),
+                        ),
+                        None => DaemonResponse::Error("Task runtime is unavailable".into()),
                     };
-                    write_ipc_message(&mut stream, &res).await?;
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
                 }
                 DaemonRequest::ListBots => {
                     let payload = if let Some(ref sup) = self.openbot {

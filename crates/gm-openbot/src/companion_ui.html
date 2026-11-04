@@ -151,7 +151,7 @@
   <section class="card">
     <h2 id="channel-heading">Channel conversation</h2>
     <p id="channel-description" class="muted"></p>
-    <p class="muted">Messages are saved and can queue bot work. Automatic queue execution is not available in this build.</p>
+    <p class="muted">Messages are saved and can queue bot work.</p>
     <div id="messages-list" role="log" aria-label="Channel messages"></div>
     <form id="message-form">
       <label for="message-input">Message · mention @bot to choose responders</label>
@@ -159,7 +159,7 @@
       <button type="submit">Send message</button>
     </form>
     <h2>Task queue &amp; Take the Wheel</h2>
-    <p class="muted">Queue controls change pending work. Running tasks cannot be interrupted here.</p>
+    <p id="runtime-status" class="muted">Checking task runtime…</p>
     <form id="task-form" class="row">
       <label for="task-bot">Bot</label>
       <select id="task-bot" style="width:140px;margin:0;"></select>

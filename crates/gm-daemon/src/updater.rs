@@ -120,42 +120,27 @@ pub use gm_core::hash::{Sha256, compute_sha256};
 /// Verify checksum of data against expected hex digest or checksum file content.
 /// Optionally matches filename if checksum file is a multi-line manifest (e.g. SHA256SUMS).
 pub fn verify_checksum(actual_hash: &str, checksum_input: &str, asset_name: Option<&str>) -> bool {
-    let target = actual_hash.trim().to_lowercase();
-
-    // If an asset name is provided, prioritize matching against lines containing the asset name
+    let target = actual_hash.trim();
+    if target.len() != 64 || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
     if let Some(name) = asset_name {
-        let mut found_asset_line = false;
-        for line in checksum_input.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains(name) {
-                found_asset_line = true;
-                for token in trimmed.split_whitespace() {
-                    let clean = token
-                        .trim()
-                        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                        .to_lowercase();
-                    if clean.len() == 64 && clean == target {
-                        return true;
-                    }
-                }
-            }
-        }
-        if found_asset_line {
-            return false;
-        }
+        let matches: Vec<_> = checksum_input
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                let file = parts
+                    .next()?
+                    .strip_prefix('*')
+                    .unwrap_or_else(|| line.split_whitespace().nth(1).unwrap_or(""));
+                (parts.next().is_none() && file == name).then_some(hash)
+            })
+            .collect();
+        return matches.len() == 1 && matches[0].eq_ignore_ascii_case(target);
     }
-
-    // Generic fallback: check any 64-character token in the input
-    for token in checksum_input.split_whitespace() {
-        let clean = token
-            .trim()
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_lowercase();
-        if clean.len() == 64 && clean == target {
-            return true;
-        }
-    }
-    false
+    let input = checksum_input.trim();
+    input.len() == 64 && input.eq_ignore_ascii_case(target)
 }
 
 /// Parse GitHub release payload and compare with current version.
