@@ -1,0 +1,152 @@
+[
+  {
+    "id": "research-01",
+    "workflow": "research",
+    "scenario": "compare-official-sources"
+  },
+  {
+    "id": "research-02",
+    "workflow": "research",
+    "scenario": "verify-direct-quotation"
+  },
+  {
+    "id": "research-03",
+    "workflow": "research",
+    "scenario": "resolve-conflicting-dates"
+  },
+  {
+    "id": "research-04",
+    "workflow": "research",
+    "scenario": "detect-broken-citation"
+  },
+  {
+    "id": "research-05",
+    "workflow": "research",
+    "scenario": "reject-injected-web-content"
+  },
+  {
+    "id": "research-06",
+    "workflow": "research",
+    "scenario": "build-source-backed-report"
+  },
+  {
+    "id": "research-07",
+    "workflow": "research",
+    "scenario": "cite-local-document"
+  },
+  {
+    "id": "research-08",
+    "workflow": "research",
+    "scenario": "cross-check-numeric-claim"
+  },
+  {
+    "id": "research-09",
+    "workflow": "research",
+    "scenario": "preserve-citations-after-restart"
+  },
+  {
+    "id": "research-10",
+    "workflow": "research",
+    "scenario": "export-research-deliverable"
+  },
+  {
+    "id": "coding-01",
+    "workflow": "coding",
+    "scenario": "import-project"
+  },
+  {
+    "id": "coding-02",
+    "workflow": "coding",
+    "scenario": "create-isolated-git-workspace"
+  },
+  {
+    "id": "coding-03",
+    "workflow": "coding",
+    "scenario": "claude-code-change"
+  },
+  {
+    "id": "coding-04",
+    "workflow": "coding",
+    "scenario": "codex-code-change"
+  },
+  {
+    "id": "coding-05",
+    "workflow": "coding",
+    "scenario": "grok-code-change"
+  },
+  {
+    "id": "coding-06",
+    "workflow": "coding",
+    "scenario": "run-tests-in-guest"
+  },
+  {
+    "id": "coding-07",
+    "workflow": "coding",
+    "scenario": "review-generated-patch"
+  },
+  {
+    "id": "coding-08",
+    "workflow": "coding",
+    "scenario": "reject-patch-conflict"
+  },
+  {
+    "id": "coding-09",
+    "workflow": "coding",
+    "scenario": "apply-approved-patch"
+  },
+  {
+    "id": "coding-10",
+    "workflow": "coding",
+    "scenario": "cancel-agent-and-recover"
+  },
+  {
+    "id": "desktop-01",
+    "workflow": "desktop",
+    "scenario": "complete-onboarding"
+  },
+  {
+    "id": "desktop-02",
+    "workflow": "desktop",
+    "scenario": "grant-and-revoke-permissions"
+  },
+  {
+    "id": "desktop-03",
+    "workflow": "desktop",
+    "scenario": "multi-monitor-scaled-target"
+  },
+  {
+    "id": "desktop-04",
+    "workflow": "desktop",
+    "scenario": "approve-reversible-action"
+  },
+  {
+    "id": "desktop-05",
+    "workflow": "desktop",
+    "scenario": "refuse-irreversible-action"
+  },
+  {
+    "id": "desktop-06",
+    "workflow": "desktop",
+    "scenario": "human-handoff-resume"
+  },
+  {
+    "id": "desktop-07",
+    "workflow": "desktop",
+    "scenario": "keyboard-only-navigation"
+  },
+  {
+    "id": "desktop-08",
+    "workflow": "desktop",
+    "scenario": "compose-ime-text"
+  },
+  {
+    "id": "desktop-09",
+    "workflow": "desktop",
+    "scenario": "restart-with-draft-and-task"
+  },
+  {
+    "id": "desktop-10",
+    "workflow": "desktop",
+    "scenario": "export-binary-artifact"
+  }
+]

@@ -1,4 +1,6 @@
 pub mod config;
+#[cfg(feature = "sqlite")]
+pub mod database;
 pub mod error;
 pub mod hash;
 pub mod ipc;

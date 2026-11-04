@@ -51,8 +51,9 @@ pub fn default_config_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GmConfig {
+    pub schema_version: u32,
     pub socket_path: PathBuf,
     #[serde(default = "default_daemon_socket_path")]
     pub daemon_socket_path: PathBuf,
@@ -104,6 +105,12 @@ impl GmConfig {
     }
 
     pub fn validate(&self) -> crate::error::Result<()> {
+        if self.schema_version != 1 {
+            return Err(crate::error::GmError::Config(format!(
+                "Unsupported configuration schema {}; original preserved",
+                self.schema_version
+            )));
+        }
         if !self.budget.daily_spend_cap_usd.is_finite()
             || self.budget.daily_spend_cap_usd < 0.0
             || !self.budget.per_job_spend_cap_usd.is_finite()
@@ -124,6 +131,26 @@ impl GmConfig {
     }
     pub fn save(&self, path: &Path) -> crate::error::Result<()> {
         self.validate()?;
+        match std::fs::read(path) {
+            Ok(original) => {
+                let old: Self = serde_json::from_slice(&original)?;
+                old.validate()?;
+                let value: serde_json::Value = serde_json::from_slice(&original)?;
+                if value
+                    .get("schema_version")
+                    .is_some_and(|version| version.as_u64() != Some(1))
+                {
+                    return Err(crate::error::GmError::Config(
+                        "Refusing to overwrite an unsupported configuration schema".into(),
+                    ));
+                }
+                if value.get("schema_version").is_none() {
+                    crate::storage::preserve_private_file(path, &original)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         crate::storage::atomic_write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
@@ -186,6 +213,7 @@ impl Default for GmConfig {
         };
 
         Self {
+            schema_version: 1,
             socket_path,
             daemon_socket_path: default_daemon_socket_path(),
             storage_dir,
@@ -483,5 +511,34 @@ impl Default for WorkspaceVmConfig {
             trusted_public_key_hex: String::new(),
             firmware_path: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn legacy_config_is_backed_up_and_future_config_never_overwritten() {
+        let root = std::env::temp_dir().join(format!("gm-config-schema-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let config = GmConfig::load(Some(&path)).unwrap();
+        config.save(&path).unwrap();
+        let backups: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension().and_then(|s| s.to_str()) == Some("bak")).then_some(p)
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{}");
+        let future = b"{\"schema_version\":2}";
+        std::fs::write(&path, future).unwrap();
+        assert!(GmConfig::load(Some(&path)).is_err());
+        assert!(config.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

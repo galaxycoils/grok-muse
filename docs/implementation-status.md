@@ -33,8 +33,8 @@ This branch implements the task/runtime foundation, native daily-use features, s
 - Persistent channel instructions (`ChannelInfo.instructions`, `create_channel_with_instructions`, `update_channel_instructions`, `gm channels set-instructions`) with supervisor prompt injection for channel bot tasks.
 - Team templates and safe import/export (`gm team export`, `gm team preview`, `gm team import`) with strict credential exclusion and trigger safety (all imported routines forced to `enabled = false`).
 - Durable routines quiet hours (`QuietHours`, `is_quiet`), overlap suppression recording, and persistent SQLite run history (`routine_runs_v1`, `gm routines runs <id>`).
-- CLI provider drivers in `gm-llm` (`CliDriver`, `CliLlmBackend`) for Claude, Codex, and Grok with explicit PATH/version availability checks, actionable auth instructions, and honest cost labeling (`0.0` USD).
-- SQLite automated corruption recovery (`open_sqlite_with_recovery`) preserving corrupt databases and WAL/SHM files to timestamped `.bak` files without silent data deletion.
+- CLI discovery metadata exists, but host execution and version probes are disabled pending a signed, isolated CLI-agent VM profile. Official distribution inputs for Claude, Codex and Grok Build are pinned for provisioning; live CLI execution and unknown-cost accounting remain release blockers.
+- SQLite ordinary opens now fail closed. Explicit `gm diagnostics recover-database` requires exclusive runtime/database leases and verified preservation of database/WAL/SHM files. Queue/channel/routine, usage and pinned memory migrations are versioned, transactional and backed up. Configuration and roster formats are versioned with legacy backup preservation. Audit/replay lifecycle policy remains outstanding.
 - Local health diagnostics (`gm diagnostics check`) and sanitized support bundle export (`gm diagnostics export`) with `SecretScrubber` credential redaction and SHA-256 fingerprint verification.
 - Release engineering documentation: `THIRD_PARTY_NOTICES.md`, `CONTRIBUTING.md`, `docs/SUPPORT_MATRIX.md`, `docs/TROUBLESHOOTING.md`, and `docs/PRIVACY.md`.
 
@@ -101,3 +101,7 @@ The native app was exercised through a private Xvfb display using software graph
 The release-manifest generator was independently checked with OpenSSL. The guest export boundary tests pass without claiming a booted VM. Hardware performance checks now run separately through the manually invoked native-desktop workflow on an authorized self-hosted Mac. Missing native services, measurements or live provider credentials fail explicitly; simulations do not certify a production release.
 
 A single post-task software-graphics sample measured approximately 116 MiB for the native UI and 159 MiB across UI/daemon/helper, above the 120 MiB whole-tree UI-open target. This is not a steady-state native-GPU measurement. The target remains unmet in this environment.
+
+## Cross-platform release readiness follow-up
+
+See [release readiness](release-readiness.md) for the current safety fixes, routine entry points, native import/save and bot duplication, platform service definitions, exact-target manual updates, signed candidate workflow, and evidence contract. Public release remains blocked; no signed VM/CLI-agent certification, complete research/coding workflow or hardware acceptance is claimed.

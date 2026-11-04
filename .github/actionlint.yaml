@@ -1,0 +1,4 @@
+self-hosted-runner:
+  labels:
+    - grok-muse-desktop
+    - grok-muse-release

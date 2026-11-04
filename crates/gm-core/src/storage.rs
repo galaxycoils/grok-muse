@@ -42,3 +42,33 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Preserve small serialized stores before their format changes. The original
+/// is untouched until a verified, fsynced, exclusively created copy exists.
+pub fn preserve_private_file(path: &Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("File has no parent"))?;
+    let backup = parent.join(format!(
+        "{}-{}.bak",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&backup)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if std::fs::read(&backup)? != bytes {
+        return Err(std::io::Error::other("Backup verification failed; original preserved").into());
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(backup)
+}

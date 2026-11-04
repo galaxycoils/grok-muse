@@ -132,8 +132,7 @@ cd grok-muse
 cargo test -p gm-openbot --locked
 ```
 
-The dependency is not pinned to a Darius revision yet; this is tracked in the
-[reliability review](docs/openmausbot-comparison.md).
+Darius is pinned to `f47a4ce980abecb751c9f5c79e1c424a20100433` by bootstrap and CI. Run `tools/bootstrap.sh` to check the sibling checkout.
 
 ### Building the DMG
 ```bash
@@ -253,17 +252,16 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 
 The companion now supports channel conversations and creating channels with a topic,
 members, and default responder. It refreshes automatically, preserves failed sends,
-and supports the server's optional bearer token. **Automatic queue execution is not
-connected yet:** messages and tasks are persisted, but `gm serve` does not run agents.
+and supports the server's optional bearer token. Both daemon and standalone `gm serve` own an exclusive runtime lease and dispatch
+bounded workers. Persisted submission acknowledgments are distinct from task completion.
 See the [OpenMausBot comparison and reliability review](docs/openmausbot-comparison.md)
 for the feature roadmap and runtime blockers.
 
 For token-protected local use, set `GROK_MUSE_COMPANION_TOKEN` in the server process's
 environment before starting `gm serve` or `gm daemon`, then enter that token in the
 companion's Connect form. The page keeps it only until reload. Keep the default
-loopback bind; remote access/pairing is not established by this setting. Slack's
-optional signing secret uses `GROK_MUSE_SLACK_SIGNING_SECRET`; replay protection is
-still outstanding (see the review).
+loopback bind; remote access/pairing is not established by this setting. Slack requires `GROK_MUSE_SLACK_SIGNING_SECRET`, a configured channel allowlist,
+fresh signed timestamps and durable delivery deduplication.
 
 ```bash
 # List the persistent bot roster (muse, researcher, coder, guardian)
@@ -416,3 +414,7 @@ Grok-Muse is continuously tested on both **macOS (`macos-14`)** and **Linux (`ub
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## Release readiness
+
+Public cross-platform release remains blocked until signed packages and signed VM images, CLI-agent containment, real model/workflow quality, desktop permissions/accessibility and native performance are independently verified. Host CLI inference is disabled. See [release readiness](docs/release-readiness.md) for implemented changes and outstanding gates.

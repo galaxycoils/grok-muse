@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use gm_core::error::{GmError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CliProvider {
@@ -44,7 +43,7 @@ impl CliProvider {
                 or set `export OPENAI_API_KEY=\"sk-...\"` in your environment."
             }
             CliProvider::Grok => {
-                "Run `grok auth` in your terminal to authenticate with xAI, \
+                "Run `grok login --device-auth` in your terminal to authenticate with xAI, \
                 or set `export XAI_API_KEY=\"xai-...\"` in your environment."
             }
         }
@@ -54,7 +53,9 @@ impl CliProvider {
         match self {
             CliProvider::Claude => "Install via npm: `npm install -g @anthropic-ai/claude-code`",
             CliProvider::Codex => "Install via npm: `npm install -g @openai/codex`",
-            CliProvider::Grok => "Install via package manager or visit https://x.ai/grok-cli",
+            CliProvider::Grok => {
+                "Official distribution: `npm install -g @xai-official/grok` (https://docs.x.ai/build/overview)"
+            }
         }
     }
 
@@ -134,45 +135,11 @@ impl CliDriver {
             };
         };
 
-        // Check version
-        let version_out = Command::new(&bin).arg("--version").output();
-        let (version, ver_err) = match version_out {
-            Ok(output) if output.status.success() => {
-                let ver_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                (Some(ver_str), None)
-            }
-            Ok(output) => {
-                let err_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                (
-                    None,
-                    Some(format!(
-                        "Binary execution failed with code {:?}: {}",
-                        output.status.code(),
-                        err_str
-                    )),
-                )
-            }
-            Err(e) => (
-                None,
-                Some(format!("Failed to execute {}: {e}", bin.display())),
-            ),
-        };
-
-        // Check authentication presence
-        let auth_env = std::env::var(self.provider.environment_auth_var()).ok();
-        let authenticated = auth_env.is_some_and(|v| !v.trim().is_empty());
-
-        let error_message = if let Some(err) = ver_err {
-            Some(err)
-        } else if !authenticated {
-            Some(format!(
-                "{} is installed but not authenticated. {}",
-                self.provider.display_name(),
-                self.provider.auth_flow_instructions()
-            ))
-        } else {
-            None
-        };
+        // Discovery must not execute a PATH binary or mistake an environment
+        // variable for verified login. CLI execution requires a certified guest.
+        let version = None;
+        let authenticated = false;
+        let error_message = Some(HOST_CLI_DISABLED.into());
 
         CliAvailability {
             provider: self.provider,
@@ -192,86 +159,14 @@ impl CliDriver {
     /// Costs are labeled honestly as 0.0 with unknown_cli_cost metadata.
     pub async fn complete(
         &self,
-        model: Option<&str>,
-        prompt: &str,
+        _model: Option<&str>,
+        _prompt: &str,
     ) -> Result<ChatCompletionResponse> {
-        let availability = self.check_availability();
-        if !availability.installed {
-            return Err(GmError::Config(availability.error_message.unwrap_or_else(
-                || format!("{} binary is not installed", self.provider.display_name()),
-            )));
-        }
-
-        let bin = availability
-            .binary_path
-            .as_ref()
-            .ok_or_else(|| GmError::Config("Binary path resolution error".into()))?;
-
-        // Format command invocation based on provider
-        let mut cmd = tokio::process::Command::new(bin);
-        match self.provider {
-            CliProvider::Claude => {
-                cmd.arg("-p").arg(prompt);
-                if let Some(m) = model
-                    && m != self.provider.binary_name()
-                {
-                    cmd.arg("--model").arg(m);
-                }
-            }
-            CliProvider::Codex => {
-                cmd.arg("exec").arg(prompt);
-                if let Some(m) = model
-                    && m != self.provider.binary_name()
-                {
-                    cmd.arg("--model").arg(m);
-                }
-            }
-            CliProvider::Grok => {
-                cmd.arg("-p").arg(prompt);
-                if let Some(m) = model
-                    && m != self.provider.binary_name()
-                {
-                    cmd.arg("--model").arg(m);
-                }
-            }
-        }
-
-        let output = cmd.output().await.map_err(|e| {
-            GmError::Provider(format!(
-                "Failed to spawn {} process: {e}",
-                self.provider.display_name()
-            ))
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GmError::Provider(format!(
-                "{} failed (status {}): {stderr}. If this is an authentication issue, {}",
-                self.provider.display_name(),
-                output.status,
-                self.provider.auth_flow_instructions()
-            )));
-        }
-
-        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let prompt_tokens = (prompt.len() / 4).max(1) as u32;
-        let completion_tokens = (content.len() / 4).max(1) as u32;
-
-        Ok(ChatCompletionResponse {
-            id: format!(
-                "cli-{}-{}",
-                self.provider.binary_name(),
-                uuid::Uuid::new_v4()
-            ),
-            content,
-            model: model.unwrap_or(self.provider.binary_name()).to_string(),
-            prompt_tokens,
-            completion_tokens,
-            // Milestone 4: Label unknown CLI costs honestly (0.0 USD, non-metered)
-            estimated_cost_usd: 0.0,
-        })
+        Err(GmError::SafetyViolation(HOST_CLI_DISABLED.into()))
     }
 }
+
+pub const HOST_CLI_DISABLED: &str = "Host CLI execution is disabled. Use an API provider until the signed CLI-agent VM profile, provider-only egress, isolated credentials and process cleanup are certified.";
 
 pub fn find_binary_on_path(binary_name: &str) -> Option<PathBuf> {
     if let Some(paths) = std::env::var_os("PATH") {
@@ -333,6 +228,28 @@ impl LlmBackend for CliLlmBackend {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn host_cli_execution_and_version_probes_are_disabled() {
+        let root = std::env::temp_dir().join(format!("gm-cli-denied-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-cli");
+        // Invalid executable still counts as present; discovery must never run it.
+        std::fs::write(&executable, b"not executable").unwrap();
+        for provider in [CliProvider::Claude, CliProvider::Codex, CliProvider::Grok] {
+            let driver = CliDriver::new(provider).with_binary_path(executable.clone());
+            let available = driver.check_availability();
+            assert!(available.installed);
+            assert!(!available.authenticated);
+            assert!(available.version.is_none());
+            assert_eq!(available.error_message.as_deref(), Some(HOST_CLI_DISABLED));
+            assert!(matches!(
+                driver.complete(None, "run a shell").await,
+                Err(GmError::SafetyViolation(_))
+            ));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn test_cli_provider_attributes_and_auth_instructions() {
         let claude = CliProvider::Claude;
@@ -347,7 +264,10 @@ mod tests {
 
         let grok = CliProvider::Grok;
         assert_eq!(grok.binary_name(), "grok");
-        assert!(grok.auth_flow_instructions().contains("grok auth"));
+        assert!(
+            grok.auth_flow_instructions()
+                .contains("grok login --device-auth")
+        );
         assert_eq!(grok.environment_auth_var(), "XAI_API_KEY");
     }
 

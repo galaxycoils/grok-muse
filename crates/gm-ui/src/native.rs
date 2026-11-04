@@ -53,6 +53,9 @@ async fn rpc(config: &GmConfig, request: DaemonRequest) -> Result<DaemonResponse
         )
         .await?;
         let reply: IpcMessage<DaemonResponse> = read_ipc_message(&mut connection).await?;
+        if reply.id != 1 {
+            return Err(GmError::Ipc("Mismatched daemon reply".into()));
+        }
         match reply.payload {
             DaemonResponse::Error(error) => Err(GmError::Ipc(error)),
             reply => Ok(reply),
@@ -180,6 +183,7 @@ impl Shared {
     }
 }
 struct NativeApp {
+    runtime: tokio::runtime::Handle,
     shared: Shared,
     requests: tokio::sync::mpsc::Sender<(DaemonRequest, Option<String>)>,
     draft: String,
@@ -203,6 +207,96 @@ struct NativeApp {
     xai_key: String,
 }
 impl NativeApp {
+    fn pick_attachments(&self) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Import files into bot inbox")
+            .pick_files();
+        let requests = self.requests.clone();
+        let bot = self.bot.clone();
+        let shared = self.shared.clone();
+        self.runtime.spawn(async move {
+            if let Some(files) = dialog.await {
+                if files.len() > 64 {
+                    shared.update(|s| s.error = Some("Select at most 64 files".into()));
+                    return;
+                }
+                for file in files {
+                    if requests
+                        .send((
+                            DaemonRequest::ImportAttachment {
+                                bot_id: bot.clone(),
+                                source_path: file.path().into(),
+                            },
+                            None,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        shared.update(|s| s.error = Some("Request queue closed".into()));
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    fn save_artifact(&self, path: &str) {
+        let name = Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Save reviewed artifact")
+            .set_file_name(name)
+            .save_file();
+        let config = self.settings_config.clone();
+        let bot = self.bot.clone();
+        let path = path.to_string();
+        let shared = self.shared.clone();
+        self.runtime.spawn(async move {
+            let Some(file) = dialog.await else {
+                return;
+            };
+            let result = async {
+                use base64::Engine;
+                let response = rpc(
+                    &config,
+                    DaemonRequest::ReadBotArtifact {
+                        bot_id: bot.clone(),
+                        path: path.clone(),
+                    },
+                )
+                .await?;
+                let DaemonResponse::JsonPayload(value) = response else {
+                    return Err(GmError::Ipc("Unexpected artifact response".into()));
+                };
+                if value["bot_id"].as_str() != Some(bot.as_str())
+                    || value["path"].as_str() != Some(path.as_str())
+                {
+                    return Err(GmError::Ipc("Mismatched artifact response".into()));
+                }
+                let encoded = value["base64"]
+                    .as_str()
+                    .ok_or_else(|| GmError::Ipc("Missing artifact bytes".into()))?;
+                if encoded.len() > 12 * 1024 * 1024 {
+                    return Err(GmError::Ipc("Artifact exceeds transfer limit".into()));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| GmError::Ipc("Invalid artifact encoding".into()))?;
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(GmError::Ipc("Artifact exceeds transfer limit".into()));
+                }
+                file.write(&bytes).await?;
+                Ok::<(), GmError>(())
+            }
+            .await;
+            shared.update(|s| match result {
+                Ok(()) => s.messages.push(("Saved".into(), path)),
+                Err(e) => s.error = Some(e.to_string()),
+            });
+        });
+    }
     fn send(&self, request: DaemonRequest) {
         if let Err(error) = self.requests.try_send((request, None)) {
             self.shared
@@ -424,6 +518,7 @@ impl eframe::App for NativeApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.task_mode, "Run task");
                 ui.checkbox(&mut self.channel_mode, "Channel message");
+                if ui.button("Duplicate bot").clicked() { self.send(DaemonRequest::DuplicateBot { bot_id:self.bot.clone() }); }
                 if ui.button("Edit bot").clicked() {
                     self.bot_editor = bots
                         .iter()
@@ -588,11 +683,13 @@ impl eframe::App for NativeApp {
             let mut open = true;
             egui::Window::new("Attachments and artifacts").vscroll(true).max_height(600.0).open(&mut open).default_width(650.0).show(ctx,|ui| {
                 ui.label(format!("Files for @{}. Drop files onto this window to import them into this bot's inbox (8 MiB maximum).",self.bot));
+                if ui.button("Import files…").clicked() {self.pick_attachments();}
                 if ui.button("Refresh files").clicked() {self.send(DaemonRequest::ListBotFiles {bot_id:self.bot.clone()});}
                 let (files,preview)={let s=self.shared.state.lock().unwrap_or_else(|e|e.into_inner());(s.files.clone(),s.file_preview.clone())};
                 if files["bot_id"].as_str()==Some(self.bot.as_str()) && let Some(files)=files["files"].as_array() {
                     egui::ScrollArea::vertical().id_salt("bot-files").max_height(220.0).show(ui,|ui| {
                         for file in files {let path=file["path"].as_str().unwrap_or("");ui.horizontal(|ui| {let width=(ui.available_width()-190.0).max(120.0);ui.add_sized([width,24.0],egui::Label::new(format!("{path} · {} bytes",file["size"])).truncate()).on_hover_text(path);
+                            if ui.button("Save…").clicked() {self.save_artifact(path);}
                             if ui.button("Preview").clicked() {self.send(DaemonRequest::PreviewBotFile {bot_id:self.bot.clone(),path:path.into()});}
                             if ui.button("Use in task").clicked() {if !self.draft.is_empty() {self.draft.push('\n');}self.draft.push_str(&format!("Attached file: {path}"));}
                         });}
@@ -634,8 +731,8 @@ impl eframe::App for NativeApp {
             let mut open = true;
             egui::Window::new("Routine schedule").vscroll(true).max_height(600.0).open(&mut open).default_width(540.0).show(ctx,|ui| {
                 for (key,label,multiline) in [("name","Name",false),("bot_id","Bot",false),("channel_id","Channel",false),("instruction","Task instructions",true),("timezone","IANA timezone (for example America/New_York)",false)] {
-                    ui.label(label);let mut text=routine[key].as_str().unwrap_or("").to_string();
-                    let changed=if multiline {ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(ui.available_width())).changed()} else {ui.text_edit_singleline(&mut text).changed()};
+                    let label_id=ui.label(label).id;let mut text=routine[key].as_str().unwrap_or("").to_string();
+                    let changed=if multiline {ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(ui.available_width())).labelled_by(label_id).changed()} else {ui.text_edit_singleline(&mut text).labelled_by(label_id).changed()};
                     if changed {routine[key]=if key=="channel_id" && text.trim().is_empty() {Value::Null} else {Value::String(text)};}
                 }
                 ui.horizontal(|ui| {
@@ -661,12 +758,12 @@ impl eframe::App for NativeApp {
             let mut open = true;
             egui::Window::new("Edit bot").open(&mut open).default_width(520.0).show(ctx,|ui| {
                 for (key,label,multiline) in [("display_name","Name",false),("role_title","Role",false),("system_prompt","Instructions",true),("preferred_model","Preferred model (optional)",false)] {
-                    ui.label(label);let mut text=profile[key].as_str().unwrap_or("").to_string();
-                    let changed=if multiline {ui.add(egui::TextEdit::multiline(&mut text).desired_rows(6).desired_width(ui.available_width())).changed()} else {ui.text_edit_singleline(&mut text).changed()};
+                    let label_id=ui.label(label).id;let mut text=profile[key].as_str().unwrap_or("").to_string();
+                    let changed=if multiline {ui.add(egui::TextEdit::multiline(&mut text).desired_rows(6).desired_width(ui.available_width())).labelled_by(label_id).changed()} else {ui.text_edit_singleline(&mut text).labelled_by(label_id).changed()};
                     if changed {profile[key]=if key=="preferred_model" && text.is_empty() {Value::Null} else {Value::String(text)};}
                 }
                 let mut provider=profile["preferred_provider"].as_str().unwrap_or("auto").to_string();
-                egui::ComboBox::from_label("Provider").selected_text(&provider).show_ui(ui,|ui| {for name in ["auto","meta","xai","local"] {ui.selectable_value(&mut provider,name.into(),name);}});
+                egui::ComboBox::from_label("Provider").selected_text(&provider).show_ui(ui,|ui| {for name in ["auto","meta","xai"] {ui.selectable_value(&mut provider,name.into(),name);}});
                 profile["preferred_provider"]=if provider=="auto" {Value::Null} else {Value::String(provider)};
                 for (key,label) in [("allow_gui","Desktop access"),("allow_shell","Workspace VM commands"),("allow_network","Network tools")] {
                     let mut allowed=profile[key].as_bool().unwrap_or(false);if ui.checkbox(&mut allowed,label).changed() {profile[key]=Value::Bool(allowed);}
@@ -688,8 +785,8 @@ impl eframe::App for NativeApp {
                 egui::ScrollArea::vertical().show(ui,|ui| {
                     ui.label("Configure a model provider, review spending limits, then choose the access your tasks need.");
                     ui.label("Save API credentials in your operating system credential store. Keys are never written to configuration or conversation history.");
-                    ui.label("Meta API key");ui.add(egui::TextEdit::singleline(&mut self.meta_key).password(true));
-                    ui.label("xAI API key");ui.add(egui::TextEdit::singleline(&mut self.xai_key).password(true));
+                    let label_id=ui.label("Meta API key").id;ui.add(egui::TextEdit::singleline(&mut self.meta_key).password(true)).labelled_by(label_id);
+                    let label_id=ui.label("xAI API key").id;ui.add(egui::TextEdit::singleline(&mut self.xai_key).password(true)).labelled_by(label_id);
                     let (saving,notice)={let s=self.shared.state.lock().unwrap_or_else(|e|e.into_inner());(s.credentials_saving,s.credentials_notice.clone())};
                     if ui.add_enabled(!saving && (!self.meta_key.is_empty() || !self.xai_key.is_empty()),egui::Button::new("Save API keys")).clicked() {
                         let meta=zeroize::Zeroizing::new(std::mem::take(&mut self.meta_key));
@@ -705,11 +802,11 @@ impl eframe::App for NativeApp {
                     ui.label(notice);
                     ui.separator();
                     ui.strong("Models");
-                    ui.label("Meta API base");ui.text_edit_singleline(&mut self.settings_config.providers.meta_api_base);
-                    ui.label("Computer-use model");ui.text_edit_singleline(&mut self.settings_config.providers.meta_cu_model);
-                    ui.label("Reasoning model");ui.text_edit_singleline(&mut self.settings_config.providers.meta_reasoning_model);
-                    ui.label("xAI API base");ui.text_edit_singleline(&mut self.settings_config.providers.xai_api_base);
-                    ui.label("xAI model");ui.text_edit_singleline(&mut self.settings_config.providers.xai_model);
+                    let label_id=ui.label("Meta API base").id;ui.text_edit_singleline(&mut self.settings_config.providers.meta_api_base).labelled_by(label_id);
+                    let label_id=ui.label("Computer-use model").id;ui.text_edit_singleline(&mut self.settings_config.providers.meta_cu_model).labelled_by(label_id);
+                    let label_id=ui.label("Reasoning model").id;ui.text_edit_singleline(&mut self.settings_config.providers.meta_reasoning_model).labelled_by(label_id);
+                    let label_id=ui.label("xAI API base").id;ui.text_edit_singleline(&mut self.settings_config.providers.xai_api_base).labelled_by(label_id);
+                    let label_id=ui.label("xAI model").id;ui.text_edit_singleline(&mut self.settings_config.providers.xai_model).labelled_by(label_id);
                     ui.separator();ui.strong("Spending limits (USD)");
                     ui.horizontal(|ui|{ui.label("Daily");ui.add(egui::DragValue::new(&mut self.settings_config.budget.daily_spend_cap_usd).range(0.0..=10000.0).speed(0.1));});
                     ui.horizontal(|ui|{ui.label("Per task");ui.add(egui::DragValue::new(&mut self.settings_config.budget.per_job_spend_cap_usd).range(0.0..=1000.0).speed(0.05));});
@@ -1041,6 +1138,7 @@ pub fn run(config: GmConfig, config_path: std::path::PathBuf) -> Result<()> {
             let (sender, receiver) = tokio::sync::mpsc::channel(64);
             runtime.spawn(background(config, shared.clone(), receiver));
             Ok(Box::new(NativeApp {
+                runtime: runtime.clone(),
                 shared,
                 requests: sender,
                 draft: restored.draft,

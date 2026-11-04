@@ -24,8 +24,10 @@ use tracing::{info, warn};
 
 pub mod control_server;
 pub mod diagnostics;
+pub mod patch;
 pub mod service;
 pub mod updater;
+mod user_services;
 
 pub use control_server::*;
 pub use diagnostics::*;
@@ -313,6 +315,14 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Review a VM-generated Git patch; applying requires its exact approved digest
+    Patch {
+        patch: PathBuf,
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        approve_sha256: Option<String>,
+    },
     /// Run local health diagnostics and export sanitized support bundles
     Diagnostics {
         #[command(subcommand)]
@@ -452,6 +462,12 @@ pub enum TeamSubcommand {
 pub enum RoutinesSubcommand {
     /// List configured routines and their schedules
     List,
+    /// Deliver an external event once without advancing the schedule
+    Trigger {
+        id: String,
+        #[arg(long)]
+        delivery_id: String,
+    },
     /// View recent execution history for a routine
     Runs {
         id: String,
@@ -464,6 +480,13 @@ pub enum RoutinesSubcommand {
 pub enum DiagnosticsSubcommand {
     /// Run local health checks across sockets, databases, permissions, and disk
     Check,
+    /// Explicitly quarantine a corrupt OpenBot database (stop all clients first)
+    RecoverDatabase,
+    /// Retain this many newest migration backups; never removes corruption evidence
+    PruneBackups {
+        #[arg(long)]
+        keep: usize,
+    },
     /// Export an explicitly approved, redacted support diagnostic bundle scrubbing secrets
     Export {
         /// Output bundle file path
@@ -1022,10 +1045,7 @@ pub async fn run_chat_loop<R: BufRead, W: Write>(
     )?);
     let llm_client = Arc::new(HybridLlmClient::new(backend, Arc::clone(&budget)));
     let router = LlmRouter::new(config.providers.clone());
-    let memory = Arc::new(
-        PersonalMemoryStore::default_store()
-            .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap()),
-    );
+    let memory = Arc::new(PersonalMemoryStore::default_store()?);
     let audit_log = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
 
     let system_prompt = system_override.unwrap_or_else(|| {
@@ -1390,10 +1410,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
     let llm_backend = build_llm_backend(&secrets);
     let llm_client = Arc::new(HybridLlmClient::new(llm_backend, Arc::clone(&budget)));
 
-    let memory = Arc::new(
-        PersonalMemoryStore::default_store()
-            .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap()),
-    );
+    let memory = Arc::new(PersonalMemoryStore::default_store()?);
 
     let proactive_engine = Arc::new(
         ProactiveEngine::new(QuietGateConfig::default(), Arc::clone(&budget))
@@ -1590,8 +1607,7 @@ pub async fn run_review(date_str: Option<String>) -> Result<()> {
 
     let config = GmConfig::load(None)?;
     let audit = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
-    let memory = PersonalMemoryStore::default_store()
-        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let memory = PersonalMemoryStore::default_store()?;
     let spend_cap = config.budget.daily_spend_cap_usd;
     let tracker = gm_goals::DogfoodTracker::default_tracker(spend_cap)?;
     let metrics = tracker.compute_metrics();
@@ -1667,8 +1683,7 @@ pub async fn run_audit(period_str: &str, json: bool) -> Result<()> {
 }
 
 pub async fn run_upkeep(stale_days: Option<i64>, json: bool) -> Result<()> {
-    let memory = PersonalMemoryStore::default_store()
-        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let memory = PersonalMemoryStore::default_store()?;
     let mut config = gm_memory::UpkeepConfig::default();
     if let Some(days) = stale_days {
         config.stale_observation_days = days;
@@ -1684,8 +1699,7 @@ pub async fn run_upkeep(stale_days: Option<i64>, json: bool) -> Result<()> {
 }
 
 pub async fn run_feed(limit: usize, json: bool) -> Result<()> {
-    let memory = PersonalMemoryStore::default_store()
-        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let memory = PersonalMemoryStore::default_store()?;
     let audit = AuditLogger::default_logger().unwrap_or_else(|_| AuditLogger::in_memory());
 
     let engine = ProactiveEngine::new(
@@ -1703,8 +1717,7 @@ pub async fn run_feed(limit: usize, json: bool) -> Result<()> {
 }
 
 pub async fn run_ideas(json: bool) -> Result<()> {
-    let memory = PersonalMemoryStore::default_store()
-        .unwrap_or_else(|_| PersonalMemoryStore::in_memory().unwrap());
+    let memory = PersonalMemoryStore::default_store()?;
     let config = GmConfig::load(None)?;
     let secrets = KeychainSecrets::default();
     let llm_backend = build_llm_backend(&secrets);
@@ -2157,6 +2170,23 @@ pub async fn run_routines(
 ) -> Result<()> {
     let sup = open_default_openbot_supervisor(config_path)?;
     match action.unwrap_or(RoutinesSubcommand::List) {
+        RoutinesSubcommand::Trigger { id, delivery_id } => {
+            let outcome = sup
+                .trigger_routine(&id, &delivery_id)?
+                .ok_or_else(|| GmError::Config(format!("Unknown routine: {id}")))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!(
+                    "{}{}",
+                    outcome.status,
+                    outcome
+                        .task_id
+                        .map(|id| format!(" task={id}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         RoutinesSubcommand::List => {
             let routines = sup.queue().list_routines()?;
             if json {
@@ -2211,8 +2241,34 @@ pub async fn run_diagnostics(
 ) -> Result<()> {
     let config = GmConfig::load(config_path.as_deref())?;
     match action.unwrap_or(DiagnosticsSubcommand::Check) {
+        DiagnosticsSubcommand::PruneBackups { keep } => {
+            let _lease = gm_openbot::runtime::RuntimeLease::acquire(&config.storage_dir)?;
+            let removed = gm_core::database::prune_migration_backups(&config.storage_dir, keep)?;
+            if json {
+                println!("{}", serde_json::json!({"removed":removed,"keep":keep}));
+            } else {
+                println!(
+                    "Removed {removed} migration backups; retained at least {keep} newest snapshots."
+                );
+            }
+        }
+        DiagnosticsSubcommand::RecoverDatabase => {
+            let backup =
+                gm_openbot::recover_corrupt_database(&config.storage_dir.join("openbot.sqlite"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"backup":backup,"status":"quarantined"})
+                );
+            } else {
+                println!(
+                    "Original database and sidecars preserved at {}. A new database will be created on next startup.",
+                    backup.display()
+                );
+            }
+        }
         DiagnosticsSubcommand::Check => {
-            let report = run_health_diagnostics(&config);
+            let report = run_health_diagnostics(&config).await;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2240,7 +2296,7 @@ pub async fn run_diagnostics(
         }
         DiagnosticsSubcommand::Export { output } => {
             println!("Generating sanitized diagnostic support bundle...");
-            let bundle = export_support_bundle(&config, &output)?;
+            let bundle = export_support_bundle(&config, &output).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&bundle)?);
             } else {
@@ -2251,7 +2307,7 @@ pub async fn run_diagnostics(
                 println!("  Version:           {}", bundle.grok_muse_version);
                 println!("  Platform:          {} ({})", bundle.os, bundle.arch);
                 println!(
-                    "  Redaction status:  VERIFIED ({} secret values scrubbed)",
+                    "  Redaction status:  VERIFIED FOR KNOWN SECRETS ({} registered values)",
                     bundle.scrubbed_secret_count
                 );
                 println!("  SHA-256 Checksum:  {}", bundle.sha256_fingerprint);
@@ -2340,31 +2396,31 @@ mod tests {
     #[tokio::test]
     async fn test_permissions_check_live() {
         let res = run_permissions(false, None, false).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
     async fn test_permissions_json_format() {
         let res = run_permissions(false, None, true).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
     async fn test_onboard_check_only_mode() {
         let res = run_onboard(true).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
     async fn test_status_command() {
         let res = run_status().await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
     async fn test_kill_command() {
         let res = run_kill().await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
@@ -2396,7 +2452,7 @@ mod tests {
     #[tokio::test]
     async fn test_service_commands() {
         let res = run_service(ServiceSubcommand::Status).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[tokio::test]
@@ -2458,7 +2514,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_feed_command() {
-        assert!(run_feed(10, false).await.is_ok());
+        let result = run_feed(10, false).await;
+        assert!(result.is_ok(), "{result:?}");
         assert!(run_feed(5, true).await.is_ok());
     }
 
@@ -2498,7 +2555,7 @@ mod tests {
         .with_audit(audit.clone());
 
         let res = agent.run_task("test_t1", "Click test").await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
 
         let entries = audit.entries();
         let done_entries: Vec<_> = entries
@@ -2517,7 +2574,7 @@ mod tests {
         let mut output = Vec::new();
 
         let res = run_chat_loop(reader, &mut output, None, None).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
 
         let out_str = String::from_utf8_lossy(&output);
         assert!(out_str.contains("Grok-Muse Interactive Terminal REPL"));
@@ -2542,7 +2599,7 @@ mod tests {
         unsafe {
             std::env::remove_var("GM_FORCE_MOCK_LLM");
         }
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
 
         let out_str = String::from_utf8_lossy(&output);
         assert!(out_str.contains("Unknown command: '/unknown_cmd'"));
@@ -3151,7 +3208,7 @@ mod tests {
         let res = run_kill_with_config(&config).await;
         let elapsed = start.elapsed();
 
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
         println!("Dual socket kill took: {:?}", elapsed);
         assert!(
             elapsed < std::time::Duration::from_millis(50),
@@ -3293,7 +3350,69 @@ mod tests {
             other => panic!("Expected JsonPayload, got {:?}", other),
         }
 
+        let routine = gm_openbot::Routine {
+            id: "external".into(),
+            name: "External event".into(),
+            bot_id: "muse".into(),
+            channel_id: None,
+            instruction: "Report".into(),
+            timezone: "UTC".into(),
+            hour: 12,
+            minute: 0,
+            weekdays: vec![],
+            quiet_hours: None,
+            enabled: true,
+        };
+        for (id, payload, expected) in [
+            (
+                2,
+                DaemonRequest::SaveRoutine {
+                    routine: serde_json::to_value(routine).unwrap(),
+                },
+                "ack",
+            ),
+            (
+                3,
+                DaemonRequest::TriggerRoutine {
+                    routine_id: "external".into(),
+                    delivery_id: "ipc-event".into(),
+                },
+                "queued",
+            ),
+            (
+                4,
+                DaemonRequest::TriggerRoutine {
+                    routine_id: "external".into(),
+                    delivery_id: "ipc-event".into(),
+                },
+                "duplicate",
+            ),
+        ] {
+            write_ipc_message(&mut stream, &IpcMessage { id, payload })
+                .await
+                .unwrap();
+            let reply: IpcMessage<DaemonResponse> = read_ipc_message(&mut stream).await.unwrap();
+            assert_eq!(reply.id, id);
+            match reply.payload {
+                DaemonResponse::Ack => assert_eq!(expected, "ack"),
+                DaemonResponse::JsonPayload(value) => assert_eq!(value["status"], expected),
+                other => panic!("Unexpected routine reply: {other:?}"),
+            }
+        }
+        assert!(
+            run_routines(
+                Some(RoutinesSubcommand::Trigger {
+                    id: "external".into(),
+                    delivery_id: "cli-event".into()
+                }),
+                true,
+                Some(config_path)
+            )
+            .await
+            .is_ok()
+        );
         srv_handle.abort();
+        let _ = srv_handle.await;
         let _ = std::fs::remove_file(&daemon_socket);
     }
 }

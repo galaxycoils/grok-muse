@@ -10,14 +10,40 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct PersonalMemoryStore {
     engine: Arc<Mutex<MemoryEngine>>,
+    // Keep the shared database ownership lease for the external engine lifetime.
+    _database: Option<Arc<Mutex<gm_core::database::Database>>>,
 }
 
 impl PersonalMemoryStore {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        let engine = MemoryEngine::open(db_path.as_ref())
+        let profile = db_path.as_ref();
+        let mut database = gm_core::database::Database::open(&profile.join("memory.db"))?;
+        // This contract matches pinned Darius f47a4ce. Upgrade it transactionally
+        // here before updating that pin; the external initializer is idempotent.
+        database.migrate("darius_memory", 1, |tx| {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS records (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT,
+                body TEXT NOT NULL CHECK(length(body)<=32768), tags TEXT NOT NULL DEFAULT '[]',
+                importance REAL NOT NULL DEFAULT 0.5, content_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                last_accessed_at INTEGER NOT NULL, source TEXT);
+                CREATE INDEX IF NOT EXISTS idx_records_hash ON records(content_hash);
+                CREATE INDEX IF NOT EXISTS idx_records_last_accessed ON records(last_accessed_at DESC);
+                CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(record_id,title,body,tags);
+                CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+                    INSERT INTO records_fts(record_id,title,body,tags) VALUES(new.id,new.title,new.body,new.tags); END;
+                CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+                    DELETE FROM records_fts WHERE record_id=old.id; END;
+                CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
+                    DELETE FROM records_fts WHERE record_id=old.id;
+                    INSERT INTO records_fts(record_id,title,body,tags) VALUES(new.id,new.title,new.body,new.tags); END;")
+                .map_err(|e| GmError::Platform(format!("Memory schema migration failed: {e}")))
+        })?;
+        let engine = MemoryEngine::open(profile)
             .map_err(|e| GmError::Platform(format!("Failed to open memory db: {e}")))?;
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
+            _database: Some(Arc::new(Mutex::new(database))),
         })
     }
 
@@ -26,6 +52,7 @@ impl PersonalMemoryStore {
             .map_err(|e| GmError::Platform(format!("Failed to open in-memory db: {e}")))?;
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
+            _database: None,
         })
     }
 
@@ -334,5 +361,36 @@ mod tests {
 
         // r1 was deleted
         assert_ne!(remaining[0].id, r1.id);
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn persistent_fts_store_reopens_and_future_schema_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = PersonalMemoryStore::open(root.path()).unwrap();
+        memory
+            .record_fact(Some("Migration test"), "persistent fixture", &[])
+            .unwrap();
+        drop(memory);
+        let memory = PersonalMemoryStore::open(root.path()).unwrap();
+        assert_eq!(memory.all_records(10).unwrap().len(), 1);
+        drop(memory);
+        let db = rusqlite::Connection::open(root.path().join("memory.db")).unwrap();
+        db.execute(
+            "UPDATE gm_schema_versions SET version=2 WHERE component='darius_memory'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        assert!(PersonalMemoryStore::open(root.path()).is_err());
+        let db = rusqlite::Connection::open(root.path().join("memory.db")).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM records", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

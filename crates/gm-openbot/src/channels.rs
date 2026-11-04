@@ -1,7 +1,8 @@
 use chrono::Utc;
+use gm_core::database::Database;
 use gm_core::error::{GmError, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,7 +55,7 @@ pub fn normalize_channel_id(id: &str) -> String {
 /// with single-task owner controls (`Stop`, `Resume`, `Reassign`, `Archive`, `Restore`).
 #[derive(Clone)]
 pub struct ChannelStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<Mutex<Database>>,
 }
 
 impl ChannelStore {
@@ -64,15 +65,16 @@ impl ChannelStore {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| GmError::Platform(format!("Failed to open in-memory channel DB: {e}")))?;
+        let conn = Database::in_memory()?;
         Self::init_conn(conn)
     }
 
-    fn init_conn(conn: Connection) -> Result<Self> {
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
+    fn init_conn(mut conn: Database) -> Result<Self> {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| GmError::Platform(e.to_string()))?;
+        conn.migrate("openbot_channels", 1, |conn| {
+            conn.execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS channels (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -96,29 +98,32 @@ impl ChannelStore {
             CREATE INDEX IF NOT EXISTS idx_channel_msgs_chan
                 ON channel_messages(channel_id, timestamp ASC);
             "#,
-        )
-        .map_err(|e| GmError::Platform(format!("Channel schema init failed: {e}")))?;
+            )
+            .map_err(|e| GmError::Platform(format!("Channel schema init failed: {e}")))?;
 
-        // Idempotent column addition for existing databases
-        let has_instructions: bool = conn
-            .prepare("PRAGMA table_info(channels)")
-            .and_then(|mut stmt| {
-                let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                for col in columns {
-                    if col? == "instructions" {
-                        return Ok(true);
+            // Idempotent column addition for existing databases
+            let has_instructions: bool = conn
+                .prepare("PRAGMA table_info(channels)")
+                .and_then(|mut stmt| {
+                    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    for col in columns {
+                        if col? == "instructions" {
+                            return Ok(true);
+                        }
                     }
-                }
-                Ok(false)
-            })
-            .unwrap_or(false);
+                    Ok(false)
+                })
+                .map_err(|e| GmError::Platform(e.to_string()))?;
 
-        if !has_instructions {
-            let _ = conn.execute_batch(
-                "ALTER TABLE channels ADD COLUMN instructions TEXT NOT NULL DEFAULT '';",
-            );
-        }
+            if !has_instructions {
+                conn.execute_batch(
+                    "ALTER TABLE channels ADD COLUMN instructions TEXT NOT NULL DEFAULT '';",
+                )
+                .map_err(|e| GmError::Platform(e.to_string()))?;
+            }
 
+            Ok(())
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };

@@ -1,0 +1,126 @@
+name: Signed release candidate
+on:
+  workflow_dispatch:
+    inputs:
+      evidence_run_id:
+        description: Completed run containing publisher-signed native-release-evidence artifact for this exact commit
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Download and verify native release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          GM_RELEASE_PUBLIC_KEY_HEX: ${{ vars.GM_RELEASE_PUBLIC_KEY_HEX }}
+        run: |
+          [[ "$EVIDENCE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
+          gh run download "$EVIDENCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name native-release-evidence --dir evidence
+          python3 tools/verify-release-evidence.py --directory evidence --commit "$GITHUB_SHA" --public-key-hex "$GM_RELEASE_PUBLIC_KEY_HEX"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-native-evidence
+          path: evidence/
+          if-no-files-found: error
+  package:
+    needs: evidence
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            arch: aarch64
+            runner: [self-hosted, macOS, ARM64, grok-muse-release]
+          - os: macos
+            arch: x86_64
+            runner: [self-hosted, macOS, X64, grok-muse-release]
+          - os: linux
+            arch: x86_64
+            runner: [self-hosted, Linux, X64, grok-muse-release]
+          - os: windows
+            arch: x86_64
+            runner: [self-hosted, Windows, X64, grok-muse-release]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: grok-muse
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: grok-muse
+          ref: ${{ github.sha }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: galaxycoils/darius
+          ref: f47a4ce980abecb751c9f5c79e1c424a20100433
+          path: Darius
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pinned for release
+        with:
+          toolchain: 1.99.1
+      - name: Verify native runner identity
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 -c 'import os,runpy; m=runpy.run_path("tools/package-release.py"); assert m["native_target"]()==(os.environ["TARGET_OS"],os.environ["TARGET_ARCH"])'
+      - name: Build and verify locked release binaries
+        env:
+          GM_RELEASE_PUBLIC_KEY_HEX: ${{ vars.GM_RELEASE_PUBLIC_KEY_HEX }}
+        run: |
+          python3 -c 'import os; assert len(bytes.fromhex(os.environ["GM_RELEASE_PUBLIC_KEY_HEX"]))==32'
+          cargo build --release --locked --workspace --bins
+          cargo test --locked --workspace
+      - name: Package and verify platform signatures
+        env:
+          GM_APPLE_SIGNING_IDENTITY: ${{ vars.GM_APPLE_SIGNING_IDENTITY }}
+          GM_APPLE_NOTARY_PROFILE: ${{ vars.GM_APPLE_NOTARY_PROFILE }}
+          GM_WINDOWS_CERT_THUMBPRINT: ${{ vars.GM_WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          python3 tools/package-release.py --version "$VERSION" --output-dir target/release-candidate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.os }}-${{ matrix.arch }}
+          path: grok-muse/target/release-candidate/
+          if-no-files-found: error
+  sign:
+    needs: package
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: release-candidate
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-native-evidence
+          path: release-candidate/evidence
+      - name: Sign packages using pinned publisher identity
+        env:
+          GM_RELEASE_PUBLIC_KEY_HEX: ${{ vars.GM_RELEASE_PUBLIC_KEY_HEX }}
+          GM_RELEASE_SIGNING_KEY_PEM: ${{ secrets.GM_RELEASE_SIGNING_KEY_PEM }}
+        run: python3 tools/sign-release.py --directory release-candidate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-candidate
+          path: release-candidate/
+          if-no-files-found: error

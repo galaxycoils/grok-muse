@@ -1,0 +1,12 @@
+{
+  "name": "grok-muse-guest-cli-provisioning",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned official CLI distributions for reviewed guest-image builds; does not enable host execution",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.318",
+    "@openai/codex": "0.166.0",
+    "@xai-official/grok": "1.0.70"
+  }
+}

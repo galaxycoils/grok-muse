@@ -786,6 +786,80 @@ impl DaemonControlServerState {
                     )
                     .await?;
                 }
+                DaemonRequest::ReadBotArtifact { bot_id, path } => {
+                    use base64::Engine;
+                    let result = (|| {
+                        let sup = self
+                            .openbot
+                            .as_ref()
+                            .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))?;
+                        let bytes = sup
+                            .roster()
+                            .workspace_sandbox(&bot_id)?
+                            .export_shared_file(&path)?;
+                        Ok::<_, GmError>(
+                            serde_json::json!({"bot_id":bot_id,"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                        )
+                    })();
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(error) => DaemonResponse::Error(error.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::DuplicateBot { bot_id } => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| sup.roster().duplicate_bot(&bot_id))
+                        .and_then(|profile| serde_json::to_value(profile).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(error) => DaemonResponse::Error(error.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
+                DaemonRequest::TriggerRoutine {
+                    routine_id,
+                    delivery_id,
+                } => {
+                    let result = self
+                        .openbot
+                        .as_ref()
+                        .ok_or_else(|| GmError::Config("Task runtime is unavailable".into()))
+                        .and_then(|sup| sup.trigger_routine(&routine_id, &delivery_id))
+                        .and_then(|outcome| {
+                            outcome.ok_or_else(|| GmError::Config("Unknown routine".into()))
+                        })
+                        .and_then(|outcome| serde_json::to_value(outcome).map_err(Into::into));
+                    let payload = match result {
+                        Ok(value) => DaemonResponse::JsonPayload(value),
+                        Err(error) => DaemonResponse::Error(error.to_string()),
+                    };
+                    write_ipc_message(
+                        &mut stream,
+                        &IpcMessage {
+                            id: request_id,
+                            payload,
+                        },
+                    )
+                    .await?;
+                }
                 DaemonRequest::SaveRoutine { routine } => {
                     let result = (|| {
                         let sup = self

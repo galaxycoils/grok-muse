@@ -264,6 +264,14 @@ impl BotWorkspaceSandbox {
         Ok(out)
     }
     pub fn preview_shared_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_shared_file(path, 1024 * 1024)
+    }
+
+    pub fn export_shared_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_shared_file(path, 8 * 1024 * 1024)
+    }
+
+    fn read_shared_file(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
         use std::io::Read;
         let (area, relative) = path
             .split_once('/')
@@ -286,15 +294,15 @@ impl BotWorkspaceSandbox {
             }
         };
         let file = directory.open(relative)?;
-        if !file.metadata()?.is_file() || file.metadata()?.len() > 1024 * 1024 {
+        if !file.metadata()?.is_file() || file.metadata()?.len() > limit as u64 {
             return Err(GmError::Config(
-                "Preview requires a regular file under 1 MiB".into(),
+                "Artifact must be a regular file within the transfer limit".into(),
             ));
         }
         let mut bytes = vec![];
-        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(GmError::Config("Preview exceeds 1 MiB".into()));
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(GmError::Config("Artifact exceeds transfer limit".into()));
         }
         Ok(bytes)
     }

@@ -154,7 +154,7 @@ impl LlmRouter {
                     provider: provider.clone(),
                     api_base: "cli://claude".into(),
                     model: "claude-3-5-sonnet".into(),
-                    allow_vision: task == TaskType::CuVisionStep,
+                    allow_vision: false,
                 },
                 ProviderKind::Codex => ModelTarget {
                     provider: provider.clone(),

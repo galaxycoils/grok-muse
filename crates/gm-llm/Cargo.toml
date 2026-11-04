@@ -8,7 +8,7 @@ license.workspace = true
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-gm-core = { workspace = true }
+gm-core = { workspace = true, features = ["sqlite"] }
 darius-daemon = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

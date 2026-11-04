@@ -22,7 +22,7 @@ Grok Muse incorporates an automated `SecretScrubber` that operates across all ex
 1. **Prompt Sanitization**: Sensitive environment variables and vault secrets are replaced with opaque references (`[REDACTED:<ref>]`) before prompts are sent to external LLMs.
 2. **Transcript & Log Masking**: Action transcripts, tool outputs, and audit events are scrubbed so that plain credentials never appear in readable logs.
 3. **AXSecureTextField Filtering**: Accessibility snapshots automatically detect secure password fields and replace their values with `[REDACTED_SECURE_FIELD]`.
-4. **Diagnostic Support Exports**: The `gm diagnostics export` command scrubs all detected keys and passwords, ensuring that technical support bundles can be shared safely.
+4. **Diagnostic Support Exports**: The `gm diagnostics export` command scrubs all detected keys and passwords, verifying removal of registered secrets across the bundle. Unknown secrets and personal information require human review before sharing.
 
 ---
 
