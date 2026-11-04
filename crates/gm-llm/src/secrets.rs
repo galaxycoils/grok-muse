@@ -1,5 +1,7 @@
 use gm_core::error::{GmError, Result};
-use tracing::{debug, info};
+use tracing::debug;
+#[cfg(target_os = "macos")]
+use tracing::info;
 
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "co.anysphere.grok-muse";
 pub const META_KEY_ACCOUNT: &str = "meta_api_key";
@@ -82,6 +84,7 @@ impl VaultSecretResolver {
 /// macOS Keychain Secret Manager for Meta and xAI API Keys.
 #[derive(Debug, Clone)]
 pub struct KeychainSecrets {
+    #[allow(dead_code)]
     service: String,
 }
 

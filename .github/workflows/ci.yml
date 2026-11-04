@@ -47,9 +47,15 @@ jobs:
         working-directory: grok-muse
         run: cargo fmt --all -- --check
 
-      - name: Clippy check
+      - name: Clippy check (macOS)
+        if: runner.os == 'macOS'
         working-directory: grok-muse
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Clippy check (Linux)
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check Windows target platform foundations
         if: runner.os == 'Linux'
@@ -58,9 +64,15 @@ jobs:
           rustup target add x86_64-pc-windows-gnu
           cargo check --target x86_64-pc-windows-gnu -p gm-platform -p gm-core -p gm-cu-helper
 
-      - name: Run nextest
+      - name: Run nextest (macOS)
+        if: runner.os == 'macOS'
         working-directory: grok-muse
         run: cargo nextest run --workspace --all-features
+
+      - name: Run nextest (Linux)
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: cargo nextest run --workspace
 
       - name: Run G5 eval suite gate
         working-directory: grok-muse

@@ -82,14 +82,18 @@ enum Commands {
     Kill,
 }
 
+#[allow(dead_code)]
 enum UiCommand {
     SubmitTaskOrChat(String),
     TogglePause(bool),
     ApprovalDecision { request_id: String, approved: bool },
 }
 
+#[allow(dead_code)]
 static UI_CMD_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<UiCommand>> = OnceLock::new();
+#[allow(dead_code)]
 static CONFIG: OnceLock<GmConfig> = OnceLock::new();
+#[allow(dead_code)]
 static TOKIO_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
