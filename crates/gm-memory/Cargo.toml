@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-gm-core = { workspace = true }
+gm-core = { workspace = true, features = ["sqlite"] }
 darius-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

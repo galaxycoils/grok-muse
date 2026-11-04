@@ -21,7 +21,7 @@ If reporting an issue to support, generate a redacted diagnostic bundle:
 ```bash
 gm diagnostics export --output /tmp/grok-muse-support.json
 ```
-The export automatically scrubs all API keys, bearer tokens, passwords, and sensitive system settings via `SecretScrubber`.
+The export scrubs registered environment secrets and the local companion token across the whole bundle, removes URL credentials/query strings, and verifies known-secret removal. Unknown secrets and personal information still require review before sharing.
 
 ---
 
@@ -47,7 +47,7 @@ The export automatically scrubs all API keys, bearer tokens, passwords, and sens
 ## 3. Database Recovery and Integrity
 
 ### Issue: Database corruption or unexpected power loss
-- **Automatic Recovery**: Grok Muse monitors database health using `PRAGMA quick_check(1)`. If corruption is detected, the corrupted database (and any WAL/SHM files) is automatically preserved as `<name>.corrupt.<timestamp>.bak` before a fresh store is initialized. User data is never deleted silently.
+- **Explicit Recovery**: Ordinary database opens fail without resetting data. Stop the UI, companion, daemon and all CLI clients, then run `gm diagnostics recover-database`. Only confirmed corruption qualifies. Recovery requires exclusive runtime/database leases, verifies copies of every database/WAL/SHM component, and preserves originals in a unique private `corrupt-*.bak` directory. A later startup creates a new store. Lock, permission and I/O failures must be resolved without recovery.
 - **Restoring from JSONL Backup**:
   ```bash
   # Check for existing backups
@@ -79,11 +79,13 @@ The export automatically scrubs all API keys, bearer tokens, passwords, and sens
 
 ## 5. Model Providers & CLI Drivers
 
-### Issue: Claude / Codex / Grok CLI not detected
-- Verify that the CLI binary is installed and present in your system `PATH`:
+### Issue: Claude / Codex / Grok CLI execution disabled
+Host execution is disabled pending the signed CLI-agent VM and egress/credential certification. Installing a binary or setting an API key does not enable it. Use Meta/xAI API routes meanwhile. Historical installation examples below do not imply supported runtime execution:
+
+- CLI discovery checks presence only:
   - **Claude**: Install via `npm install -g @anthropic-ai/claude-code`. Authenticate via `claude login` or `export ANTHROPIC_API_KEY="..."`.
   - **Codex**: Install via `npm install -g @openai/codex`. Authenticate via `codex login` or `export OPENAI_API_KEY="..."`.
-  - **Grok**: Authenticate via `grok auth` or `export XAI_API_KEY="..."`.
+  - **Grok**: Official distribution is `@xai-official/grok`. Authenticate via `grok login --device-auth` or `export XAI_API_KEY="..."`.
 
 ### Issue: Local Candle VLM not found
 - Download open-weight vision-language models for offline operation:

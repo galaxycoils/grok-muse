@@ -40,7 +40,7 @@ impl HealthReport {
 }
 
 /// Run comprehensive local diagnostics across sockets, storage, permissions, and models.
-pub fn run_health_diagnostics(config: &GmConfig) -> HealthReport {
+pub async fn run_health_diagnostics(config: &GmConfig) -> HealthReport {
     let mut checks = Vec::new();
 
     // 1. Storage directory integrity
@@ -118,7 +118,7 @@ pub fn run_health_diagnostics(config: &GmConfig) -> HealthReport {
     }
 
     // 3. Channels database integrity
-    let channels_path = storage_dir.join("channels.sqlite");
+    let channels_path = storage_dir.join("openbot.sqlite");
     if channels_path.exists() {
         match gm_openbot::check_sqlite_integrity(&channels_path) {
             Ok(_) => {
@@ -180,27 +180,38 @@ pub fn run_health_diagnostics(config: &GmConfig) -> HealthReport {
         });
     }
 
-    // 5. Helper IPC Socket
-    let socket_path = &config.socket_path;
-    let socket_exists = socket_path.exists();
-    checks.push(DiagnosticCheck {
-        name: "CU-Helper Socket".into(),
-        category: "IPC".into(),
-        status: if socket_exists {
-            DiagnosticStatus::Ok
-        } else {
-            DiagnosticStatus::Warning
-        },
-        message: if socket_exists {
-            format!("Helper socket present at {:?}", socket_path)
-        } else {
-            format!(
-                "Helper socket not currently active at {:?} (daemon auto-spawns it on demand)",
-                socket_path
-            )
-        },
-        remediation: None,
-    });
+    // A socket path alone is not a liveness signal. Both probes are bounded and
+    // validate the response and request ID without starting any services.
+    for (name, path, daemon) in [
+        ("CU-Helper IPC", &config.socket_path, false),
+        ("Daemon IPC", &config.daemon_socket_path, true),
+    ] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            ping_ipc(path, daemon),
+        )
+        .await;
+        let responsive = matches!(result, Ok(Ok(())));
+        checks.push(DiagnosticCheck {
+            name: name.into(),
+            category: "IPC".into(),
+            status: if responsive {
+                DiagnosticStatus::Ok
+            } else {
+                DiagnosticStatus::Warning
+            },
+            message: if responsive {
+                "Matching IPC peer answered Ping".into()
+            } else {
+                "IPC peer is absent, unresponsive or incompatible".into()
+            },
+            remediation: if responsive {
+                None
+            } else {
+                Some("Start the matching installed service and retry".into())
+            },
+        });
+    }
 
     // Determine overall status
     let mut overall = DiagnosticStatus::Ok;
@@ -224,6 +235,58 @@ pub fn run_health_diagnostics(config: &GmConfig) -> HealthReport {
     }
 }
 
+async fn ping_ipc(path: &Path, daemon: bool) -> Result<()> {
+    use gm_core::ipc::*;
+    if !daemon {
+        return gm_platform::IpcPlatformClient::new(path).ping().await;
+    }
+    #[cfg(unix)]
+    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    #[cfg(windows)]
+    let mut stream = tokio::net::windows::named_pipe::ClientOptions::new().open(path)?;
+    let id = 1;
+    write_ipc_message(
+        &mut stream,
+        &IpcMessage {
+            id,
+            payload: DaemonRequest::Ping,
+        },
+    )
+    .await?;
+    let reply: IpcMessage<DaemonResponse> = read_ipc_message(&mut stream).await?;
+    if reply.id != id || !matches!(reply.payload, DaemonResponse::Pong) {
+        return Err(gm_core::GmError::Ipc("Unexpected Ping response".into()));
+    }
+    Ok(())
+}
+
+fn mask_urls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(mut url) = reqwest::Url::parse(text)
+                && matches!(url.scheme(), "http" | "https")
+            {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                *text = url.to_string();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                mask_urls(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                mask_urls(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportExportBundle {
     pub export_timestamp: String,
@@ -238,8 +301,11 @@ pub struct SupportExportBundle {
 }
 
 /// Create an explicitly approved, redacted diagnostic support export scrubbing all secrets.
-pub fn export_support_bundle(config: &GmConfig, output_path: &Path) -> Result<SupportExportBundle> {
-    let health = run_health_diagnostics(config);
+pub async fn export_support_bundle(
+    config: &GmConfig,
+    output_path: &Path,
+) -> Result<SupportExportBundle> {
+    let health = run_health_diagnostics(config).await;
 
     // Initialize secret scrubber
     let scrubber = SecretScrubber::new();
@@ -254,13 +320,23 @@ pub fn export_support_bundle(config: &GmConfig, output_path: &Path) -> Result<Su
             || upper.ends_with("_PASSWORD")
             || upper.ends_with("_AUTH")
             || upper.contains("API_KEY")
-            || upper.contains("AUTH_TOKEN");
-        if is_sensitive_key && !v.trim().is_empty() && v.len() >= 12 {
+            || upper.contains("AUTH_TOKEN")
+            || upper.contains("PRIVATE_KEY")
+            || upper.contains("SIGNING_KEY");
+        if is_sensitive_key && !v.trim().is_empty() {
             scrubber.register(format!("ENV_{upper}"), &v);
             secret_count += 1;
         }
     }
 
+    // Include the locally generated companion bearer token, not just env keys.
+    if let Ok(token) = std::fs::read_to_string(config.storage_dir.join("companion-token")) {
+        let token = token.trim();
+        if !token.is_empty() {
+            scrubber.register("COMPANION_TOKEN", token);
+            secret_count += 1;
+        }
+    }
     // Sanitize config to JSON and scrub with SecretScrubber
     let raw_config = serde_json::to_value(config)?;
     let mut sanitized_config = scrubber.scrub_json(&raw_config);
@@ -281,18 +357,25 @@ pub fn export_support_bundle(config: &GmConfig, output_path: &Path) -> Result<Su
         arch: std::env::consts::ARCH.to_string(),
         health,
         sanitized_config,
-        redaction_verified: true,
+        redaction_verified: false,
         scrubbed_secret_count: secret_count,
         sha256_fingerprint: String::new(),
     };
 
-    let serialized = serde_json::to_string_pretty(&bundle)?;
-    // Compute SHA-256 fingerprint
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(serialized.as_bytes());
-    let hash_hex = hex::encode(hasher.finalize());
-    bundle.sha256_fingerprint = hash_hex;
+    // Scrub all fields (including diagnostic messages and object keys), then
+    // check the serialized result before claiming known-secret redaction.
+    let mut value = serde_json::to_value(&bundle)?;
+    mask_urls(&mut value);
+    let value = scrubber.scrub_json(&value);
+    let serialized = serde_json::to_string(&value)?;
+    if scrubber.scrub_str(&serialized) != serialized {
+        return Err(gm_core::GmError::SafetyViolation(
+            "Support bundle failed known-secret redaction verification".into(),
+        ));
+    }
+    bundle = serde_json::from_value(value)?;
+    bundle.redaction_verified = true;
+    bundle.sha256_fingerprint = support_bundle_fingerprint(&bundle)?;
 
     let final_bytes = serde_json::to_vec_pretty(&bundle)?;
     gm_core::storage::atomic_write_private(output_path, &final_bytes)?;
@@ -300,27 +383,35 @@ pub fn export_support_bundle(config: &GmConfig, output_path: &Path) -> Result<Su
     Ok(bundle)
 }
 
+/// Hash canonical JSON with an empty fingerprint field. Consumers can recompute
+/// this without trusting the embedded digest. Redaction covers known secrets only.
+pub fn support_bundle_fingerprint(bundle: &SupportExportBundle) -> Result<String> {
+    let mut copy = bundle.clone();
+    copy.sha256_fingerprint.clear();
+    Ok(gm_core::hash::compute_sha256(&serde_json::to_vec(&copy)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_health_diagnostics_runs_cleanly() {
+    #[tokio::test]
+    async fn test_health_diagnostics_runs_cleanly() {
         let dir = std::env::temp_dir().join(format!("gm-diag-test-{}", uuid::Uuid::new_v4()));
         let config = GmConfig {
             storage_dir: dir.clone(),
             ..Default::default()
         };
 
-        let report = run_health_diagnostics(&config);
+        let report = run_health_diagnostics(&config).await;
         assert!(!report.checks.is_empty());
         assert!(report.checks.iter().any(|c| c.name == "Storage Directory"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_support_bundle_redaction_and_fingerprint() {
+    #[tokio::test]
+    async fn test_support_bundle_redaction_and_fingerprint() {
         let dir = std::env::temp_dir().join(format!("gm-export-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let export_path = dir.join("support_bundle.json");
@@ -329,16 +420,22 @@ mod tests {
             std::env::set_var("TEST_DUMMY_SECRET_KEY", "super-confidential-token-12345");
         }
 
-        let mut config = GmConfig::default();
+        let mut config = GmConfig {
+            storage_dir: dir.clone(),
+            ..GmConfig::default()
+        };
         config
             .safety
             .blocklisted_apps
             .push("super-confidential-token-12345".into());
-        let bundle = export_support_bundle(&config, &export_path).unwrap();
+        let bundle = export_support_bundle(&config, &export_path).await.unwrap();
 
         assert!(export_path.exists());
         assert!(bundle.redaction_verified);
-        assert!(!bundle.sha256_fingerprint.is_empty());
+        assert_eq!(
+            bundle.sha256_fingerprint,
+            support_bundle_fingerprint(&bundle).unwrap()
+        );
 
         let file_contents = std::fs::read_to_string(&export_path).unwrap();
         assert!(!file_contents.contains("super-confidential-token-12345"));

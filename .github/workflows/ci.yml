@@ -81,6 +81,11 @@ jobs:
         working-directory: grok-muse
         run: python3 tools/workspace-guest/test_agent.py
 
+      - name: Verify release signatures and evidence gate regressions
+        if: runner.os == 'Linux'
+        working-directory: grok-muse
+        run: python3 tools/test_release_tools.py
+
       - name: Verify real X11 capture and input
         if: runner.os == 'Linux'
         working-directory: grok-muse

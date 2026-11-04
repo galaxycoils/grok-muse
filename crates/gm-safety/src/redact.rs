@@ -47,7 +47,11 @@ impl SecretScrubber {
             return input.to_string();
         }
         let mut out = input.to_string();
-        for (secret_val, secret_ref) in map.iter() {
+        let mut secrets: Vec<_> = map.iter().collect();
+        secrets.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        for (secret_val, secret_ref) in secrets {
             if !secret_val.is_empty() && out.contains(secret_val) {
                 let replacement = format!("[REDACTED:{secret_ref}]");
                 out = out.replace(secret_val, &replacement);
@@ -66,7 +70,7 @@ impl SecretScrubber {
             serde_json::Value::Object(obj) => {
                 let mut scrubbed = serde_json::Map::with_capacity(obj.len());
                 for (k, v) in obj {
-                    scrubbed.insert(k.clone(), self.scrub_json(v));
+                    scrubbed.insert(self.scrub_str(k), self.scrub_json(v));
                 }
                 serde_json::Value::Object(scrubbed)
             }

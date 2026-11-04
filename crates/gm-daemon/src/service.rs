@@ -1,4 +1,8 @@
+#[cfg(not(target_os = "macos"))]
+pub use crate::user_services::{install_services, show_services_status, uninstall_services};
+#[cfg(target_os = "macos")]
 use gm_core::error::{GmError, Result};
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -124,8 +128,8 @@ pub fn get_user_id() -> u32 {
 
 pub fn resolve_binaries(custom_bin_dir: Option<&Path>) -> (PathBuf, PathBuf) {
     if let Some(dir) = custom_bin_dir {
-        let d = dir.join("gm-daemon");
-        let h = dir.join("gm-cu-helper");
+        let d = dir.join(format!("gm-daemon{}", std::env::consts::EXE_SUFFIX));
+        let h = dir.join(format!("gm-cu-helper{}", std::env::consts::EXE_SUFFIX));
         return (d, h);
     }
 
@@ -141,8 +145,8 @@ pub fn resolve_binaries(custom_bin_dir: Option<&Path>) -> (PathBuf, PathBuf) {
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
     {
-        let d = parent.join("gm-daemon");
-        let h = parent.join("gm-cu-helper");
+        let d = parent.join(format!("gm-daemon{}", std::env::consts::EXE_SUFFIX));
+        let h = parent.join(format!("gm-cu-helper{}", std::env::consts::EXE_SUFFIX));
         if d.exists() && h.exists() {
             return (d, h);
         }
@@ -191,7 +195,7 @@ fn run_launchctl(args: &[&str]) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = args;
-        true
+        false
     }
 }
 
@@ -278,6 +282,7 @@ pub fn inspect_service(label: &str, plist_path: PathBuf) -> ServiceStatus {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn install_services(custom_bin_dir: Option<&Path>) -> Result<()> {
     let agents_dir = launch_agents_dir();
     fs::create_dir_all(&agents_dir).map_err(GmError::Io)?;
@@ -339,6 +344,7 @@ pub fn install_services(custom_bin_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn uninstall_services() -> Result<()> {
     println!("==> Uninstalling Grok-Muse LaunchAgents...");
     let d_path = daemon_plist_path();
@@ -365,6 +371,7 @@ pub fn uninstall_services() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn show_services_status() -> Result<()> {
     let d_status = inspect_service(DAEMON_LABEL, daemon_plist_path());
     let h_status = inspect_service(HELPER_LABEL, helper_plist_path());
@@ -441,8 +448,14 @@ mod tests {
     fn test_resolve_binaries() {
         let custom = Path::new("/opt/my-bin");
         let (d, h) = resolve_binaries(Some(custom));
-        assert_eq!(d, custom.join("gm-daemon"));
-        assert_eq!(h, custom.join("gm-cu-helper"));
+        assert_eq!(
+            d,
+            custom.join(format!("gm-daemon{}", std::env::consts::EXE_SUFFIX))
+        );
+        assert_eq!(
+            h,
+            custom.join(format!("gm-cu-helper{}", std::env::consts::EXE_SUFFIX))
+        );
     }
 
     #[test]

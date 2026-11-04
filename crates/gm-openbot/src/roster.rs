@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BotProfile {
     pub id: String,
     pub display_name: String,
@@ -21,6 +22,33 @@ pub struct BotProfile {
     pub allow_shell: bool,
     pub allow_network: bool,
     pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RosterDisk {
+    schema_version: u32,
+    bots: BTreeMap<String, BotProfile>,
+}
+fn decode_roster(raw: &str) -> Result<BTreeMap<String, BotProfile>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    if value.get("schema_version").is_some() {
+        let disk: RosterDisk = serde_json::from_value(value)?;
+        if disk.schema_version != 1 {
+            return Err(GmError::Config(
+                "Unsupported roster schema; original preserved".into(),
+            ));
+        }
+        Ok(disk.bots)
+    } else {
+        Ok(serde_json::from_value(value)?)
+    }
+}
+fn encode_roster(bots: &BTreeMap<String, BotProfile>) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&RosterDisk {
+        schema_version: 1,
+        bots: bots.clone(),
+    })?)
 }
 
 /// Persistent roster of OpenBot AI teammates with isolated workspace folders and per-bot memory.
@@ -41,7 +69,14 @@ impl BotRoster {
         let mut loaded: BTreeMap<String, BotProfile> = if roster_file.exists() {
             let content = std::fs::read_to_string(&roster_file)?;
             // A damaged roster must never be replaced by defaults on the next read.
-            serde_json::from_str(&content)?
+            let loaded = decode_roster(&content)?;
+            if serde_json::from_str::<serde_json::Value>(&content)?
+                .get("schema_version")
+                .is_none()
+            {
+                gm_core::storage::preserve_private_file(&roster_file, content.as_bytes())?;
+            }
+            loaded
         } else {
             BTreeMap::new()
         };
@@ -148,7 +183,7 @@ impl BotRoster {
     }
     pub fn refresh(&self) -> Result<()> {
         let raw = std::fs::read_to_string(&self.roster_file)?;
-        let map: BTreeMap<String, BotProfile> = serde_json::from_str(&raw)?;
+        let map = decode_roster(&raw)?;
         for (key, profile) in &map {
             if key != &profile.id
                 || key.is_empty()
@@ -166,8 +201,7 @@ impl BotRoster {
 
     fn persist(&self) -> Result<()> {
         let map = self.bots.lock();
-        let json = serde_json::to_string_pretty(&*map)?;
-        gm_core::storage::atomic_write_private(&self.roster_file, json.as_bytes())?;
+        gm_core::storage::atomic_write_private(&self.roster_file, &encode_roster(&map)?)?;
         Ok(())
     }
 
@@ -264,10 +298,7 @@ impl BotRoster {
             .with_network(normalized.allow_network);
         let mut updated = self.bots.lock().clone();
         updated.insert(id.clone(), normalized.clone());
-        gm_core::storage::atomic_write_private(
-            &self.roster_file,
-            &serde_json::to_vec_pretty(&updated)?,
-        )?;
+        gm_core::storage::atomic_write_private(&self.roster_file, &encode_roster(&updated)?)?;
         *self.bots.lock() = updated;
         Ok(normalized)
     }
@@ -285,5 +316,66 @@ impl BotRoster {
             self.persist()?;
         }
         Ok(removed)
+    }
+
+    /// Duplicate configuration, never history, files, credentials or grants.
+    pub fn duplicate_bot(&self, bot_id: &str) -> Result<BotProfile> {
+        let mut profile = self
+            .get_bot(bot_id)
+            .ok_or_else(|| GmError::Config("Unknown bot".into()))?;
+        profile.id = format!("bot-{}", uuid::Uuid::new_v4().simple());
+        profile.display_name = format!(
+            "{} copy",
+            profile.display_name.chars().take(120).collect::<String>()
+        );
+        profile.allow_gui = false;
+        profile.allow_shell = false;
+        profile.allow_network = false;
+        profile.created_at = Utc::now().to_rfc3339();
+        self.upsert_bot(profile)
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    #[test]
+    fn duplicate_never_inherits_grants_or_files() {
+        let root = std::env::temp_dir().join(format!("gm-duplicate-{}", uuid::Uuid::new_v4()));
+        let roster = BotRoster::open(&root).unwrap();
+        let source = roster.get_bot("muse").unwrap();
+        std::fs::write(
+            roster.bot_root("muse").join("outbox/private.txt"),
+            "private",
+        )
+        .unwrap();
+        let copy = roster.duplicate_bot("muse").unwrap();
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.system_prompt, source.system_prompt);
+        assert!(!copy.allow_gui && !copy.allow_shell && !copy.allow_network);
+        assert!(
+            !roster
+                .bot_root(&copy.id)
+                .join("outbox/private.txt")
+                .exists()
+        );
+        drop(roster);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn future_roster_is_rejected_without_replacement() {
+        let root = std::env::temp_dir().join(format!("gm-future-roster-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("roster.json");
+        let future = b"{\"schema_version\":2,\"bots\":{}}";
+        std::fs::write(&path, future).unwrap();
+        assert!(BotRoster::open(&root).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -12,7 +12,7 @@ Thank you for contributing to Grok Muse! We welcome bug reports, design suggesti
 
 ### Prerequisites
 
-- **Rust Toolchain**: Rust 1.85+ (Edition 2024).
+- **Rust Toolchain**: Rust 1.99.1, pinned in `rust-toolchain.toml` (Edition 2024).
 - **macOS**: macOS 14+ Sonoma or Sequoia (Apple Silicon or Intel). Requires Xcode command line tools.
 - **Linux**: Ubuntu 24.04+ (or equivalent modern distribution with systemd, Wayland/X11, and KVM).
 - **Windows**: Windows 11 x64 with WHPX enabled.

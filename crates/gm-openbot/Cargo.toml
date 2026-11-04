@@ -8,7 +8,7 @@ description = "OpenBot multi-agent coworker orchestration, durable FIFO queues, 
 
 [dependencies]
 chrono-tz = "0.10"
-gm-core = { workspace = true }
+gm-core = { workspace = true, features = ["sqlite"] }
 gm-safety = { workspace = true }
 gm-memory = { workspace = true }
 gm-llm = { workspace = true }

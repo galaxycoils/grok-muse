@@ -1,7 +1,8 @@
 use chrono::Utc;
+use gm_core::database::Database;
 use gm_core::error::{GmError, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -80,7 +81,7 @@ pub struct QueuedTask {
 /// "Take the Wheel" human handoff states, reboot recovery, and JSONL backup/restore.
 #[derive(Clone)]
 pub struct DurableTaskQueue {
-    pub(crate) conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Database>>,
     max_recoveries: u32,
 }
 
@@ -91,18 +92,19 @@ impl DurableTaskQueue {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| GmError::Platform(format!("Failed to open in-memory queue DB: {e}")))?;
+        let conn = Database::in_memory()?;
         Self::init_conn(conn)
     }
 
-    fn init_conn(mut conn: Connection) -> Result<Self> {
+    fn init_conn(mut conn: Database) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| GmError::Platform(e.to_string()))?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| GmError::Platform(e.to_string()))?;
+        conn.migrate("openbot_queue", 1, |migration| {
+            migration
+                .execute_batch(
+                    r#"
             CREATE TABLE IF NOT EXISTS runtime_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_json TEXT NOT NULL
@@ -133,37 +135,35 @@ impl DurableTaskQueue {
             CREATE INDEX IF NOT EXISTS idx_bot_tasks_bot_status
                 ON bot_tasks(bot_id, status, priority DESC, created_at ASC);
             "#,
-        )
-        .map_err(|e| GmError::Platform(format!("Queue schema init error: {e}")))?;
+                )
+                .map_err(|e| GmError::Platform(format!("Queue schema init error: {e}")))?;
 
-        let migration = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| GmError::Platform(e.to_string()))?;
-        let has_attempt = {
-            let mut statement = migration
-                .prepare("PRAGMA table_info(bot_tasks)")
-                .map_err(|e| GmError::Platform(e.to_string()))?;
-            let columns = statement
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| GmError::Platform(e.to_string()))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| GmError::Platform(e.to_string()))?;
-            columns.iter().any(|s| s == "attempt_id")
-        };
-        if !has_attempt {
+            let has_attempt = {
+                let mut statement = migration
+                    .prepare("PRAGMA table_info(bot_tasks)")
+                    .map_err(|e| GmError::Platform(e.to_string()))?;
+                let columns = statement
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .map_err(|e| GmError::Platform(e.to_string()))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| GmError::Platform(e.to_string()))?;
+                columns.iter().any(|s| s == "attempt_id")
+            };
+            if !has_attempt {
+                migration
+                    .execute("ALTER TABLE bot_tasks ADD COLUMN attempt_id TEXT", [])
+                    .map_err(|e| GmError::Platform(e.to_string()))?;
+            }
             migration
-                .execute("ALTER TABLE bot_tasks ADD COLUMN attempt_id TEXT", [])
+                .execute_batch(crate::routines::ROUTINES_SCHEMA)
                 .map_err(|e| GmError::Platform(e.to_string()))?;
-        }
-        migration
-            .commit()
-            .map_err(|e| GmError::Platform(e.to_string()))?;
+            Ok(())
+        })?;
 
         let queue = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_recoveries: 2,
         };
-        queue.init_routines()?;
         Ok(queue)
     }
 

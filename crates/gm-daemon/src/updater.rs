@@ -147,6 +147,29 @@ pub fn verify_checksum(actual_hash: &str, checksum_input: &str, asset_name: Opti
     input.len() == 64 && input.eq_ignore_ascii_case(target)
 }
 
+pub fn release_asset_name(version: &str, os: &str, architecture: &str) -> Result<String> {
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".-+".contains(&c))
+    {
+        return Err(GmError::Config("Invalid release version".into()));
+    }
+    let extension = match (os, architecture) {
+        ("macos", "aarch64" | "x86_64") => "dmg",
+        ("windows", "x86_64") => "zip",
+        ("linux", "x86_64") => "tar.gz",
+        _ => {
+            return Err(GmError::Config(
+                "Unsupported release OS/architecture".into(),
+            ));
+        }
+    };
+    Ok(format!(
+        "GrokMuse-{version}-{os}-{architecture}.{extension}"
+    ))
+}
+
 /// Parse GitHub release payload and compare with current version.
 pub fn parse_github_release_json(
     json_str: &str,
@@ -163,29 +186,24 @@ pub fn parse_github_release_json(
 
     let update_available = is_newer_version(current_version, &latest_version);
 
-    // Locate DMG asset: MUST strictly end with .dmg
-    let native_extension = if cfg!(target_os = "windows") {
-        ".zip"
-    } else if cfg!(target_os = "linux") {
-        ".tar.gz"
-    } else {
-        ".dmg"
-    };
-    let native_asset = release.assets.iter().find(|a| {
-        a.name.ends_with(native_extension)
-            && a.name.contains(std::env::consts::ARCH)
-            && (a.name.contains("GrokMuse") || a.name.contains("Grok-Muse"))
-    });
-    let dmg_asset = native_asset.or_else(|| {
-        release
-            .assets
-            .iter()
-            .find(|a| {
-                a.name.ends_with(".dmg")
-                    && (a.name.contains("Grok-Muse") || a.name.contains("GrokMuse"))
-            })
-            .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".dmg")))
-    });
+    // Canonical names bind preliminary selection to one OS and architecture.
+    // The signed manifest independently verifies the same identity at staging.
+    let expected_name = release_asset_name(
+        &latest_version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )?;
+    let matches: Vec<_> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == expected_name)
+        .collect();
+    if matches.len() > 1 {
+        return Err(GmError::SafetyViolation(
+            "Release contains duplicate target assets".into(),
+        ));
+    }
+    let dmg_asset = matches.first().copied();
 
     // Locate SHA-256 checksum asset: prefer {dmg_name}.sha256, then SHA256SUMS or *.sha256
     let checksum_asset = if let Some(dmg) = dmg_asset {
@@ -299,15 +317,26 @@ pub async fn download_and_verify_update(
     target_dir: &Path,
     client_opt: Option<&reqwest::Client>,
 ) -> Result<(PathBuf, bool)> {
-    let dmg_url = check_result
-        .dmg_download_url
-        .as_ref()
-        .ok_or_else(|| GmError::Platform("No DMG download URL found in release".into()))?;
+    let key=option_env!("GM_RELEASE_PUBLIC_KEY_HEX").map(str::to_owned)
+        .or_else(||std::env::var("GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX").ok())
+        .ok_or_else(||GmError::Config("This development build has no trusted release signing key. Configure GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX from an independently verified publisher key.".into()))?;
+    download_with_trusted_key(check_result, target_dir, client_opt, &key).await
+}
+
+async fn download_with_trusted_key(
+    check_result: &UpdateCheckResult,
+    target_dir: &Path,
+    client_opt: Option<&reqwest::Client>,
+    key: &str,
+) -> Result<(PathBuf, bool)> {
+    let dmg_url = check_result.dmg_download_url.as_ref().ok_or_else(|| {
+        GmError::Platform("No package exists for this OS/architecture in the release".into())
+    })?;
 
     let file_name = check_result
         .dmg_asset_name
         .clone()
-        .unwrap_or_else(|| "Grok-Muse.dmg".into());
+        .ok_or_else(|| GmError::Config("Release package name is missing".into()))?;
 
     if file_name.contains('/')
         || file_name.contains('\\')
@@ -324,9 +353,6 @@ pub async fn download_and_verify_update(
         .build()
         .map_err(|e| GmError::Platform(e.to_string()))?;
     let client = client_opt.unwrap_or(&default_client);
-    let key=option_env!("GM_RELEASE_PUBLIC_KEY_HEX").map(str::to_owned)
-        .or_else(||std::env::var("GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX").ok())
-        .ok_or_else(||GmError::Config("This development build has no trusted release signing key. Configure GM_UPDATE_TRUSTED_PUBLIC_KEY_HEX from an independently verified publisher key.".into()))?;
     let manifest_url = check_result
         .manifest_download_url
         .as_deref()
@@ -337,7 +363,7 @@ pub async fn download_and_verify_update(
         .ok_or_else(|| GmError::SafetyViolation("Release has no manifest signature".into()))?;
     let raw = bounded_release_fetch(client, manifest_url, 128 * 1024).await?;
     let signature = bounded_release_fetch(client, signature_url, 4096).await?;
-    let manifest = verify_release_manifest(&raw, &signature, &key)?;
+    let manifest = verify_release_manifest(&raw, &signature, key)?;
     let asset = manifest
         .assets
         .iter()
@@ -465,6 +491,22 @@ pub fn verify_release_manifest(
             "Release manifest is expired or unsupported".into(),
         ));
     }
+    let mut identities = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for asset in &manifest.assets {
+        if !identities.insert((&asset.os, &asset.architecture))
+            || !names.insert(&asset.name)
+            || asset.size_bytes == 0
+            || asset.size_bytes > 2 * 1024 * 1024 * 1024
+            || asset.sha256.len() != 64
+            || !asset.sha256.bytes().all(|c| c.is_ascii_hexdigit())
+            || asset.name != release_asset_name(&manifest.version, &asset.os, &asset.architecture)?
+        {
+            return Err(GmError::SafetyViolation(
+                "Release manifest contains an invalid or ambiguous target".into(),
+            ));
+        }
+    }
     Ok(manifest)
 }
 async fn bounded_release_fetch(
@@ -518,6 +560,9 @@ pub fn print_installation_guidance(dmg_path: &Path, result: &UpdateCheckResult) 
     );
     println!("  Release Tag: {}", result.release_tag);
     println!();
+    println!(
+        "  Stop Grok Muse and its services before replacing applications. Retain the previous package and a closed-app data backup for manual recovery."
+    );
     println!("  To complete installation, run the following commands:");
     println!();
     println!("  1. Mount the disk image:");
@@ -631,7 +676,7 @@ pub async fn run_update(
 
     if result.dmg_download_url.is_none() {
         println!(
-            "\n  Notice: No macOS DMG release asset found in release {}.",
+            "\n  Notice: No package for this OS/architecture found in release {}.",
             result.release_tag
         );
         println!(
@@ -778,21 +823,21 @@ mod tests {
             ]
         }"###;
 
-        let result = parse_github_release_json(json, "0.1.0").expect("Failed to parse release");
+        let expected =
+            release_asset_name("0.2.0", std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let json = json.replace("Grok-Muse-v0.2.0.dmg", &expected);
+        let result = parse_github_release_json(&json, "0.1.0").expect("Failed to parse release");
         assert_eq!(result.latest_version, "0.2.0");
         assert!(result.update_available);
         // Must select the actual DMG asset, NOT the preceding .sha256 or .tar.gz!
-        assert_eq!(
-            result.dmg_asset_name.as_deref(),
-            Some("Grok-Muse-v0.2.0.dmg")
-        );
+        assert_eq!(result.dmg_asset_name.as_deref(), Some(expected.as_str()));
         assert_eq!(result.dmg_size_bytes, Some(52428800));
         assert!(
             result
                 .dmg_download_url
                 .as_deref()
                 .unwrap()
-                .ends_with(".dmg")
+                .ends_with(&expected)
         );
         assert!(result.checksum_download_url.is_some());
     }
@@ -841,7 +886,7 @@ mod signed_manifest_tests {
             version: "1.2.3".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
             assets: vec![SignedReleaseAsset {
-                name: "GrokMuse.dmg".into(),
+                name: "GrokMuse-1.2.3-macos-aarch64.dmg".into(),
                 os: "macos".into(),
                 architecture: "aarch64".into(),
                 size_bytes: 1,
@@ -874,5 +919,114 @@ mod signed_manifest_tests {
             .into_bytes();
         let signature = hex::encode(key.sign(&expired).to_bytes());
         assert!(verify_release_manifest(&expired, signature.as_bytes(), &public).is_err());
+    }
+}
+
+#[cfg(test)]
+mod target_selection_tests {
+    use super::*;
+    #[test]
+    fn missing_target_never_falls_back_to_another_os_or_architecture() {
+        let wrong = if std::env::consts::OS == "windows" {
+            "macos"
+        } else {
+            "windows"
+        };
+        let asset = release_asset_name("1.0.0", wrong, "x86_64").unwrap();
+        let json = serde_json::json!({"tag_name":"v1.0.0","name":"Release","html_url":"https://example.invalid","assets":[{"name":asset,"browser_download_url":"https://example.invalid/asset","size":42}]});
+        let result = parse_github_release_json(&json.to_string(), "0.3.0").unwrap();
+        assert!(result.dmg_asset_name.is_none());
+        assert!(result.dmg_download_url.is_none());
+        assert!(release_asset_name("../bad", "linux", "x86_64").is_err());
+        assert!(release_asset_name("1.0.0", "windows", "aarch64").is_err());
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn signed_http_staging_rejects_tampering_and_keeps_verified_package() {
+        let bytes = b"synthetic signed package fixture".to_vec();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let name =
+            release_asset_name("9.9.9", std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let manifest = serde_json::to_vec(&SignedReleaseManifest {
+            schema: 1,
+            version: "9.9.9".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            assets: vec![SignedReleaseAsset {
+                name: name.clone(),
+                os: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                size_bytes: bytes.len() as u64,
+                sha256: gm_core::compute_sha256(&bytes),
+            }],
+        })
+        .unwrap();
+        let signature = hex::encode(key.sign(&manifest).to_bytes()).into_bytes();
+        let payload = std::sync::Arc::new(std::sync::Mutex::new(bytes.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = payload.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (manifest, signature, payload) =
+                    (manifest.clone(), signature.clone(), serving.clone());
+                tokio::spawn(async move {
+                    let mut request = vec![];
+                    let mut buffer = [0u8; 1024];
+                    while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                        let n = stream.read(&mut buffer).await.unwrap();
+                        if n == 0 || request.len() + n > 16384 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..n]);
+                    }
+                    let path = std::str::from_utf8(&request)
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let body = match path {
+                        "/manifest" => manifest,
+                        "/signature" => signature,
+                        "/asset" => payload.lock().unwrap().clone(),
+                        _ => vec![],
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                });
+            }
+        });
+        let metadata = serde_json::json!({"tag_name":"v9.9.9","html_url":"https://example.invalid/release","assets":[
+            {"name":name,"browser_download_url":format!("http://{address}/asset"),"size":bytes.len()},
+            {"name":"grok-muse-release.json","browser_download_url":format!("http://{address}/manifest"),"size":1024},
+            {"name":"grok-muse-release.sig","browser_download_url":format!("http://{address}/signature"),"size":128}]});
+        let check = parse_github_release_json(&metadata.to_string(), "0.3.0").unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let public = hex::encode(key.verifying_key().to_bytes());
+        let (path, verified) = download_with_trusted_key(&check, destination.path(), None, &public)
+            .await
+            .unwrap();
+        assert!(verified);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        *payload.lock().unwrap() = b"tampered".to_vec();
+        assert!(
+            download_with_trusted_key(&check, destination.path(), None, &public)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+        server.abort();
+        let _ = server.await;
     }
 }

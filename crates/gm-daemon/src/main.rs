@@ -13,6 +13,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Patch {
+            patch,
+            repo,
+            approve_sha256,
+        }) => {
+            println!(
+                "{}",
+                gm_daemon::patch::review_patch(&repo, &patch, approve_sha256.as_deref())?
+            );
+            Ok(())
+        }
         Some(Commands::Chat { system }) => run_chat(system, cli.config).await,
         Some(Commands::Permissions {
             open_missing,

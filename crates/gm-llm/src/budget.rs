@@ -1,7 +1,8 @@
 use gm_core::config::BudgetConfig;
+use gm_core::database::Database;
 use gm_core::error::{GmError, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{TransactionBehavior, params};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ pub struct BudgetManager {
     config: BudgetConfig,
     daily: Arc<Mutex<DailyLedger>>,
     job: Arc<Mutex<JobLedger>>,
-    store: Option<Arc<Mutex<Connection>>>,
+    store: Option<Arc<Mutex<Database>>>,
 }
 
 /// An admitted request reserves its estimated maximum exposure before dispatch.
@@ -109,20 +110,24 @@ impl BudgetManager {
     /// independent connections serialize admission with BEGIN IMMEDIATE.
     pub fn open(config: BudgetConfig, storage: &Path) -> Result<Self> {
         gm_core::storage::ensure_private_dir(storage)?;
-        let connection = Connection::open(storage.join("usage.sqlite3"))
-            .map_err(|e| GmError::Config(format!("Cannot open usage ledger: {e}")))?;
+        let mut connection = Database::open(&storage.join("usage.sqlite3"))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(3))
             .map_err(db_error)?;
         connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(db_error)?;
+        connection.migrate("usage", 1, |tx| {
+            tx.execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS usage_v1 (
                 id TEXT PRIMARY KEY, day TEXT NOT NULL, amount REAL NOT NULL CHECK(amount >= 0),
                 settled INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS usage_v1_day ON usage_v1(day);",
             )
             .map_err(db_error)?;
+            Ok(())
+        })?;
         let manager = Self {
             store: Some(Arc::new(Mutex::new(connection))),
             ..Self::new(config)

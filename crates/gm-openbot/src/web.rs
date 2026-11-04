@@ -47,6 +47,12 @@ pub struct ReassignBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerRoutineBody {
+    pub delivery_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AuditQuery {
     pub category: Option<String>,
     pub bot_id: Option<String>,
@@ -106,6 +112,7 @@ pub fn build_companion_router(state: CompanionWebState) -> Router {
         .route("/a2a/tasks", post(create_a2a_task))
         .route("/a2a/tasks/:id", get(get_a2a_task))
         .route("/api/runtime", get(runtime_status))
+        .route("/api/routines/:id/trigger", post(trigger_routine))
         .route("/api/events", get(replay_events))
         .route("/api/bots", get(list_bots))
         .route("/api/queue", get(list_queue).post(enqueue_task))
@@ -129,6 +136,21 @@ pub fn build_companion_router(state: CompanionWebState) -> Router {
         }))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
+}
+
+async fn trigger_routine(
+    State(state): State<CompanionWebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<TriggerRoutineBody>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    check_auth(&headers, state.bearer_token.as_deref())
+        .map_err(|code| (code, "Authentication required".into()))?;
+    match state.supervisor.trigger_routine(&id, &body.delivery_id) {
+        Ok(Some(outcome)) => Ok(Json(outcome)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Unknown routine".into())),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error.to_string())),
+    }
 }
 
 pub struct CompanionWebServer {
@@ -599,4 +621,101 @@ async fn handle_slack_webhook(
         .handle_inbound(&inbound)
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(serde_json::json!(reply)))
+}
+
+#[cfg(test)]
+mod routine_trigger_tests {
+    use super::*;
+    use crate::Routine;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn authenticated_routine_delivery_is_durable_and_preserves_schedule() {
+        let root = std::env::temp_dir().join(format!("gm-hook-{}", uuid::Uuid::new_v4()));
+        let config = gm_core::GmConfig {
+            storage_dir: root.clone(),
+            ..Default::default()
+        };
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let sup = OpenBotSupervisor::open(
+            config.clone(),
+            Arc::new(gm_safety::AuditLogger::in_memory()),
+            tx,
+        )
+        .unwrap();
+        let mut routine = Routine {
+            id: "hook".into(),
+            name: "Webhook".into(),
+            bot_id: "muse".into(),
+            channel_id: Some("general".into()),
+            instruction: "Report".into(),
+            timezone: "UTC".into(),
+            hour: 12,
+            minute: 0,
+            weekdays: vec![],
+            quiet_hours: None,
+            enabled: true,
+        };
+        sup.save_routine(&routine).unwrap();
+        let due = sup.queue().list_routines().unwrap()[0].next_run_utc.clone();
+        let server = CompanionWebServer::new(
+            sup.clone(),
+            BridgeRouter::new(sup.clone(), config.openbot.bridges),
+            Some("test-token".into()),
+            None,
+        );
+        let (address, handle) = server.bind_and_serve("127.0.0.1:0").await.unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/routines/hook/trigger");
+        let body = serde_json::json!({"delivery_id":"delivery-1"});
+        let response = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(sup.queue().list_tasks(None).unwrap().is_empty());
+        for expected in ["queued", "duplicate"] {
+            let response = client
+                .post(&url)
+                .bearer_auth("test-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let outcome: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(outcome["status"], expected);
+        }
+        assert_eq!(sup.queue().list_tasks(None).unwrap().len(), 1);
+        assert_eq!(sup.queue().list_routines().unwrap()[0].next_run_utc, due);
+        let bad = client
+            .post(&url)
+            .bearer_auth("test-token")
+            .json(&serde_json::json!({"delivery_id":""}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        routine.enabled = false;
+        sup.save_routine(&routine).unwrap();
+        let disabled = client
+            .post(&url)
+            .bearer_auth("test-token")
+            .json(&serde_json::json!({"delivery_id":"new-delivery"}))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(disabled["status"], "disabled");
+        let unknown = client
+            .post(format!("http://{address}/api/routines/missing/trigger"))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+        let _ = handle.await;
+        drop(sup);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

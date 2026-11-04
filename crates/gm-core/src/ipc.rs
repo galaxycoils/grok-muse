@@ -138,11 +138,22 @@ pub enum DaemonRequest {
         bot_id: String,
         path: String,
     },
+    ReadBotArtifact {
+        bot_id: String,
+        path: String,
+    },
     ListRoutines,
+    TriggerRoutine {
+        routine_id: String,
+        delivery_id: String,
+    },
     SaveRoutine {
         routine: serde_json::Value,
     },
     ListBots,
+    DuplicateBot {
+        bot_id: String,
+    },
     SaveBot {
         profile: serde_json::Value,
     },

@@ -125,15 +125,8 @@ impl Routine {
         Err(error("No next occurrence within 15 days"))
     }
 }
+pub(crate) const ROUTINES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS routines_v1 (\n            id TEXT PRIMARY KEY, config_json TEXT NOT NULL, next_due TEXT NOT NULL, last_task_id TEXT);\n            CREATE INDEX IF NOT EXISTS routines_due ON routines_v1(next_due);\n            CREATE TABLE IF NOT EXISTS routine_runs_v1 (\n            id TEXT PRIMARY KEY, routine_id TEXT NOT NULL, task_id TEXT, scheduled_for TEXT NOT NULL, fired_at TEXT NOT NULL, status TEXT NOT NULL);\n            CREATE INDEX IF NOT EXISTS routine_runs_idx ON routine_runs_v1(routine_id, fired_at DESC);";
 impl DurableTaskQueue {
-    pub(crate) fn init_routines(&self) -> Result<()> {
-        self.conn.lock().execute_batch("CREATE TABLE IF NOT EXISTS routines_v1 (
-            id TEXT PRIMARY KEY, config_json TEXT NOT NULL, next_due TEXT NOT NULL, last_task_id TEXT);
-            CREATE INDEX IF NOT EXISTS routines_due ON routines_v1(next_due);
-            CREATE TABLE IF NOT EXISTS routine_runs_v1 (
-            id TEXT PRIMARY KEY, routine_id TEXT NOT NULL, task_id TEXT, scheduled_for TEXT NOT NULL, fired_at TEXT NOT NULL, status TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS routine_runs_idx ON routine_runs_v1(routine_id, fired_at DESC);").map_err(error)
-    }
     pub fn save_routine(&self, routine: &Routine, now: DateTime<Utc>) -> Result<()> {
         let next = routine.next_after(now)?.to_rfc3339();
         self.conn.lock().execute("INSERT INTO routines_v1(id,config_json,next_due) VALUES (?1,?2,?3)
