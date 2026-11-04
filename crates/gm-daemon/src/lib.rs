@@ -2332,6 +2332,7 @@ pub async fn run_serve(bind: &str, config_path: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use gm_core::ipc::DaemonEvent;
 
     static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
