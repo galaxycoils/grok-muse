@@ -1,5 +1,6 @@
 #[cfg(not(target_os = "macos"))]
 pub use crate::user_services::{install_services, show_services_status, uninstall_services};
+#[cfg(target_os = "macos")]
 use gm_core::error::{GmError, Result};
 #[cfg(target_os = "macos")]
 use std::fs;
