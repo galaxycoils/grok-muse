@@ -1,6 +1,7 @@
 use gm_core::error::{GmError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 pub const DAEMON_LABEL: &str = "co.anysphere.grok-muse.daemon";
@@ -237,7 +238,9 @@ pub struct ServiceStatus {
 pub fn inspect_service(label: &str, plist_path: PathBuf) -> ServiceStatus {
     let installed =
         plist_path.exists() || (label == HELPER_LABEL && helper_short_plist_path().exists());
+    #[allow(unused_mut)]
     let mut is_running = false;
+    #[allow(unused_mut)]
     let mut pid = None;
 
     #[cfg(target_os = "macos")]

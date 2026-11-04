@@ -13,6 +13,7 @@ jobs:
   check-and-test:
     name: Check & Test
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-14, ubuntu-latest]
     runs-on: ${{ matrix.os }}
