@@ -13,12 +13,13 @@ members = [
     "crates/gm-ui",
     "crates/gm-eval",
     "crates/gm-vlm-candle",
+    "crates/gm-openbot",
     "xtask",
 ]
 exclude = ["target"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 authors = ["Grok-Muse Contributors"]
@@ -34,6 +35,9 @@ gm-llm = { path = "crates/gm-llm" }
 gm-goals = { path = "crates/gm-goals" }
 gm-agent = { path = "crates/gm-agent" }
 gm-vlm-candle = { path = "crates/gm-vlm-candle" }
+gm-openbot = { path = "crates/gm-openbot" }
+gm-daemon = { path = "crates/gm-daemon" }
+gm-cu-helper = { path = "crates/gm-cu-helper" }
 
 # Darius path dependencies
 darius-core = { path = "../Darius/crates/darius-core" }
@@ -44,6 +48,8 @@ darius-tools = { path = "../Darius/crates/darius-tools" }
 
 # Shared external dependencies
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -56,3 +62,9 @@ clap = { version = "4", features = ["derive"] }
 parking_lot = "0.12"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 16

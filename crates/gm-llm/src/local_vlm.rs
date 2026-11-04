@@ -300,14 +300,28 @@ impl LlmBackend for LocalVlmLlmAdapter {
         target: &ModelTarget,
         messages: &[ChatMessage],
     ) -> Result<ChatCompletionResponse> {
+        use base64::Engine;
+
         let last_prompt = messages
             .last()
             .map(|m| m.content.clone())
             .unwrap_or_else(|| "Generate computer use action".into());
 
-        // Dummy empty 1x1 JPEG frame for text-only calls through the VLM adapter
+        let decoded_frame = messages
+            .iter()
+            .rev()
+            .find_map(|m| m.images.last())
+            .and_then(|img| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&img.base64_data)
+                    .ok()
+            })
+            .filter(|bytes| !bytes.is_empty());
+
+        // Fallback minimal JPEG marker for text-only calls through the VLM adapter
         let empty_frame: &[u8] = &[0xFF, 0xD8, 0xFF, 0xD9];
-        let content = self.backend.generate(empty_frame, &last_prompt).await?;
+        let frame_slice = decoded_frame.as_deref().unwrap_or(empty_frame);
+        let content = self.backend.generate(frame_slice, &last_prompt).await?;
 
         Ok(ChatCompletionResponse {
             id: format!("vlm_{}", self.backend.model_name()),
@@ -375,10 +389,7 @@ mod tests {
             model: "qwen2-vl-2b-metal".into(),
             allow_vision: true,
         };
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "Click button".into(),
-        }];
+        let messages = vec![ChatMessage::text("user", "Click button")];
 
         let resp = adapter.complete(&target, &messages).await.unwrap();
         assert_eq!(resp.model, "qwen2-vl-2b-metal");
@@ -403,10 +414,7 @@ mod tests {
             model: "smolvlm-instruct-mlx".into(),
             allow_vision: true,
         };
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "Locate Submit button".into(),
-        }];
+        let messages = vec![ChatMessage::text("user", "Locate Submit button")];
 
         let resp = hybrid
             .execute_routed(&target, None, &messages)

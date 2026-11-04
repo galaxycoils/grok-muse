@@ -103,6 +103,27 @@ enum Commands {
         #[arg(long)]
         release: bool,
     },
+    /// Submit a signed DMG to Apple Notary Service (`xcrun notarytool`) and staple notarization ticket
+    Notarize {
+        /// Path to signed .dmg file
+        #[arg(long, default_value = "target/dist/Grok-Muse.dmg")]
+        dmg_path: String,
+        /// Keychain notarytool profile name (preferred over Apple ID + app-specific password)
+        #[arg(long)]
+        keychain_profile: Option<String>,
+        /// Apple ID email (or set APPLE_ID env var)
+        #[arg(long)]
+        apple_id: Option<String>,
+        /// Apple Developer Team ID (or set APPLE_TEAM_ID env var)
+        #[arg(long)]
+        team_id: Option<String>,
+        /// Environment variable holding app-specific password
+        #[arg(long, default_value = "APPLE_APP_SPECIFIC_PASSWORD")]
+        password_env: String,
+        /// Validate arguments and DMG file without submitting over network
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -244,8 +265,11 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
         helper_app_dir.join("gm-cu-helper"),
     )?;
 
+    let pkg_version = env!("CARGO_PKG_VERSION");
+
     // Write helper Info.plist (TCC declarations + LSUIElement)
-    let helper_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let helper_plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -253,6 +277,10 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     <string>co.anysphere.grok-muse.cu-helper</string>
     <key>CFBundleName</key>
     <string>GrokMuseCUHelper</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{pkg_version}</string>
+    <key>CFBundleVersion</key>
+    <string>{pkg_version}</string>
     <key>CFBundleExecutable</key>
     <string>gm-cu-helper</string>
     <key>CFBundlePackageType</key>
@@ -269,7 +297,8 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     <string>Grok-Muse proactive engine requires Reminders access to follow up on tasks.</string>
 </dict>
 </plist>
-"#;
+"#
+    );
     fs::write(
         "target/bundle/GrokMuseCUHelper.app/Contents/Info.plist",
         helper_plist,
@@ -285,7 +314,8 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     fs::copy(format!("{bin_dir}/gm"), app_macos_dir.join("gm"))?;
 
-    let app_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let app_plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -293,6 +323,10 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     <string>co.anysphere.grok-muse.ui</string>
     <key>CFBundleName</key>
     <string>GrokMuse</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{pkg_version}</string>
+    <key>CFBundleVersion</key>
+    <string>{pkg_version}</string>
     <key>CFBundleExecutable</key>
     <string>gm-ui</string>
     <key>CFBundlePackageType</key>
@@ -307,7 +341,8 @@ fn create_app_bundles(release: bool) -> Result<(), Box<dyn std::error::Error>> {
     <string>Grok-Muse proactive engine requires Reminders access to follow up on tasks.</string>
 </dict>
 </plist>
-"#;
+"#
+    );
     fs::write("target/bundle/GrokMuse.app/Contents/Info.plist", app_plist)?;
 
     println!("==> Successfully created app bundles:");
@@ -685,14 +720,11 @@ async fn run_bench_llm(
 
     // Warmup
     let warmup_msgs = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: "You are an autonomous computer-use agent. Output JSON action.".into(),
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: "Click button".into(),
-        },
+        ChatMessage::text(
+            "system",
+            "You are an autonomous computer-use agent. Output JSON action.",
+        ),
+        ChatMessage::text("user", "Click button"),
     ];
     let _ = hybrid_client
         .execute_routed_stream(&primary, fallback.as_ref(), &warmup_msgs)
@@ -706,14 +738,11 @@ async fn run_bench_llm(
 
     for _ in 0..iterations {
         let msgs = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: "You are an autonomous computer-use agent. Output JSON with fields 'action' and 'params'.".into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "Click the Submit button".into(),
-            },
+            ChatMessage::text(
+                "system",
+                "You are an autonomous computer-use agent. Output JSON with fields 'action' and 'params'.",
+            ),
+            ChatMessage::text("user", "Click the Submit button"),
         ];
         let (_, metrics) = hybrid_client
             .execute_routed_stream(&primary, fallback.as_ref(), &msgs)
@@ -891,6 +920,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             release,
         } => {
             run_install(dest_dir, bin_dir, identity, no_sign, release)?;
+        }
+
+        Commands::Notarize {
+            dmg_path,
+            keychain_profile,
+            apple_id,
+            team_id,
+            password_env,
+            dry_run,
+        } => {
+            run_notarize(
+                &dmg_path,
+                keychain_profile,
+                apple_id,
+                team_id,
+                &password_env,
+                dry_run,
+            )?;
         }
     }
 
@@ -1187,12 +1234,61 @@ async fn run_eval() -> Result<gm_eval::EvalSummaryReport, Box<dyn std::error::Er
         "  Safety Violations: {} (Target: 0)",
         summary.total_safety_violations
     );
-    if summary.meets_g5_quality_gate {
-        println!("==> G5 Quality Gate: PASSED");
+
+    println!(
+        "\n==> Running v0.2.0 Capability Evaluation Suite (SoM, Stagnation, Approvals, MCP, Live AX)..."
+    );
+    let v2_results = gm_eval::run_v2_capability_evals().await;
+    let mut v2_all_passed = true;
+    for r in &v2_results {
+        if !r.success || r.safety_violation {
+            v2_all_passed = false;
+        }
+        let status_str = if r.success && !r.safety_violation {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "  [{status_str}] {} - {}: {}",
+            r.task_id, r.task_name, r.details
+        );
+    }
+
+    println!(
+        "\n==> Running v0.3.0 OpenBot Capability Evaluation Suite (Queue, Seatbelt, Wheel, A2A, AG-UI)..."
+    );
+    let openbot_results = gm_eval::run_openbot_capability_evals().await;
+    let mut openbot_all_passed = true;
+    for r in &openbot_results {
+        if !r.success || r.safety_violation {
+            openbot_all_passed = false;
+        }
+        let status_str = if r.success && !r.safety_violation {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "  [{status_str}] {} - {}: {}",
+            r.task_id, r.task_name, r.details
+        );
+    }
+
+    if summary.meets_g5_quality_gate && v2_all_passed && openbot_all_passed {
+        println!(
+            "==> G5 + v0.2.0 + v0.3.0 OpenBot Quality Gate: PASSED ({}/{} G5 + {}/{} v0.2.0 + {}/{} OpenBot)",
+            summary.passed_tasks,
+            summary.total_tasks,
+            v2_results.iter().filter(|r| r.success).count(),
+            v2_results.len(),
+            openbot_results.iter().filter(|r| r.success).count(),
+            openbot_results.len()
+        );
         Ok(summary)
     } else {
-        eprintln!("==> G5 Quality Gate: FAILED");
-        Err("G5 Quality Gate failed".into())
+        eprintln!("==> G5 / v0.2.0 / v0.3.0 Quality Gate: FAILED");
+        Err("G5, v0.2.0, or v0.3.0 OpenBot Quality Gate failed".into())
     }
 }
 
@@ -1926,6 +2022,111 @@ fn run_install(
     Ok(())
 }
 
+fn build_notarytool_args(
+    dmg_path: &str,
+    keychain_profile: Option<&str>,
+    apple_id: Option<&str>,
+    team_id: Option<&str>,
+    password: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "notarytool".to_string(),
+        "submit".to_string(),
+        dmg_path.to_string(),
+        "--wait".to_string(),
+    ];
+
+    if let Some(profile) = keychain_profile.filter(|s| !s.trim().is_empty()) {
+        args.push("--keychain-profile".into());
+        args.push(profile.to_string());
+        return Ok(args);
+    }
+
+    let resolved_id = apple_id.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        "Missing notarization credentials: provide --keychain-profile or --apple-id / APPLE_ID"
+            .to_string()
+    })?;
+    let resolved_team = team_id.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        "Missing Apple Developer Team ID: provide --team-id or APPLE_TEAM_ID".to_string()
+    })?;
+    let resolved_pw = password.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        "Missing app-specific password in configured environment variable".to_string()
+    })?;
+
+    args.push("--apple-id".into());
+    args.push(resolved_id.to_string());
+    args.push("--team-id".into());
+    args.push(resolved_team.to_string());
+    args.push("--password".into());
+    args.push(resolved_pw.to_string());
+    Ok(args)
+}
+
+fn run_notarize(
+    dmg_path: &str,
+    keychain_profile: Option<String>,
+    apple_id: Option<String>,
+    team_id: Option<String>,
+    password_env: &str,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dmg = Path::new(dmg_path);
+    if !dmg.exists() {
+        return Err(format!(
+            "DMG file does not exist at '{dmg_path}'. Run `cargo run -p xtask -- dmg` first."
+        )
+        .into());
+    }
+
+    let profile = keychain_profile.or_else(|| std::env::var("APPLE_NOTARY_PROFILE").ok());
+    let id = apple_id.or_else(|| std::env::var("APPLE_ID").ok());
+    let team = team_id.or_else(|| std::env::var("APPLE_TEAM_ID").ok());
+    let pw = std::env::var(password_env).ok();
+
+    let notary_args = build_notarytool_args(
+        dmg_path,
+        profile.as_deref(),
+        id.as_deref(),
+        team.as_deref(),
+        pw.as_deref(),
+    )?;
+
+    if dry_run {
+        println!(
+            "==> [Dry-Run] Validated notarization & stapling pipeline for '{dmg_path}' ({} args).",
+            notary_args.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "==> Submitting {dmg_path} to Apple Notary Service (xcrun notarytool submit --wait)..."
+    );
+    let submit_status = Command::new("xcrun").args(&notary_args).status()?;
+    if !submit_status.success() {
+        return Err("xcrun notarytool submit failed".into());
+    }
+
+    println!("==> Stapling notarization ticket to {dmg_path} (xcrun stapler staple)...");
+    let staple_status = Command::new("xcrun")
+        .args(["stapler", "staple", dmg_path])
+        .status()?;
+    if !staple_status.success() {
+        return Err("xcrun stapler staple failed".into());
+    }
+
+    println!("==> Validating stapled ticket (xcrun stapler validate)...");
+    let validate_status = Command::new("xcrun")
+        .args(["stapler", "validate", dmg_path])
+        .status()?;
+    if !validate_status.success() {
+        return Err("xcrun stapler validate failed".into());
+    }
+
+    println!("==> Notarization and ticket stapling succeeded for {dmg_path}!");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2035,5 +2236,46 @@ mod tests {
 
         let _ = fs::remove_dir_all(test_apps);
         let _ = fs::remove_dir_all(test_bin);
+    }
+
+    #[test]
+    fn test_notarize_dry_run_and_command_builder() {
+        let profile_args =
+            build_notarytool_args("Grok-Muse.dmg", Some("gm-notary"), None, None, None).unwrap();
+        assert_eq!(
+            profile_args,
+            vec![
+                "notarytool",
+                "submit",
+                "Grok-Muse.dmg",
+                "--wait",
+                "--keychain-profile",
+                "gm-notary"
+            ]
+        );
+
+        let apple_id_args = build_notarytool_args(
+            "Grok-Muse.dmg",
+            None,
+            Some("dev@example.com"),
+            Some("TEAM123456"),
+            Some("app-pw"),
+        )
+        .unwrap();
+        assert!(apple_id_args.contains(&"--team-id".to_string()));
+        assert!(build_notarytool_args("Grok-Muse.dmg", None, None, None, None).is_err());
+
+        let tmp_dmg = std::env::temp_dir().join("test_notarize_dry_run.dmg");
+        fs::write(&tmp_dmg, b"dummy_dmg_header").unwrap();
+        let res = run_notarize(
+            tmp_dmg.to_str().unwrap(),
+            Some("gm-notary-profile".into()),
+            None,
+            None,
+            "UNUSED_PW_ENV",
+            true,
+        );
+        assert!(res.is_ok());
+        let _ = fs::remove_file(tmp_dmg);
     }
 }

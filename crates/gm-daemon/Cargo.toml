@@ -19,11 +19,13 @@ path = "src/bin/gm.rs"
 [dependencies]
 gm-core = { workspace = true }
 gm-platform = { workspace = true }
-gm-llm = { workspace = true }
+gm-llm = { workspace = true, features = ["local-vlm"] }
+gm-vlm-candle = { workspace = true }
 gm-safety = { workspace = true }
 gm-memory = { workspace = true }
 gm-goals = { workspace = true }
 gm-agent = { workspace = true }
+gm-openbot = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -33,4 +35,14 @@ serde_json = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+libc = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gm-vlm-candle = { workspace = true, features = ["metal"] }
+
+[dev-dependencies]
+gm-cu-helper = { workspace = true }
+tempfile = "3"
 

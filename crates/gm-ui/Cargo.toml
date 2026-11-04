@@ -17,6 +17,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+gm-daemon = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 cc = "1.2"

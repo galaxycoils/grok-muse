@@ -7,7 +7,7 @@ use crate::quiet_gate::{QuietGate, QuietGateConfig};
 use crate::scheduler::ProactiveScheduler;
 use chrono::{DateTime, Utc};
 use gm_core::error::Result;
-use gm_llm::BudgetManager;
+use gm_llm::{BudgetManager, ChatMessage, HybridLlmClient, LlmRouter, TaskType};
 use gm_memory::{MemoryUpkeepReport, PersonalMemoryStore, UpkeepConfig};
 use gm_platform::Platform;
 use gm_safety::AuditLogger;
@@ -21,6 +21,7 @@ pub struct ProactiveEngine {
     budget: Arc<BudgetManager>,
     notices_history: Arc<Mutex<Vec<ProactiveNotice>>>,
     dogfood_tracker: Arc<DogfoodTracker>,
+    llm: Option<(Arc<HybridLlmClient>, LlmRouter)>,
 }
 
 impl ProactiveEngine {
@@ -35,6 +36,7 @@ impl ProactiveEngine {
             budget,
             notices_history: Arc::new(Mutex::new(Vec::new())),
             dogfood_tracker: tracker,
+            llm: None,
         }
     }
 
@@ -49,7 +51,13 @@ impl ProactiveEngine {
             budget,
             notices_history: Arc::new(Mutex::new(Vec::new())),
             dogfood_tracker,
+            llm: None,
         }
+    }
+
+    pub fn with_llm(mut self, llm: Arc<HybridLlmClient>, router: LlmRouter) -> Self {
+        self.llm = Some((llm, router));
+        self
     }
 
     pub fn scheduler(&self) -> &ProactiveScheduler {
@@ -120,14 +128,24 @@ impl ProactiveEngine {
     }
 
     /// Synthesizes proactive recommendations derived from calendar context, unread email threads,
-    /// pending reminders, and personal memory facts.
+    /// pending reminders, and personal memory facts (enriched via `TaskType::ProactiveTriage` when LLM is attached).
     pub async fn generate_ideas<P: Platform>(
         &self,
         platform: Option<&P>,
         memory: &PersonalMemoryStore,
         now: DateTime<Utc>,
     ) -> Result<Vec<ProactiveIdea>> {
-        generate_ideas(platform, memory, now).await
+        if let Some((ref client, ref router)) = self.llm {
+            crate::ideas::generate_ideas_with_llm(
+                platform,
+                memory,
+                Some((client.as_ref(), router)),
+                now,
+            )
+            .await
+        } else {
+            generate_ideas(platform, memory, now).await
+        }
     }
 
     /// Evaluates calendar and reminder state via EventKit, generates candidate notices,
@@ -249,23 +267,57 @@ impl ProactiveEngine {
                 continue;
             }
 
-            // B. Enforce Daily Spend Cap Tracking
-            // Simulated cost of triage/dispatch check ($0.001)
-            let triage_cost = 0.001;
-            if let Err(e) = self.budget.record_spend(triage_cost) {
-                warn!("Proactive alert suppressed due to budget spend cap: {e}");
-                continue;
-            }
+            // B. Triage & Enforce Daily Spend Cap Tracking
+            let (final_body, triage_cost) = if let Some((ref client, ref router)) = self.llm {
+                let (primary, fallback) = router.route(TaskType::ProactiveTriage);
+                let msgs = vec![
+                    ChatMessage::text(
+                        "system",
+                        "You are Grok-Muse proactive triage. Summarize the notification into one crisp actionable sentence (<=120 chars), or output SUPPRESS if trivial.",
+                    ),
+                    ChatMessage::text("user", format!("Title: {title}\nContext: {body}")),
+                ];
+                match client
+                    .execute_routed(&primary, fallback.as_ref(), &msgs)
+                    .await
+                {
+                    Ok(resp) => {
+                        let trimmed = resp.content.trim();
+                        if trimmed.eq_ignore_ascii_case("suppress") {
+                            info!("Notice '{}' suppressed by LLM ProactiveTriage", title);
+                            continue;
+                        }
+                        let enriched = if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                            trimmed.to_string()
+                        } else {
+                            body.clone()
+                        };
+                        (enriched, resp.estimated_cost_usd)
+                    }
+                    Err(e) => {
+                        warn!("Proactive LLM triage suppressed/failed (budget or provider): {e}");
+                        continue;
+                    }
+                }
+            } else {
+                // Rule-based offline fallback cost ($0.001)
+                let fallback_cost = 0.001;
+                if let Err(e) = self.budget.record_spend(fallback_cost) {
+                    warn!("Proactive alert suppressed due to budget spend cap: {e}");
+                    continue;
+                }
+                (body, fallback_cost)
+            };
 
             // C. Deliver via macOS UserNotifications alert
             let sent = platform
-                .send_notification(&title, Some("Grok-Muse Patrol"), &body)
+                .send_notification(&title, Some("Grok-Muse Patrol"), &final_body)
                 .await?;
 
             if sent {
                 self.quiet_gate.record_delivery_at(&dedup_hash, now);
 
-                let notice = ProactiveNotice::new(title, body, topic, is_urgent);
+                let notice = ProactiveNotice::new(title, final_body, topic, is_urgent);
                 let _ = self.dogfood_tracker.record_notice_delivered(
                     &notice.id,
                     &notice.topic,
@@ -862,13 +914,13 @@ mod tests {
             .record_preference("Prefers dark mode in all apps", &["ui", "preferences"])
             .unwrap();
 
-        let now = Utc.with_ymd_and_hms(2026, 11, 3, 21, 30, 0).unwrap();
+        let now = Utc::now();
         let summary = engine
             .nightly_review(Some(&*mock_platform), &audit, &memory, now)
             .await
             .expect("nightly review");
 
-        assert_eq!(summary.date, "2026-11-03");
+        assert_eq!(summary.date, now.format("%Y-%m-%d").to_string());
         assert_eq!(summary.tasks_completed.len(), 1);
         assert!(summary.tasks_completed[0].contains("Automated file reorganization"));
         assert!(
@@ -1037,5 +1089,58 @@ mod tests {
         let records = memory.all_records(10).unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].tags.contains(&"duplicate".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_proactive_engine_with_llm_triage_and_suppression() {
+        use gm_core::config::ProvidersConfig;
+        use gm_core::types::CalendarItem;
+        use gm_llm::MockLlmBackend;
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let mock_llm = Arc::new(MockLlmBackend::new());
+        mock_llm.queue_response("Join Design Review on Zoom in 10m; agenda ready.");
+        mock_llm.queue_response("SUPPRESS");
+
+        let client = Arc::new(HybridLlmClient::new(mock_llm, Arc::clone(&budget)));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let engine = ProactiveEngine::new(QuietGateConfig::default(), Arc::clone(&budget))
+            .with_llm(client, router);
+
+        let platform = gm_platform::MockPlatform::new();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis() as u64;
+        platform.set_calendar_events(vec![
+            CalendarItem {
+                id: "ev_important".into(),
+                title: "Design Review".into(),
+                start_time_ms: now_ms + 10 * 60 * 1000,
+                end_time_ms: now_ms + 40 * 60 * 1000,
+                location: Some("Zoom".into()),
+                notes: None,
+                is_all_day: false,
+            },
+            CalendarItem {
+                id: "ev_trivial".into(),
+                title: "Optional Placeholder".into(),
+                start_time_ms: now_ms + 25 * 60 * 1000,
+                end_time_ms: now_ms + 50 * 60 * 1000,
+                location: None,
+                notes: None,
+                is_all_day: false,
+            },
+        ]);
+
+        let delivered = engine
+            .patrol_calendar_and_reminders(&platform, 2, now)
+            .await
+            .unwrap();
+        // First event enriched and delivered; second event suppressed by LLM triage!
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].body,
+            "Join Design Review on Zoom in 10m; agenda ready."
+        );
+        assert!(budget.get_daily_spent() > 0.0);
     }
 }

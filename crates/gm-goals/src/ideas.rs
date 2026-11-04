@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use gm_core::error::Result;
+use gm_llm::{ChatMessage, HybridLlmClient, LlmRouter, TaskType};
 use gm_memory::PersonalMemoryStore;
 use gm_platform::Platform;
 use serde::{Deserialize, Serialize};
@@ -223,6 +224,60 @@ pub async fn generate_ideas<P: Platform>(
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    Ok(ideas)
+}
+
+/// Generates proactive ideas and optionally synthesizes a high-leverage hybrid LLM recommendation
+/// via `TaskType::ProactiveTriage` when an LLM client and budget are available.
+pub async fn generate_ideas_with_llm<P: Platform>(
+    platform: Option<&P>,
+    memory: &PersonalMemoryStore,
+    llm: Option<(&HybridLlmClient, &LlmRouter)>,
+    now: DateTime<Utc>,
+) -> Result<Vec<ProactiveIdea>> {
+    let mut ideas = generate_ideas(platform, memory, now).await?;
+
+    if let Some((client, router)) = llm
+        && !ideas.is_empty()
+    {
+        let context_summary: String = ideas
+            .iter()
+            .take(5)
+            .map(|i| format!("- [{}] {}: {}", i.source.label(), i.title, i.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (primary, fallback) = router.route(TaskType::ProactiveTriage);
+        let msgs = vec![
+            ChatMessage::text(
+                "system",
+                "You are Grok-Muse strategic assistant. Given the user's current schedule/inbox signals, propose ONE concise cross-cutting synthesis action in <=160 chars.",
+            ),
+            ChatMessage::text("user", context_summary),
+        ];
+
+        if let Ok(resp) = client
+            .execute_routed(&primary, fallback.as_ref(), &msgs)
+            .await
+        {
+            let text = resp.content.trim();
+            if !text.is_empty() && !text.starts_with('{') {
+                ideas.insert(
+                    0,
+                    ProactiveIdea {
+                        id: "idea_llm_synthesis".into(),
+                        title: "AI Strategic Synthesis".into(),
+                        description: text.to_string(),
+                        source: IdeaSource::Hybrid,
+                        action_prompt: None,
+                        confidence: 0.96,
+                        created_at: now,
+                    },
+                );
+            }
+        }
+    }
 
     Ok(ideas)
 }

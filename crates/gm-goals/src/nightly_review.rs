@@ -2,6 +2,7 @@ use crate::dogfood::DogfoodMetricsSummary;
 use chrono::{DateTime, Utc};
 use gm_core::error::Result;
 use gm_core::types::{CalendarItem, ReminderItem};
+use gm_llm::{ChatMessage, HybridLlmClient, LlmRouter, TaskType};
 use gm_memory::PersonalMemoryStore;
 use gm_platform::Platform;
 use gm_safety::AuditLogger;
@@ -253,10 +254,45 @@ pub async fn run_nightly_review<P: Platform>(
     Ok(summary)
 }
 
+/// Runs nightly review synthesis and enriches it with `TaskType::Planning` LLM executive commentary when configured.
+pub async fn run_nightly_review_with_llm<P: Platform>(
+    platform: Option<&P>,
+    audit: &AuditLogger,
+    memory: &PersonalMemoryStore,
+    dogfood: Option<&DogfoodMetricsSummary>,
+    llm: Option<(&HybridLlmClient, &LlmRouter)>,
+    now: DateTime<Utc>,
+) -> Result<NightlyReviewSummary> {
+    let mut summary = run_nightly_review(platform, audit, memory, dogfood, now).await?;
+
+    if let Some((client, router)) = llm {
+        let (primary, fallback) = router.route(TaskType::Planning);
+        let msgs = vec![
+            ChatMessage::text(
+                "system",
+                "You are Grok-Muse executive coach. Provide a 2-sentence strategic reflection on today's review and tomorrow's commitments.",
+            ),
+            ChatMessage::text("user", summary.review_markdown.clone()),
+        ];
+        if let Ok(resp) = client
+            .execute_routed(&primary, fallback.as_ref(), &msgs)
+            .await
+        {
+            let note = resp.content.trim();
+            if !note.is_empty() && !note.starts_with('{') {
+                summary
+                    .review_markdown
+                    .push_str(&format!("## 🤖 AI Executive Reflection\n{note}\n"));
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use gm_platform::MockPlatform;
 
     #[tokio::test]
@@ -282,14 +318,19 @@ mod tests {
             .unwrap();
 
         let mock_platform = MockPlatform::new();
-        let now = Utc.with_ymd_and_hms(2026, 11, 3, 21, 0, 0).unwrap();
-        let now_ms = now.timestamp_millis() as u64;
+        let now = Utc::now();
+        let tomorrow = (now + chrono::Duration::days(1))
+            .date_naive()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc();
+        let tomorrow_ms = tomorrow.timestamp_millis() as u64;
 
         mock_platform.set_calendar_events(vec![CalendarItem {
             id: "cal_tomorrow".into(),
             title: "Sprint Planning".into(),
-            start_time_ms: now_ms + (12 * 3600 * 1000),
-            end_time_ms: now_ms + (13 * 3600 * 1000),
+            start_time_ms: tomorrow_ms,
+            end_time_ms: tomorrow_ms + (3600 * 1000),
             location: Some("Zoom".into()),
             notes: None,
             is_all_day: false,
@@ -318,7 +359,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(review.date, "2026-11-03");
+        assert_eq!(review.date, now.format("%Y-%m-%d").to_string());
         assert_eq!(review.tasks_completed.len(), 1);
         assert!(review.tasks_completed[0].contains("Created quarterly summary in Notes"));
         assert!(

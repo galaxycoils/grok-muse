@@ -25,7 +25,20 @@ unsafe extern "C" {
     fn gm_mac_install_global_hotkeys(callback: extern "C" fn(c_int)) -> c_int;
     fn gm_mac_uninstall_global_hotkeys();
     fn gm_mac_seconds_since_last_input() -> c_double;
+    fn gm_mac_get_primary_backing_scale() -> c_double;
+    fn gm_mac_peek_latest_frame_timestamp() -> u64;
     fn gm_mac_start_stream() -> c_int;
+    fn gm_mac_set_capture_active(active: c_int) -> c_int;
+    fn gm_mac_capture_jpeg_scaled(
+        max_long_edge: u32,
+        quality: c_float,
+        out_jpeg: *mut *mut u8,
+        out_len: *mut usize,
+        out_w: *mut u32,
+        out_h: *mut u32,
+        out_scale: *mut c_double,
+        out_ts: *mut u64,
+    ) -> c_int;
     fn gm_mac_get_latest_frame(
         out_data: *mut *mut u8,
         out_len: *mut usize,
@@ -82,11 +95,15 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+type CachedCaptureEntry = (Option<u32>, Option<u8>, FrameCapture);
+
 /// Native macOS Platform implementation utilizing ScreenCaptureKit,
 /// AXUIElement, and CoreGraphics event taps.
 pub struct MacPlatform {
     cached_snapshot: Arc<RwLock<Option<AxSnapshot>>>,
+    last_capture_cache: Arc<RwLock<Option<CachedCaptureEntry>>>,
     stream_started: Arc<AtomicBool>,
+    capture_active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -100,7 +117,9 @@ impl MacPlatform {
     pub fn new() -> Result<Self> {
         Ok(Self {
             cached_snapshot: Arc::new(RwLock::new(None)),
+            last_capture_cache: Arc::new(RwLock::new(None)),
             stream_started: Arc::new(AtomicBool::new(false)),
+            capture_active: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -115,6 +134,20 @@ impl MacPlatform {
                 warn!("ScreenCaptureKit stream deferred or running on-demand fallback");
             }
         }
+    }
+
+    /// Toggles active (20 FPS) vs low-power idle (1 FPS) ScreenCaptureKit cadence.
+    pub fn set_capture_active(&self, active: bool) {
+        if self.capture_active.swap(active, Ordering::Relaxed) != active {
+            unsafe {
+                let _ = gm_mac_set_capture_active(if active { 1 } else { 0 });
+            }
+        }
+    }
+
+    /// Queries the live CoreGraphics Retina backing scale factor of the primary display.
+    pub fn primary_backing_scale() -> f64 {
+        unsafe { gm_mac_get_primary_backing_scale() }
     }
 
     /// Encode 32-bit RGBA image buffer to JPEG using native Apple ImageIO
@@ -240,12 +273,62 @@ impl Platform for MacPlatform {
         quality: Option<u8>,
     ) -> Result<FrameCapture> {
         self.ensure_stream_started();
+        self.set_capture_active(true);
+
+        let latest_ts = unsafe { gm_mac_peek_latest_frame_timestamp() };
+        if latest_ts > 0
+            && let Some((cached_edge, cached_q, ref cached_frame)) = *self.last_capture_cache.read()
+            && cached_edge == max_long_edge
+            && cached_q == quality
+            && cached_frame.timestamp_ms == latest_ts
+        {
+            return Ok(cached_frame.clone());
+        }
+
+        // Fast hardware CoreGraphics + ImageIO path when JPEG quality is requested
+        if let Some(q) = quality {
+            let mut jpeg_ptr: *mut u8 = std::ptr::null_mut();
+            let mut jpeg_len: usize = 0;
+            let mut out_w: u32 = 0;
+            let mut out_h: u32 = 0;
+            let mut out_scale: c_double = 2.0;
+            let mut out_ts: u64 = 0;
+            let q_ratio = ((q as f32) / 100.0).clamp(0.05, 1.0);
+            let target_edge = max_long_edge.unwrap_or(0);
+
+            let ret = unsafe {
+                gm_mac_capture_jpeg_scaled(
+                    target_edge,
+                    q_ratio,
+                    &mut jpeg_ptr,
+                    &mut jpeg_len,
+                    &mut out_w,
+                    &mut out_h,
+                    &mut out_scale,
+                    &mut out_ts,
+                )
+            };
+
+            if ret == 0 && !jpeg_ptr.is_null() && jpeg_len > 0 {
+                let jpeg_bytes = unsafe { std::slice::from_raw_parts(jpeg_ptr, jpeg_len).to_vec() };
+                unsafe { gm_mac_free_frame(jpeg_ptr) };
+                let result = FrameCapture {
+                    width: out_w,
+                    height: out_h,
+                    scale_factor: out_scale,
+                    data: FrameData::InlineBytes(jpeg_bytes),
+                    timestamp_ms: out_ts,
+                };
+                *self.last_capture_cache.write() = Some((max_long_edge, quality, result.clone()));
+                return Ok(result);
+            }
+        }
 
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let mut width: u32 = 0;
         let mut height: u32 = 0;
-        let mut scale: c_double = 2.0;
+        let mut scale: c_double = Self::primary_backing_scale();
         let mut timestamp_ms: u64 = 0;
 
         let ret = unsafe {
@@ -309,13 +392,15 @@ impl Platform for MacPlatform {
             FrameData::InlineBytes(rgba_bytes)
         };
 
-        Ok(FrameCapture {
+        let result = FrameCapture {
             width: final_w,
             height: final_h,
             scale_factor: scale,
             data: frame_data,
             timestamp_ms,
-        })
+        };
+        *self.last_capture_cache.write() = Some((max_long_edge, quality, result.clone()));
+        Ok(result)
     }
 
     async fn ax_snapshot(&self, window_id: Option<u32>) -> Result<AxSnapshot> {

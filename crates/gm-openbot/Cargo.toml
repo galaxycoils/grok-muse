@@ -1,0 +1,31 @@
+[package]
+name = "gm-openbot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OpenBot multi-agent coworker orchestration, durable FIFO queues, channels, A2A, AG-UI companion server, and external chat bridges"
+
+[dependencies]
+gm-core = { workspace = true }
+gm-safety = { workspace = true }
+gm-memory = { workspace = true }
+gm-llm = { workspace = true }
+gm-platform = { workspace = true }
+gm-agent = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
+hex = "0.4"

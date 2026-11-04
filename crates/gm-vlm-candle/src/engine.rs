@@ -1,16 +1,19 @@
-use crate::config::CandleVlmConfig;
+use crate::config::{CandleVlmConfig, VlmBackendMode};
 use crate::device::VlmDeviceContext;
 use crate::text::LanguageModel;
 use crate::tokenizer::VlmTokenizer;
 use crate::vision::VisionEncoder;
 use crate::weights::SafetensorsWeightLoader;
 use async_trait::async_trait;
+use candle_core::{DType, Tensor};
 use gm_core::error::{GmError, Result};
 use gm_llm::{LocalVlmBackend, VlmBoundingBox, VlmGroundingResult, VlmTriageResult};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::info;
 
 /// High-performance Candle-based local Vision-Language Model Engine (Action A12).
-/// Supports SmolVLM / Qwen2-VL safetensors weights with Apple Silicon Metal acceleration
+/// Supports SmolVLM / SmolVLM2 / Qwen2-VL safetensors weights with Apple Silicon Metal acceleration
 /// and seamless fallback CPU execution.
 pub struct CandleVlmEngine {
     config: CandleVlmConfig,
@@ -18,6 +21,7 @@ pub struct CandleVlmEngine {
     tokenizer: VlmTokenizer,
     vision_encoder: VisionEncoder,
     language_model: LanguageModel,
+    has_real_weights: bool,
 }
 
 impl CandleVlmEngine {
@@ -30,7 +34,12 @@ impl CandleVlmEngine {
         let device_ctx = VlmDeviceContext::resolve(config.device);
         let dtype = device_ctx.candle_dtype(config.precision);
 
-        let tokenizer = VlmTokenizer::new(config.architecture);
+        let tokenizer = if let Some(ref tok_path) = config.tokenizer_path {
+            VlmTokenizer::from_hf_tokenizer_json(config.architecture, tok_path)
+                .map_err(GmError::Platform)?
+        } else {
+            VlmTokenizer::new(config.architecture)
+        };
 
         let vision_encoder = VisionEncoder::new(
             config.patch_size,
@@ -58,95 +67,171 @@ impl CandleVlmEngine {
             tokenizer,
             vision_encoder,
             language_model,
+            has_real_weights: false,
         };
 
-        // If Safetensors weights are configured, load and verify them against architecture dimensions
-        if let Some(ref path) = engine.config.weights_path {
-            if !path.exists() {
-                return Err(GmError::Platform(format!(
-                    "Configured weights path does not exist: {:?}",
-                    path
-                )));
+        let mut all_paths: Vec<PathBuf> = engine.config.shard_paths.clone();
+        if let Some(ref single_path) = engine.config.weights_path
+            && !all_paths.contains(single_path)
+        {
+            all_paths.insert(0, single_path.clone());
+        }
+
+        if !all_paths.is_empty() {
+            let mut merged_tensors: HashMap<String, Tensor> = HashMap::new();
+            for path in &all_paths {
+                if !path.exists() {
+                    return Err(GmError::Platform(format!(
+                        "Configured weights path does not exist: {:?}",
+                        path
+                    )));
+                }
+                let (tensors, _stats) =
+                    SafetensorsWeightLoader::load_and_verify(path, &engine.device_ctx.device)
+                        .map_err(|e| {
+                            GmError::Platform(format!(
+                                "Failed to load safetensors from {:?}: {e}",
+                                path
+                            ))
+                        })?;
+                merged_tensors.extend(tensors);
             }
 
-            let (tensors, _stats) = SafetensorsWeightLoader::load_and_verify(
-                path,
-                &engine.device_ctx.device,
-            )
-            .map_err(|e| {
-                GmError::Platform(format!("Failed to load safetensors from {:?}: {e}", path))
-            })?;
+            // Verify canonical 5-layer checkpoints strictly (preserving shape mismatch guarantees),
+            // while also adapting transposed/conv HF safetensors layouts when present.
+            if engine.config.shard_paths.is_empty() {
+                let verified = SafetensorsWeightLoader::verify_tensors_for_config(
+                    &merged_tensors,
+                    &engine.config,
+                )
+                .map_err(|e| {
+                    GmError::Platform(format!(
+                        "Safetensors tensor verification failed for {:?}: {e}",
+                        all_paths[0]
+                    ))
+                })?;
 
-            let verified =
-                SafetensorsWeightLoader::verify_tensors_for_config(&tensors, &engine.config)
-                    .map_err(|e| {
-                        GmError::Platform(format!(
-                            "Safetensors tensor verification failed for {:?}: {e}",
-                            path
-                        ))
-                    })?;
+                info!(
+                    "Successfully loaded and verified {} architecture weights from {:?} for model {}",
+                    verified.len(),
+                    all_paths[0],
+                    engine.config.model_id
+                );
+            }
 
-            info!(
-                "Successfully loaded and verified {} architecture weights from {:?} for model {}",
-                verified.len(),
-                path,
-                engine.config.model_id
-            );
+            let patch_vec_len = 3 * engine.config.patch_size * engine.config.patch_size;
 
-            // Apply verified tensors
-            for (names, target_tensor) in [
+            for (names, expected_2d, target_tensor) in [
                 (
                     &[
                         "vision_model.patch_projection.weight",
                         "visual.patch_embed.proj.weight",
+                        "model.vision_model.embeddings.patch_embedding.weight",
                         "patch_projection.weight",
                     ][..],
+                    (patch_vec_len, engine.config.vision_dim),
                     &mut engine.vision_encoder.patch_projection,
                 ),
                 (
                     &[
                         "vision_model.multimodal_projector.weight",
                         "visual.merger.linear.weight",
+                        "model.connector.modality_projection.proj.weight",
                         "multimodal_projector.weight",
                     ][..],
+                    (engine.config.vision_dim, engine.config.text_dim),
                     &mut engine.vision_encoder.multimodal_projector,
                 ),
                 (
                     &[
                         "language_model.embed_tokens.weight",
+                        "model.text_model.embed_tokens.weight",
                         "model.embed_tokens.weight",
                         "embed_tokens.weight",
                     ][..],
+                    (engine.config.vocab_size, engine.config.text_dim),
                     &mut engine.language_model.token_embedding,
                 ),
                 (
                     &[
                         "language_model.attention.weight",
+                        "model.text_model.layers.0.self_attn.q_proj.weight",
                         "model.layers.0.self_attn.q_proj.weight",
                         "attention.weight",
                     ][..],
+                    (engine.config.text_dim, engine.config.text_dim),
                     &mut engine.language_model.attention_weight,
                 ),
                 (
-                    &["language_model.lm_head.weight", "lm_head.weight"][..],
+                    &[
+                        "language_model.lm_head.weight",
+                        "model.text_model.lm_head.weight",
+                        "lm_head.weight",
+                    ][..],
+                    (engine.config.text_dim, engine.config.vocab_size),
                     &mut engine.language_model.lm_head,
                 ),
             ] {
-                if let Some(t) = names.iter().find_map(|n| tensors.get(*n)) {
-                    *target_tensor = t.clone();
+                if let Some(t) = names.iter().find_map(|n| merged_tensors.get(*n)) {
+                    let adapted = Self::adapt_tensor_to_shape(t, expected_2d, dtype)
+                        .map_err(|e| GmError::Platform(format!("Weight adaptation failed: {e}")))?;
+                    *target_tensor = adapted;
                 }
             }
+
+            let max_abs = engine
+                .language_model
+                .lm_head
+                .abs()
+                .and_then(|t| t.max_all())
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.to_scalar::<f32>())
+                .unwrap_or(0.0);
+            engine.has_real_weights = max_abs > 1e-6;
+        }
+
+        if engine.config.backend_mode == VlmBackendMode::RealWeights && !engine.has_real_weights {
+            return Err(GmError::Platform(
+                "VlmBackendMode::RealWeights requested, but loaded checkpoint contains no non-zero LM head weights".into(),
+            ));
         }
 
         info!(
-            "Initialized CandleVlmEngine: arch={}, model={}, device={:?} (accelerated={})",
+            "Initialized CandleVlmEngine: arch={}, model={}, device={:?} (accelerated={}, real_weights={})",
             engine.config.architecture,
             engine.config.model_id,
             engine.device_ctx.active_device_kind,
-            engine.device_ctx.is_accelerated
+            engine.device_ctx.is_accelerated,
+            engine.has_real_weights
         );
 
         Ok(engine)
+    }
+
+    fn adapt_tensor_to_shape(
+        tensor: &Tensor,
+        expected: (usize, usize),
+        dtype: DType,
+    ) -> candle_core::Result<Tensor> {
+        let dims = tensor.dims();
+        let (rows, cols) = expected;
+        let aligned = if dims == [rows, cols] {
+            tensor.clone()
+        } else if dims == [cols, rows] {
+            tensor.t()?.contiguous()?
+        } else if tensor.elem_count() == rows * cols {
+            tensor.reshape((rows, cols))?
+        } else {
+            return Err(candle_core::Error::Msg(format!(
+                "Tensor shape mismatch: expected [{rows}, {cols}], found {:?}",
+                dims
+            )));
+        };
+        aligned.to_dtype(dtype)
+    }
+
+    pub fn has_real_weights(&self) -> bool {
+        self.has_real_weights
     }
 
     pub fn config(&self) -> &CandleVlmConfig {
@@ -369,6 +454,51 @@ impl LocalVlmBackend for CandleVlmEngine {
 
     /// Multimodal action generation from visual input and natural language prompt.
     async fn generate(&self, image_jpeg: &[u8], prompt: &str) -> Result<String> {
+        if self.config.backend_mode != VlmBackendMode::SyntheticTest
+            && self.has_real_weights
+            && self.tokenizer.has_loaded_vocab()
+        {
+            let dtype = self.device_ctx.candle_dtype(self.config.precision);
+            let img_tensor = VisionEncoder::preprocess_image(
+                image_jpeg,
+                self.config.image_size,
+                &self.device_ctx.device,
+                dtype,
+            )
+            .map_err(|e| GmError::Platform(format!("Image preprocessing error: {e}")))?;
+
+            let vision_tokens = self
+                .vision_encoder
+                .forward(&img_tensor)
+                .map_err(|e| GmError::Platform(format!("Vision forward error: {e}")))?;
+
+            let formatted_prompt = self.tokenizer.format_grounding_prompt(prompt);
+            let token_ids = self.tokenizer.encode(&formatted_prompt);
+            let text_embeds = self
+                .language_model
+                .embed_tokens(&token_ids, &self.device_ctx.device)
+                .map_err(|e| GmError::Platform(format!("Text embedding error: {e}")))?;
+
+            let multimodal_seq = Tensor::cat(&[&vision_tokens, &text_embeds], 1)
+                .map_err(|e| GmError::Platform(format!("Multimodal sequence concat error: {e}")))?;
+
+            let generated_ids = self
+                .language_model
+                .generate_autoregressive(
+                    &multimodal_seq,
+                    64,
+                    self.tokenizer.special_tokens().eos_token_id,
+                    self.config.temperature,
+                    &self.device_ctx.device,
+                )
+                .map_err(|e| GmError::Platform(format!("Autoregressive generation error: {e}")))?;
+
+            let decoded = self.tokenizer.decode(&generated_ids);
+            if !decoded.is_empty() {
+                return Ok(decoded);
+            }
+        }
+
         let grounding = self.ground(image_jpeg, prompt).await?;
         let triage = self.triage(image_jpeg, prompt).await?;
 

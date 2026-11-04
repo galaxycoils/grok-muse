@@ -10,11 +10,16 @@ gm-platform = { workspace = true }
 gm-agent = { workspace = true }
 gm-llm = { workspace = true }
 gm-safety = { workspace = true }
+gm-openbot = { workspace = true }
+darius-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

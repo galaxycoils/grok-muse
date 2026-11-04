@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Grok-Muse OpenBot Companion &amp; Governance Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #131b2e;
+    --border: #23304d;
+    --text: #e6edf7;
+    --muted: #8ea0c0;
+    --accent: #4f8cff;
+    --ok: #2bd576;
+    --warn: #ffb020;
+    --err: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    background: #0e1525;
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #1d2a47;
+    color: var(--accent);
+  }
+  .badge.permitted { background: rgba(43,213,118,0.16); color: var(--ok); }
+  .badge.refused { background: rgba(255,92,92,0.16); color: var(--err); }
+  .badge.failed { background: rgba(255,176,32,0.16); color: var(--warn); }
+  main {
+    display: grid;
+    grid-template-columns: 280px 1fr 420px;
+    gap: 16px;
+    padding: 16px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  h2 {
+    margin: 0 0 10px 0;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .item {
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: rgba(255,255,255,0.02);
+  }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 11px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  button.secondary { background: #243252; }
+  input, select {
+    background: #0b1120;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 6px;
+    width: 100%;
+    margin-bottom: 8px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <strong>⚡ Grok-Muse OpenBot</strong>
+    <span class="badge">v0.3.0 AG-UI + A2A</span>
+  </div>
+  <div id="status-pill" class="badge permitted">Loopback Secured</div>
+</header>
+<main>
+  <section class="card">
+    <h2>AI Coworker Roster</h2>
+    <div id="bots-list"></div>
+    <h2 style="margin-top:16px;">Channels</h2>
+    <div id="channels-list"></div>
+  </section>
+
+  <section class="card">
+    <h2>Durable FIFO Task Queue &amp; "Take the Wheel"</h2>
+    <div style="display:flex; gap:8px; margin-bottom:10px;">
+      <select id="task-bot" style="width:140px;margin:0;"></select>
+      <input id="task-input" placeholder="Queue task or @bot instruction..." style="margin:0;" />
+      <button onclick="submitQueueTask()">Enqueue</button>
+    </div>
+    <div id="queue-list"></div>
+  </section>
+
+  <section class="card">
+    <h2>Governance Audit (/admin/audit)</h2>
+    <div style="display:flex; gap:6px; margin-bottom:10px;">
+      <button class="secondary" onclick="loadAudit('')">All</button>
+      <button class="secondary" onclick="loadAudit('permitted')">Permitted</button>
+      <button class="secondary" onclick="loadAudit('refused')">Refused</button>
+      <button class="secondary" onclick="loadAudit('failed')">Failed</button>
+    </div>
+    <div id="audit-list"></div>
+  </section>
+</main>
+<script>
+async function refreshAll() {
+  const bots = await (await fetch('/api/bots')).json();
+  const botsEl = document.getElementById('bots-list');
+  const selEl = document.getElementById('task-bot');
+  botsEl.innerHTML = bots.map(b => `
+    <div class="item">
+      <div><strong>${b.avatar_emoji} @${b.id}</strong> — ${b.display_name}</div>
+      <div style="font-size:12px;color:var(--muted)">${b.role_title}</div>
+    </div>
+  `).join('');
+  if (!selEl.innerHTML) {
+    selEl.innerHTML = bots.map(b => `<option value="${b.id}">@${b.id}</option>`).join('');
+  }
+
+  const chans = await (await fetch('/api/channels')).json();
+  document.getElementById('channels-list').innerHTML = chans.map(c => `
+    <div class="item">
+      <strong>${c.name}</strong> <span class="badge">owner: @${c.owner_bot_id || 'none'}</span>
+      <div style="font-size:12px;color:var(--muted)">${c.topic}</div>
+    </div>
+  `).join('');
+
+  const tasks = await (await fetch('/api/queue')).json();
+  document.getElementById('queue-list').innerHTML = tasks.map(t => `
+    <div class="item">
+      <div style="display:flex;justify-content:space-between;">
+        <strong>@${t.bot_id} · ${t.status.toUpperCase()}</strong>
+        <span style="font-size:11px;color:var(--muted)">${t.id}</span>
+      </div>
+      <div style="margin:6px 0;font-size:13px;">${t.instruction}</div>
+      ${t.status === 'waiting_for_human' ? `
+        <div style="padding:8px;background:rgba(255,176,32,0.12);border-radius:6px;margin-top:6px;">
+          <div>🛞 <strong>Take the Wheel:</strong> ${t.blocker_note || 'Human intervention needed'}</div>
+          <button style="margin-top:6px;" onclick="wheelResume('${t.id}')">Hand Back to Bot</button>
+        </div>
+      ` : ''}
+      <div style="display:flex;gap:6px;margin-top:6px;">
+        <button class="secondary" onclick="taskAction('${t.id}','pause')">Pause</button>
+        <button class="secondary" onclick="taskAction('${t.id}','resume')">Resume</button>
+        <button class="secondary" onclick="taskAction('${t.id}','cancel')">Cancel</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function loadAudit(category) {
+  const url = category ? `/api/audit?category=${category}` : '/api/audit';
+  const records = await (await fetch(url)).json();
+  document.getElementById('audit-list').innerHTML = records.map(r => `
+    <div class="item">
+      <div style="display:flex;justify-content:space-between;">
+        <span class="badge ${r.category}">${r.category.toUpperCase()}</span>
+        <code>${r.rule_id}</code>
+      </div>
+      <div style="margin-top:4px;font-size:13px;"><strong>${r.action_summary}</strong></div>
+      <div style="font-size:12px;color:var(--muted)">${r.citation}</div>
+    </div>
+  `).join('');
+}
+
+async function submitQueueTask() {
+  const bot_id = document.getElementById('task-bot').value;
+  const instruction = document.getElementById('task-input').value;
+  if (!instruction.trim()) return;
+  await fetch('/api/queue', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ bot_id, instruction, priority: 5 })
+  });
+  document.getElementById('task-input').value = '';
+  refreshAll();
+}
+
+async function taskAction(id, action) {
+  await fetch(`/api/tasks/${id}/${action}`, { method: 'POST' });
+  refreshAll();
+}
+
+async function wheelResume(id) {
+  const note = prompt('Optional note for bot on what you completed:', 'Completed login/2FA step');
+  if (note === null) return;
+  await fetch(`/api/tasks/${id}/wheel-resume`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ note })
+  });
+  refreshAll();
+}
+
+refreshAll();
+loadAudit('');
+</script>
+</body>
+</html>

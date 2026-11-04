@@ -111,6 +111,158 @@ impl AuditLogger {
     pub fn generate_report(&self, period: AuditPeriod, now: chrono::DateTime<Utc>) -> AuditReport {
         synthesize_audit_report(&self.entries(), period, now)
     }
+
+    /// Log a structured OpenBot governance decision (Permitted, Refused, or Failed) with rule citation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_governance(
+        &self,
+        event_type: impl Into<String>,
+        bot_id: Option<&str>,
+        category: AuditCategory,
+        rule_id: &str,
+        citation: &str,
+        action_summary: impl Into<String>,
+        mut extra_details: serde_json::Value,
+    ) {
+        if let Some(obj) = extra_details.as_object_mut() {
+            obj.insert(
+                "governance_category".into(),
+                serde_json::json!(category.as_str()),
+            );
+            obj.insert("policy_rule_id".into(), serde_json::json!(rule_id));
+            obj.insert("policy_citation".into(), serde_json::json!(citation));
+            if let Some(b) = bot_id {
+                obj.insert("bot_id".into(), serde_json::json!(b));
+            }
+        }
+        self.log(
+            event_type,
+            None,
+            None,
+            None,
+            None,
+            Some(action_summary.into()),
+            extra_details,
+        );
+    }
+
+    /// Query governance audit entries filtered by category (`Permitted`, `Refused`, `Failed`) and `bot_id`.
+    pub fn query_governance_entries(
+        &self,
+        category_filter: Option<AuditCategory>,
+        bot_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<GovernanceAuditRecord> {
+        let entries = self.entries();
+        let mut results = Vec::new();
+
+        for entry in entries.into_iter().rev() {
+            let inferred_cat = entry
+                .details
+                .get("governance_category")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s {
+                    "permitted" => Some(AuditCategory::Permitted),
+                    "refused" => Some(AuditCategory::Refused),
+                    "failed" => Some(AuditCategory::Failed),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    if entry.event_type.contains("denied")
+                        || entry.event_type.contains("blocked")
+                        || entry.event_type.contains("refused")
+                    {
+                        AuditCategory::Refused
+                    } else if entry.event_type.contains("failed")
+                        || entry.event_type.contains("error")
+                    {
+                        AuditCategory::Failed
+                    } else {
+                        AuditCategory::Permitted
+                    }
+                });
+
+            if let Some(cat) = category_filter
+                && inferred_cat != cat
+            {
+                continue;
+            }
+
+            let entry_bot = entry
+                .details
+                .get("bot_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if let Some(bf) = bot_filter
+                && entry_bot.as_deref() != Some(bf)
+            {
+                continue;
+            }
+
+            let rule_id = entry
+                .details
+                .get("policy_rule_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("RULE-STD-000")
+                .to_string();
+
+            let citation = entry
+                .details
+                .get("policy_citation")
+                .and_then(|v| v.as_str())
+                .or_else(|| entry.details.get("reason").and_then(|v| v.as_str()))
+                .unwrap_or("Standard governance policy")
+                .to_string();
+
+            results.push(GovernanceAuditRecord {
+                timestamp: entry.timestamp,
+                event_type: entry.event_type,
+                bot_id: entry_bot,
+                category: inferred_cat,
+                rule_id,
+                citation,
+                action_summary: entry.action_summary.unwrap_or_default(),
+                details: entry.details,
+            });
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        results
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditCategory {
+    Permitted,
+    Refused,
+    Failed,
+}
+
+impl AuditCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditCategory::Permitted => "permitted",
+            AuditCategory::Refused => "refused",
+            AuditCategory::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceAuditRecord {
+    pub timestamp: String,
+    pub event_type: String,
+    pub bot_id: Option<String>,
+    pub category: AuditCategory,
+    pub rule_id: String,
+    pub citation: String,
+    pub action_summary: String,
+    pub details: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,5 +922,38 @@ mod tests {
         // Only entries 1 and 2 should be included!
         assert_eq!(report.entries_analyzed, 2);
         assert_eq!(report.task_metrics.tasks_succeeded, 2);
+    }
+
+    #[test]
+    fn test_audit_governance_categorization_and_rule_citations() {
+        let logger = AuditLogger::in_memory();
+        logger.log_governance(
+            "workspace_shell",
+            Some("coder"),
+            AuditCategory::Permitted,
+            "RULE-STD-000",
+            "Standard workspace read/test command",
+            "cargo test",
+            serde_json::json!({"exit_code": 0}),
+        );
+        logger.log_governance(
+            "workspace_write",
+            Some("coder"),
+            AuditCategory::Refused,
+            "RULE-PATH-002",
+            "Path escapes bot workspace root",
+            "write /etc/hosts",
+            serde_json::json!({"path": "/etc/hosts"}),
+        );
+
+        let refused =
+            logger.query_governance_entries(Some(AuditCategory::Refused), Some("coder"), 10);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].rule_id, "RULE-PATH-002");
+        assert!(refused[0].citation.contains("escapes bot workspace"));
+
+        let permitted = logger.query_governance_entries(Some(AuditCategory::Permitted), None, 10);
+        assert_eq!(permitted.len(), 1);
+        assert_eq!(permitted[0].rule_id, "RULE-STD-000");
     }
 }

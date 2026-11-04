@@ -22,46 +22,68 @@ typedef struct {
 } FrameBuffer;
 
 static FrameBuffer g_latest_frame = { NULL, 0, 0, 0, 1.0, 0 };
+static CMSampleBufferRef g_latest_sample = NULL;
+static uint64_t g_latest_sample_ts_ms = 0;
 static os_unfair_lock g_frame_lock = OS_UNFAIR_LOCK_INIT;
 static SCStream *g_stream = nil;
+static uint32_t g_stream_width = 1680;
+static uint32_t g_stream_height = 1050;
+static double g_cached_backing_scale = 0.0;
+static int g_capture_active_state = -1;
+
+static double gm_query_display_backing_scale(CGDirectDisplayID displayID) {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
+    if (mode) {
+        size_t pixelW = CGDisplayModeGetPixelWidth(mode);
+        size_t pointW = CGDisplayModeGetWidth(mode);
+        CGDisplayModeRelease(mode);
+        if (pointW > 0 && pixelW >= pointW) {
+            return (double)pixelW / (double)pointW;
+        }
+    }
+    return 2.0;
+}
+
+double gm_mac_get_primary_backing_scale(void) {
+    if (g_cached_backing_scale <= 0.0) {
+        g_cached_backing_scale = gm_query_display_backing_scale(CGMainDisplayID());
+    }
+    return g_cached_backing_scale;
+}
+
+uint64_t gm_mac_peek_latest_frame_timestamp(void) {
+    os_unfair_lock_lock(&g_frame_lock);
+    uint64_t ts = g_latest_sample ? g_latest_sample_ts_ms : g_latest_frame.timestamp_ms;
+    os_unfair_lock_unlock(&g_frame_lock);
+    return ts;
+}
 
 @interface GmStreamOutputDelegate : NSObject <SCStreamOutput, SCStreamDelegate>
 @end
 
 @implementation GmStreamOutputDelegate
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-    if (type != SCStreamOutputTypeScreen) return;
-    
+    (void)stream;
+    if (type != SCStreamOutputTypeScreen || !sampleBuffer) return;
+
     CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pixelBuffer) return;
-    
-    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-    size_t width = CVPixelBufferGetWidth(pixelBuffer);
-    size_t height = CVPixelBufferGetHeight(pixelBuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
-    const uint8_t *baseAddress = (const uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer);
-    size_t totalBytes = bytesPerRow * height;
-    
-    if (baseAddress && totalBytes > 0) {
-        uint8_t *new_buf = (uint8_t *)malloc(totalBytes);
-        if (new_buf) {
-            memcpy(new_buf, baseAddress, totalBytes);
-            
-            os_unfair_lock_lock(&g_frame_lock);
-            if (g_latest_frame.data) {
-                free(g_latest_frame.data);
-            }
-            g_latest_frame.data = new_buf;
-            g_latest_frame.len = totalBytes;
-            g_latest_frame.width = (uint32_t)width;
-            g_latest_frame.height = (uint32_t)height;
-            g_latest_frame.scale = 2.0;
-            g_latest_frame.timestamp_ms = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-            os_unfair_lock_unlock(&g_frame_lock);
-        }
+
+    // Lazy retention: keep only a CFRetain reference to the latest IOSurface-backed CMSampleBuffer.
+    // Zero malloc/memcpy occurs on the real-time ScreenCaptureKit callback queue.
+    uint64_t now_ms = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+    CMSampleBufferRef retained = (CMSampleBufferRef)CFRetain(sampleBuffer);
+    CMSampleBufferRef previous = NULL;
+
+    os_unfair_lock_lock(&g_frame_lock);
+    previous = g_latest_sample;
+    g_latest_sample = retained;
+    g_latest_sample_ts_ms = now_ms;
+    os_unfair_lock_unlock(&g_frame_lock);
+
+    if (previous) {
+        CFRelease(previous);
     }
-    
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 }
 @end
 
@@ -236,11 +258,18 @@ int gm_mac_start_stream(void) {
             }
             
             SCDisplay *display = content.displays.firstObject;
+            g_cached_backing_scale = gm_query_display_backing_scale(display.displayID);
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
             SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-            config.width = display.width > 0 ? display.width : 1680;
-            config.height = display.height > 0 ? display.height : 1050;
-            config.minimumFrameInterval = CMTimeMake(1, 30);
+            // Capture at 1:1 macOS logical point coordinates so SoM badges align 1:1 with AXUIElement & CGEvent
+            uint32_t pointW = (uint32_t)(display.width > 0 ? display.width : 1680);
+            uint32_t pointH = (uint32_t)(display.height > 0 ? display.height : 1050);
+            g_stream_width = pointW;
+            g_stream_height = pointH;
+            config.width = pointW;
+            config.height = pointH;
+            // Start in low-power 2 FPS standby; gm_mac_set_capture_active(1) boosts to 20 FPS during active tasks
+            config.minimumFrameInterval = CMTimeMake(1, 2);
             config.pixelFormat = 'BGRA';
             config.showsCursor = YES;
             
@@ -270,9 +299,188 @@ int gm_mac_start_stream(void) {
     }
 }
 
+int gm_mac_set_capture_active(int active) {
+    @autoreleasepool {
+        if (!g_stream) return 0;
+        int normalized = active ? 1 : 0;
+        if (g_capture_active_state == normalized) return 0;
+        g_capture_active_state = normalized;
+        SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+        config.width = g_stream_width > 0 ? g_stream_width : 1680;
+        config.height = g_stream_height > 0 ? g_stream_height : 1050;
+        config.minimumFrameInterval = normalized ? CMTimeMake(1, 20) : CMTimeMake(1, 1);
+        config.pixelFormat = 'BGRA';
+        config.showsCursor = YES;
+        [g_stream updateConfiguration:config completionHandler:nil];
+        return 0;
+    }
+}
+
+static CGImageRef gm_create_cgimage_from_sample(CMSampleBufferRef sample) {
+    if (!sample) return NULL;
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sample);
+    if (!pb) return NULL;
+
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    size_t width = CVPixelBufferGetWidth(pb);
+    size_t height = CVPixelBufferGetHeight(pb);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pb);
+    void *baseAddress = CVPixelBufferGetBaseAddress(pb);
+
+    CGImageRef cgImg = NULL;
+    if (baseAddress && width > 0 && height > 0) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(
+            baseAddress, width, height, 8, bytesPerRow, cs,
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+        );
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            cgImg = CGBitmapContextCreateImage(ctx);
+            CGContextRelease(ctx);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return cgImg;
+}
+
+int gm_mac_capture_jpeg_scaled(
+    uint32_t max_long_edge,
+    float quality,
+    uint8_t **out_jpeg,
+    size_t *out_len,
+    uint32_t *out_w,
+    uint32_t *out_h,
+    double *out_scale,
+    uint64_t *out_ts
+) {
+    if (!out_jpeg || !out_len || !out_w || !out_h || !out_scale || !out_ts) return -1;
+    @autoreleasepool {
+        double backingScale = gm_mac_get_primary_backing_scale();
+        CMSampleBufferRef sample = NULL;
+        uint64_t sample_ts = 0;
+
+        os_unfair_lock_lock(&g_frame_lock);
+        if (g_latest_sample) {
+            sample = (CMSampleBufferRef)CFRetain(g_latest_sample);
+            sample_ts = g_latest_sample_ts_ms;
+        }
+        os_unfair_lock_unlock(&g_frame_lock);
+
+        CGImageRef sourceImage = NULL;
+        if (sample) {
+            sourceImage = gm_create_cgimage_from_sample(sample);
+            CFRelease(sample);
+        }
+
+        if (!sourceImage) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block CGImageRef shot = NULL;
+            [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+                if (error || !content || content.displays.count == 0) {
+                    dispatch_semaphore_signal(sem);
+                    return;
+                }
+                SCDisplay *display = content.displays.firstObject;
+                SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+                SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+                config.width = (size_t)((display.width > 0 ? display.width : 1680) * backingScale);
+                config.height = (size_t)((display.height > 0 ? display.height : 1050) * backingScale);
+                config.pixelFormat = 'BGRA';
+                [SCScreenshotManager captureImageWithFilter:filter configuration:config completionHandler:^(CGImageRef img, NSError *err) {
+                    if (img && !err) {
+                        shot = CGImageRetain(img);
+                    }
+                    dispatch_semaphore_signal(sem);
+                }];
+            }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+            sourceImage = shot;
+            sample_ts = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+        }
+
+        if (!sourceImage) return -2;
+
+        size_t srcW = CGImageGetWidth(sourceImage);
+        size_t srcH = CGImageGetHeight(sourceImage);
+        size_t dstW = srcW;
+        size_t dstH = srcH;
+        size_t maxDim = srcW > srcH ? srcW : srcH;
+
+        if (max_long_edge > 0 && maxDim > max_long_edge) {
+            double ratio = (double)max_long_edge / (double)maxDim;
+            dstW = (size_t)llround((double)srcW * ratio);
+            dstH = (size_t)llround((double)srcH * ratio);
+            if (dstW < 1) dstW = 1;
+            if (dstH < 1) dstH = 1;
+        }
+
+        CGImageRef targetImage = NULL;
+        if (dstW != srcW || dstH != srcH) {
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef scaleCtx = CGBitmapContextCreate(
+                NULL, dstW, dstH, 8, dstW * 4, cs,
+                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+            );
+            CGColorSpaceRelease(cs);
+            if (scaleCtx) {
+                CGContextSetInterpolationQuality(scaleCtx, kCGInterpolationHigh);
+                CGContextDrawImage(scaleCtx, CGRectMake(0, 0, dstW, dstH), sourceImage);
+                targetImage = CGBitmapContextCreateImage(scaleCtx);
+                CGContextRelease(scaleCtx);
+            }
+            CGImageRelease(sourceImage);
+        } else {
+            targetImage = sourceImage;
+        }
+
+        if (!targetImage) return -3;
+
+        NSMutableData *destData = [NSMutableData data];
+        CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+            (__bridge CFMutableDataRef)destData, CFSTR("public.jpeg"), 1, NULL
+        );
+        if (!dest) {
+            CGImageRelease(targetImage);
+            return -4;
+        }
+
+        float q = (quality > 0.0f && quality <= 1.0f) ? quality : 0.75f;
+        NSDictionary *options = @{
+            (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(q)
+        };
+        CGImageDestinationAddImage(dest, targetImage, (__bridge CFDictionaryRef)options);
+        BOOL ok = CGImageDestinationFinalize(dest);
+        CFRelease(dest);
+        CGImageRelease(targetImage);
+
+        if (!ok || [destData length] == 0) return -5;
+
+        size_t len = [destData length];
+        uint8_t *copy = (uint8_t *)malloc(len);
+        if (!copy) return -6;
+        memcpy(copy, [destData bytes], len);
+
+        *out_jpeg = copy;
+        *out_len = len;
+        *out_w = (uint32_t)dstW;
+        *out_h = (uint32_t)dstH;
+        *out_scale = backingScale;
+        *out_ts = sample_ts;
+        return 0;
+    }
+}
+
 int gm_mac_get_latest_frame(uint8_t **out_data, size_t *out_len, uint32_t *out_w, uint32_t *out_h, double *out_scale, uint64_t *out_ts) {
+    double backingScale = gm_mac_get_primary_backing_scale();
+    CMSampleBufferRef retainedSample = NULL;
+    uint64_t sampleTs = 0;
+
     os_unfair_lock_lock(&g_frame_lock);
-    if (g_latest_frame.data && g_latest_frame.len > 0) {
+    if (g_latest_sample) {
+        retainedSample = (CMSampleBufferRef)CFRetain(g_latest_sample);
+        sampleTs = g_latest_sample_ts_ms;
+    } else if (g_latest_frame.data && g_latest_frame.len > 0) {
         uint8_t *copy = (uint8_t *)malloc(g_latest_frame.len);
         if (copy) {
             memcpy(copy, g_latest_frame.data, g_latest_frame.len);
@@ -283,10 +491,40 @@ int gm_mac_get_latest_frame(uint8_t **out_data, size_t *out_len, uint32_t *out_w
             *out_scale = g_latest_frame.scale;
             *out_ts = g_latest_frame.timestamp_ms;
             os_unfair_lock_unlock(&g_frame_lock);
-            return 0; // Success from persistent stream (< 2ms)
+            return 0; // Success from cached fallback
         }
     }
     os_unfair_lock_unlock(&g_frame_lock);
+
+    if (retainedSample) {
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(retainedSample);
+        if (pb) {
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            size_t width = CVPixelBufferGetWidth(pb);
+            size_t height = CVPixelBufferGetHeight(pb);
+            size_t srcBpr = CVPixelBufferGetBytesPerRow(pb);
+            size_t dstBpr = width * 4;
+            size_t totalBytes = dstBpr * height;
+            const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+            uint8_t *copy = (src && totalBytes > 0) ? (uint8_t *)malloc(totalBytes) : NULL;
+            if (copy) {
+                for (size_t row = 0; row < height; row++) {
+                    memcpy(copy + row * dstBpr, src + row * srcBpr, dstBpr);
+                }
+                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                CFRelease(retainedSample);
+                *out_data = copy;
+                *out_len = totalBytes;
+                *out_w = (uint32_t)width;
+                *out_h = (uint32_t)height;
+                *out_scale = backingScale;
+                *out_ts = sampleTs;
+                return 0;
+            }
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        }
+        CFRelease(retainedSample);
+    }
     
     // Fallback: capture on-demand via ScreenCaptureKit
     @autoreleasepool {
@@ -376,18 +614,26 @@ void gm_mac_free_frame(uint8_t *data) {
 }
 
 void gm_mac_stop_stream(void) {
+    g_capture_active_state = -1;
     if (g_stream) {
         [g_stream stopCaptureWithCompletionHandler:nil];
         g_stream = nil;
         g_stream_delegate = nil;
     }
+    CMSampleBufferRef sampleToRelease = NULL;
     os_unfair_lock_lock(&g_frame_lock);
+    sampleToRelease = g_latest_sample;
+    g_latest_sample = NULL;
+    g_latest_sample_ts_ms = 0;
     if (g_latest_frame.data) {
         free(g_latest_frame.data);
         g_latest_frame.data = NULL;
         g_latest_frame.len = 0;
     }
     os_unfair_lock_unlock(&g_frame_lock);
+    if (sampleToRelease) {
+        CFRelease(sampleToRelease);
+    }
 }
 
 // Hardware-accelerated native JPEG encoding

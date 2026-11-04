@@ -19,12 +19,30 @@ impl std::fmt::Display for VlmModelArchitecture {
     }
 }
 
+/// Execution mode for `CandleVlmEngine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VlmBackendMode {
+    /// Automatically run real autoregressive weights when loaded, or calibrated spatial fallback otherwise.
+    #[default]
+    Auto,
+    /// Require real non-zero checkpoint weights and HuggingFace tokenizer vocabulary.
+    RealWeights,
+    /// Deterministic fast offline mode for CI unit tests.
+    SyntheticTest,
+}
+
 /// Configuration settings for the Candle-powered local VLM engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandleVlmConfig {
     pub architecture: VlmModelArchitecture,
     pub model_id: String,
     pub weights_path: Option<PathBuf>,
+    #[serde(default)]
+    pub shard_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub tokenizer_path: Option<PathBuf>,
+    #[serde(default)]
+    pub backend_mode: VlmBackendMode,
     pub device: VlmDevice,
     pub precision: VlmPrecision,
     pub image_size: (usize, usize),
@@ -40,7 +58,7 @@ pub struct CandleVlmConfig {
 
 impl Default for CandleVlmConfig {
     fn default() -> Self {
-        Self::smolvlm_preset()
+        Self::qwen2_vl_preset()
     }
 }
 
@@ -51,6 +69,9 @@ impl CandleVlmConfig {
             architecture: VlmModelArchitecture::SmolVlm,
             model_id: "HuggingFaceTB/SmolVLM-Instruct".into(),
             weights_path: None,
+            shard_paths: Vec::new(),
+            tokenizer_path: None,
+            backend_mode: VlmBackendMode::Auto,
             device: if cfg!(target_os = "macos") {
                 VlmDevice::Metal
             } else {
@@ -69,12 +90,42 @@ impl CandleVlmConfig {
         }
     }
 
-    /// Qwen2-VL-2B configuration preset (richer OCR & fine-grained desktop UI grounding).
+    /// SmolVLM2-2.2B-Instruct preset (second-generation compact multimodal model).
+    pub fn smolvlm2_preset() -> Self {
+        Self {
+            architecture: VlmModelArchitecture::SmolVlm,
+            model_id: "HuggingFaceTB/SmolVLM2-2.2B-Instruct".into(),
+            weights_path: None,
+            shard_paths: Vec::new(),
+            tokenizer_path: None,
+            backend_mode: VlmBackendMode::Auto,
+            device: if cfg!(target_os = "macos") {
+                VlmDevice::Metal
+            } else {
+                VlmDevice::Cpu
+            },
+            precision: VlmPrecision::Bf16,
+            image_size: (384, 384),
+            patch_size: 16,
+            vision_dim: 1152,
+            text_dim: 2048,
+            vocab_size: 49280,
+            num_layers: 24,
+            num_heads: 32,
+            max_context: 8192,
+            temperature: 0.1,
+        }
+    }
+
+    /// Qwen2-VL-2B configuration preset (default `v0.2.0` local VLM for OCR & desktop UI grounding).
     pub fn qwen2_vl_preset() -> Self {
         Self {
             architecture: VlmModelArchitecture::Qwen2Vl,
             model_id: "Qwen/Qwen2-VL-2B-Instruct".into(),
             weights_path: None,
+            shard_paths: Vec::new(),
+            tokenizer_path: None,
+            backend_mode: VlmBackendMode::Auto,
             device: if cfg!(target_os = "macos") {
                 VlmDevice::Metal
             } else {
@@ -93,8 +144,39 @@ impl CandleVlmConfig {
         }
     }
 
+    /// Resolve a `CandleVlmConfig` preset from a model ID or short alias.
+    pub fn from_model_id(model_or_alias: &str) -> Option<Self> {
+        let trimmed = model_or_alias.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "qwen2-vl-2b" | "qwen2-vl" | "qwen/qwen2-vl-2b-instruct" => {
+                Some(Self::qwen2_vl_preset())
+            }
+            "smolvlm2-2.2b" | "smolvlm2" | "huggingfacetb/smolvlm2-2.2b-instruct" => {
+                Some(Self::smolvlm2_preset())
+            }
+            "smolvlm" | "huggingfacetb/smolvlm-instruct" => Some(Self::smolvlm_preset()),
+            _ => None,
+        }
+    }
+
     pub fn with_weights_path(mut self, path: impl AsRef<Path>) -> Self {
         self.weights_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn with_shard_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.shard_paths = paths;
+        self
+    }
+
+    pub fn with_tokenizer_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.tokenizer_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn with_backend_mode(mut self, mode: VlmBackendMode) -> Self {
+        self.backend_mode = mode;
         self
     }
 

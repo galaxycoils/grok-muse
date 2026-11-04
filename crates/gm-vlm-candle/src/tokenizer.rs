@@ -14,7 +14,7 @@ pub struct VlmSpecialTokens {
     pub pad_token_id: u32,
 }
 
-/// Tokenizer scaffolding supporting SmolVLM and Qwen2-VL tokenization schemes,
+/// Tokenizer supporting SmolVLM and Qwen2-VL HuggingFace `tokenizer.json` vocabularies,
 /// image token injection, and structured UI coordinate parsing.
 #[derive(Debug, Clone)]
 pub struct VlmTokenizer {
@@ -22,6 +22,7 @@ pub struct VlmTokenizer {
     vocab: HashMap<String, u32>,
     inv_vocab: HashMap<u32, String>,
     special_tokens: VlmSpecialTokens,
+    has_loaded_vocab: bool,
 }
 
 impl VlmTokenizer {
@@ -77,7 +78,83 @@ impl VlmTokenizer {
                 eos_token_id,
                 pad_token_id: 0,
             },
+            has_loaded_vocab: false,
         }
+    }
+
+    /// Load a real HuggingFace `tokenizer.json` file (`model.vocab` + `added_tokens`).
+    pub fn from_hf_tokenizer_json(
+        architecture: VlmModelArchitecture,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<Self, String> {
+        let raw = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| format!("Failed to read tokenizer.json at {:?}: {e}", path.as_ref()))?;
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Invalid JSON in tokenizer.json: {e}"))?;
+
+        let mut tok = Self::new(architecture);
+        let mut loaded_entries = 0usize;
+
+        if let Some(vocab_obj) = json
+            .get("model")
+            .and_then(|m| m.get("vocab"))
+            .and_then(|v| v.as_object())
+        {
+            for (token_str, id_val) in vocab_obj {
+                if let Some(id_u64) = id_val.as_u64() {
+                    let id = id_u64 as u32;
+                    tok.vocab.insert(token_str.clone(), id);
+                    tok.inv_vocab.insert(id, token_str.clone());
+                    loaded_entries += 1;
+                }
+            }
+        }
+
+        if let Some(added) = json.get("added_tokens").and_then(|a| a.as_array()) {
+            for item in added {
+                if let (Some(content), Some(id_u64)) = (
+                    item.get("content").and_then(|c| c.as_str()),
+                    item.get("id").and_then(|i| i.as_u64()),
+                ) {
+                    let id = id_u64 as u32;
+                    tok.vocab.insert(content.to_string(), id);
+                    tok.inv_vocab.insert(id, content.to_string());
+                    loaded_entries += 1;
+                }
+            }
+        }
+
+        if loaded_entries == 0 {
+            return Err("tokenizer.json contained neither model.vocab nor added_tokens".into());
+        }
+
+        if let Some(&img_id) = tok.vocab.get(tok.special_tokens.image_token) {
+            tok.special_tokens.image_token_id = img_id;
+        }
+        if let Some(&bos_id) = tok.vocab.get(tok.special_tokens.bos_token) {
+            tok.special_tokens.bos_token_id = bos_id;
+        }
+        if let Some(&eos_id) = tok.vocab.get(tok.special_tokens.eos_token) {
+            tok.special_tokens.eos_token_id = eos_id;
+        }
+        if let Some(&pad_id) = tok
+            .vocab
+            .get("<pad>")
+            .or_else(|| tok.vocab.get("<|endoftext|>"))
+        {
+            tok.special_tokens.pad_token_id = pad_id;
+        }
+
+        tok.has_loaded_vocab = true;
+        Ok(tok)
+    }
+
+    pub fn has_loaded_vocab(&self) -> bool {
+        self.has_loaded_vocab
+    }
+
+    pub fn vocab_len(&self) -> usize {
+        self.vocab.len()
     }
 
     pub fn architecture(&self) -> VlmModelArchitecture {
@@ -122,6 +199,10 @@ impl VlmTokenizer {
 
     /// Tokenize text into sequence of token IDs.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        if self.has_loaded_vocab {
+            return self.encode_subwords(text);
+        }
+
         let mut tokens = Vec::new();
         let words: Vec<&str> = text.split_whitespace().collect();
 
@@ -141,8 +222,92 @@ impl VlmTokenizer {
         tokens
     }
 
+    fn encode_subwords(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let max_id = self.vocab.values().copied().max().unwrap_or(1024).max(1);
+        for (idx, word) in text.split_whitespace().enumerate() {
+            if let Some(&id) = self.vocab.get(word) {
+                out.push(id);
+                continue;
+            }
+            if idx > 0 {
+                let gpt_prefixed = format!("Ġ{word}");
+                if let Some(&id) = self.vocab.get(&gpt_prefixed) {
+                    out.push(id);
+                    continue;
+                }
+                let sp_prefixed = format!("▁{word}");
+                if let Some(&id) = self.vocab.get(&sp_prefixed) {
+                    out.push(id);
+                    continue;
+                }
+            }
+
+            // Greedy longest-prefix subword scan across characters
+            let chars: Vec<char> = word.chars().collect();
+            let mut pos = 0usize;
+            while pos < chars.len() {
+                let mut matched = false;
+                let max_end = (pos + 24).min(chars.len());
+                for end in (pos + 1..=max_end).rev() {
+                    let sub: String = chars[pos..end].iter().collect();
+                    if let Some(&id) = self.vocab.get(&sub) {
+                        out.push(id);
+                        pos = end;
+                        matched = true;
+                        break;
+                    }
+                    if idx > 0 && pos == 0 {
+                        let gpt_sub = format!("Ġ{sub}");
+                        if let Some(&id) = self.vocab.get(&gpt_sub) {
+                            out.push(id);
+                            pos = end;
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if !matched {
+                    let ch = chars[pos] as u32;
+                    let unk = self
+                        .vocab
+                        .get("<unk>")
+                        .copied()
+                        .unwrap_or(ch % (max_id + 1));
+                    out.push(unk);
+                    pos += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Decode sequence of token IDs into text.
     pub fn decode(&self, token_ids: &[u32]) -> String {
+        if self.has_loaded_vocab {
+            let mut buf = String::new();
+            for &id in token_ids {
+                if id == self.special_tokens.eos_token_id
+                    || id == self.special_tokens.pad_token_id && buf.is_empty()
+                {
+                    continue;
+                }
+                if let Some(piece) = self.inv_vocab.get(&id) {
+                    let normalized = piece.replace(['Ġ', '▁'], " ").replace('Ċ', "\n");
+                    if !buf.is_empty()
+                        && !normalized.starts_with(' ')
+                        && !normalized.starts_with('\n')
+                        && !normalized.starts_with([',', '.', ':', ';', '}', ']', ')'])
+                        && !buf.ends_with([' ', '\n', '{', '[', '(', '"'])
+                    {
+                        buf.push(' ');
+                    }
+                    buf.push_str(&normalized);
+                }
+            }
+            return buf.trim().to_string();
+        }
+
         let mut words = Vec::new();
         for &id in token_ids {
             if let Some(word) = self.inv_vocab.get(&id) {

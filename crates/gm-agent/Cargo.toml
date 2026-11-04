@@ -9,6 +9,7 @@ gm-core = { workspace = true }
 gm-platform = { workspace = true }
 gm-llm = { workspace = true }
 gm-safety = { workspace = true }
+darius-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +17,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

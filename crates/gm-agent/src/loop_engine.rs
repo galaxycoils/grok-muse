@@ -1,16 +1,31 @@
+use crate::approval::{ApprovalRequest, InteractionHandler, NonInteractiveHandler};
+use crate::mcp_bridge::{McpToolBridge, try_parse_mcp_tool_call};
+use crate::som::{annotate_frame_with_som, is_interactive_element, resolve_som_badge};
 use crate::trajectory::TrajectoryRecorder;
+use crate::wheel::{OpenBotStepAction, WheelHandoffRequest, try_parse_openbot_step_action};
+use crate::workspace_tools::BotWorkspaceSandbox;
 use gm_core::error::{GmError, Result};
-use gm_core::types::{ComputerAction, compute_ax_diff};
-use gm_llm::{ChatMessage, HybridLlmClient, LlmRouter, TaskType};
+use gm_core::types::{AxSnapshot, ComputerAction, compute_ax_diff};
+use gm_llm::{ChatMessage, HybridLlmClient, LlmRouter, TaskType, VaultSecretResolver};
 use gm_platform::Platform;
 use gm_safety::{
-    ActionTier, AuditLogger, BlocklistManager, KillSwitch, UntrustedData, format_untrusted_context,
-    sanitize_ax_snapshot,
+    ActionTier, AuditCategory, AuditLogger, BlocklistManager, KillSwitch, SecretScrubber,
+    UntrustedData, format_untrusted_context, sanitize_ax_snapshot,
 };
+use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepRecord {
+    pub step: u32,
+    pub action_summary: String,
+    pub outcome: String,
+    pub ax_digest: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
@@ -19,6 +34,9 @@ pub struct AgentLoopConfig {
     pub max_action_retries: u32,
     pub trajectory_dir: Option<PathBuf>,
     pub capture_frames: bool,
+    pub max_history_steps: usize,
+    pub sparse_ax_threshold: usize,
+    pub always_include_vision: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -29,9 +47,78 @@ impl Default for AgentLoopConfig {
             max_action_retries: 3,
             trajectory_dir: None,
             capture_frames: false,
+            max_history_steps: 8,
+            sparse_ax_threshold: 5,
+            always_include_vision: false,
         }
     }
 }
+
+pub fn compute_ax_digest(snapshot: &AxSnapshot) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    snapshot.app_name.hash(&mut hasher);
+    snapshot.window_title.hash(&mut hasher);
+    for el in &snapshot.elements {
+        el.token.hash(&mut hasher);
+        el.role.hash(&mut hasher);
+        if let Some(ref l) = el.label {
+            l.hash(&mut hasher);
+        }
+        if let Some(ref v) = el.value {
+            v.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+pub fn format_action_summary(action: &ComputerAction) -> String {
+    match action {
+        ComputerAction::Click {
+            token,
+            coords,
+            button,
+            click_count,
+        } => {
+            let mut parts = Vec::new();
+            if let Some(t) = token {
+                parts.push(format!("token={t}"));
+            }
+            if let Some((x, y)) = coords {
+                parts.push(format!("coords=({x:.0}, {y:.0})"));
+            }
+            if let Some(b) = button {
+                parts.push(format!("button={b:?}"));
+            }
+            if let Some(c) = click_count {
+                parts.push(format!("clicks={c}"));
+            }
+            format!("Click({})", parts.join(", "))
+        }
+        ComputerAction::Type { text } => format!("Type(\"{text}\")"),
+        ComputerAction::KeyCombo { modifiers, key } => {
+            format!("KeyCombo({:?} + {key})", modifiers)
+        }
+        ComputerAction::Scroll { dx, dy } => format!("Scroll(dx={dx}, dy={dy})"),
+        ComputerAction::Drag { start, end } => {
+            format!(
+                "Drag(({:.0}, {:.0}) -> ({:.0}, {:.0}))",
+                start.0, start.1, end.0, end.1
+            )
+        }
+        ComputerAction::Menu { path } => format!("Menu({})", path.join(" > ")),
+        ComputerAction::FocusApp { app_name } => format!("FocusApp(\"{app_name}\")"),
+        ComputerAction::LaunchApp { bundle_id } => format!("LaunchApp(\"{bundle_id}\")"),
+        ComputerAction::Wait {
+            condition,
+            timeout_ms,
+        } => format!("Wait(timeout_ms={timeout_ms}, condition={condition:?})"),
+        ComputerAction::Done { summary } => format!("Done(\"{summary}\")"),
+        ComputerAction::AskUser { question } => format!("AskUser(\"{question}\")"),
+    }
+}
+
+pub type ProgressCallback = Arc<dyn Fn(u32, &str) + Send + Sync>;
+pub type DelegationCallback = Arc<dyn Fn(&str, &str, &[String]) -> Result<String> + Send + Sync>;
 
 pub struct AgentLoop<P: Platform> {
     platform: Arc<P>,
@@ -41,6 +128,13 @@ pub struct AgentLoop<P: Platform> {
     blocklist: BlocklistManager,
     config: AgentLoopConfig,
     audit: Option<Arc<AuditLogger>>,
+    interaction_handler: Arc<dyn InteractionHandler>,
+    progress_callback: Option<ProgressCallback>,
+    mcp_bridge: Option<McpToolBridge>,
+    workspace_sandbox: Option<BotWorkspaceSandbox>,
+    vault_resolver: Option<VaultSecretResolver>,
+    secret_scrubber: SecretScrubber,
+    delegation_callback: Option<DelegationCallback>,
 }
 
 fn action_type_name(action: &ComputerAction) -> &'static str {
@@ -76,11 +170,59 @@ impl<P: Platform> AgentLoop<P> {
             blocklist,
             config,
             audit: None,
+            interaction_handler: Arc::new(NonInteractiveHandler),
+            progress_callback: None,
+            mcp_bridge: None,
+            workspace_sandbox: None,
+            vault_resolver: None,
+            secret_scrubber: SecretScrubber::new(),
+            delegation_callback: None,
         }
+    }
+
+    pub fn with_mcp_bridge(mut self, bridge: McpToolBridge) -> Self {
+        self.mcp_bridge = Some(bridge);
+        self
+    }
+
+    pub fn with_workspace_sandbox(mut self, sandbox: BotWorkspaceSandbox) -> Self {
+        self.workspace_sandbox = Some(sandbox);
+        self
+    }
+
+    pub fn with_vault_resolver(mut self, resolver: VaultSecretResolver) -> Self {
+        self.vault_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_secret_scrubber(mut self, scrubber: SecretScrubber) -> Self {
+        self.secret_scrubber = scrubber;
+        self
+    }
+
+    pub fn with_delegation_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&str, &str, &[String]) -> Result<String> + Send + Sync + 'static,
+    {
+        self.delegation_callback = Some(Arc::new(cb));
+        self
     }
 
     pub fn with_audit(mut self, audit: Arc<AuditLogger>) -> Self {
         self.audit = Some(audit);
+        self
+    }
+
+    pub fn with_interaction_handler(mut self, handler: Arc<dyn InteractionHandler>) -> Self {
+        self.interaction_handler = handler;
+        self
+    }
+
+    pub fn with_progress_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(u32, &str) + Send + Sync + 'static,
+    {
+        self.progress_callback = Some(Arc::new(cb));
         self
     }
 
@@ -139,6 +281,8 @@ impl<P: Platform> AgentLoop<P> {
         let mut step = 0;
         let mut consecutive_no_change_retries = 0;
         let mut last_action_feedback: Option<String> = None;
+        let mut step_history: Vec<StepRecord> = Vec::new();
+        let mut prev_action_was_mutating = false;
 
         while step < self.config.max_steps {
             step += 1;
@@ -167,14 +311,7 @@ impl<P: Platform> AgentLoop<P> {
             // 2. Snapshot AX tree
             let raw_snapshot = self.platform.ax_snapshot(None).await?;
 
-            // 3. Optional frame capture for multimodal grounding or trajectory recording
-            let frame = if self.config.capture_frames {
-                self.platform.capture(Some(1280), Some(70)).await.ok()
-            } else {
-                None
-            };
-
-            // 4. Blocklist check on frontmost window
+            // 3. Blocklist check on frontmost window
             if self
                 .blocklist
                 .is_blocked(&raw_snapshot.app_name, &raw_snapshot.window_title)
@@ -203,35 +340,125 @@ impl<P: Platform> AgentLoop<P> {
                 )));
             }
 
-            // 5. Redaction of secure fields
+            // 4. Redaction of secure fields
             let sanitized_snapshot = sanitize_ax_snapshot(raw_snapshot);
+            let current_ax_digest = compute_ax_digest(&sanitized_snapshot);
 
-            // 6. Wrap screen text as untrusted data
+            // 5. Adaptive Vision Escalation Check
+            let interactive_count = sanitized_snapshot
+                .elements
+                .iter()
+                .filter(|el| is_interactive_element(el))
+                .count();
+
+            let is_sparse_ui = interactive_count < self.config.sparse_ax_threshold;
+            let is_stagnated = prev_action_was_mutating
+                && step_history
+                    .last()
+                    .map(|prev| prev.ax_digest == current_ax_digest)
+                    .unwrap_or(false);
+
+            let should_escalate_vision =
+                self.config.always_include_vision || is_sparse_ui || is_stagnated;
+
+            let task_type = if should_escalate_vision {
+                TaskType::CuVisionStep
+            } else {
+                TaskType::CuAxStep
+            };
+
+            // 6. Frame capture (required if vision escalated or capture_frames enabled)
+            let frame_capture = if should_escalate_vision || self.config.capture_frames {
+                self.platform.capture(Some(1280), Some(70)).await.ok()
+            } else {
+                None
+            };
+            let resolved_frame_bytes: Option<Vec<u8>> = frame_capture
+                .as_ref()
+                .and_then(|fc| gm_platform::resolve_frame_bytes(fc).ok());
+
+            // 7. Optional Set-of-Marks annotation when vision escalated
+            let (som_annotation, active_som_marks) = if should_escalate_vision {
+                let fallback_dims = (
+                    sanitized_snapshot.bounds.width.max(1280.0) as u32,
+                    sanitized_snapshot.bounds.height.max(800.0) as u32,
+                );
+                let annotation = annotate_frame_with_som(
+                    resolved_frame_bytes.as_deref(),
+                    fallback_dims,
+                    &sanitized_snapshot,
+                )?;
+                let marks = annotation.marks.clone();
+                (Some(annotation), marks)
+            } else {
+                (None, Vec::new())
+            };
+
+            // 8. Wrap screen text as untrusted data
             let snapshot_json = serde_json::to_string(&sanitized_snapshot)?;
             let untrusted = UntrustedData::new(snapshot_json, "screen_ax_tree");
             let untrusted_block = format_untrusted_context(untrusted.inner(), untrusted.source());
 
-            // 7. Route and execute LLM step
-            let (primary, fallback) = self.router.route(TaskType::CuAxStep);
+            // 9. Format Recent Step History block
+            let mut history_block = String::new();
+            if !step_history.is_empty() {
+                history_block.push_str("\n\n## Recent Step History\n");
+                for rec in &step_history {
+                    history_block.push_str(&format!(
+                        "- Step {}: {} -> {}\n",
+                        rec.step, rec.action_summary, rec.outcome
+                    ));
+                }
+            }
+
+            // 10. Assemble prompt and messages
             let feedback_block = if let Some(ref fb) = last_action_feedback {
                 format!("\n\n{fb}")
             } else {
                 String::new()
             };
-            let prompt = format!(
-                "Goal: {instruction}\n\nCurrent window state:\n{untrusted_block}{feedback_block}\n\nPick the next action in JSON format."
-            );
-            let messages = vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: "You are an autonomous computer-use agent. Output JSON with fields 'action' and 'params'.".into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: prompt,
-                },
-            ];
 
+            let stagnation_block = if is_stagnated {
+                "\n\n[STAGNATION DETECTED] The previous action did not change the UI state. Use visual Set-of-Marks tags (#1, #2, ...) or visual coordinates to take a different action."
+            } else {
+                ""
+            };
+
+            let som_legend_block = if let Some(ref som) = som_annotation {
+                format!("\n\n{}", som.legend_text)
+            } else {
+                String::new()
+            };
+
+            let mcp_tools_block = if let Some(ref bridge) = self.mcp_bridge {
+                bridge.format_tools_prompt()
+            } else {
+                String::new()
+            };
+
+            let prompt_text = format!(
+                "Goal: {instruction}\n\nCurrent window state:\n{untrusted_block}{history_block}{feedback_block}{stagnation_block}{som_legend_block}{mcp_tools_block}\n\nPick the next action in JSON format."
+            );
+
+            let messages = match &som_annotation {
+                Some(som) => vec![
+                    ChatMessage::text(
+                        "system",
+                        "You are an autonomous computer-use agent with vision. Output JSON with fields 'action' and 'params'. You can reference interactive elements by their Set-of-Marks badge (#1, #2, ...) or accessibility token.",
+                    ),
+                    ChatMessage::with_jpeg("user", prompt_text, &som.jpeg_bytes),
+                ],
+                None => vec![
+                    ChatMessage::text(
+                        "system",
+                        "You are an autonomous computer-use agent. Output JSON with fields 'action' and 'params'.",
+                    ),
+                    ChatMessage::text("user", prompt_text),
+                ],
+            };
+
+            // 11. Route and execute LLM step
+            let (primary, fallback) = self.router.route(task_type);
             let response = self
                 .llm
                 .execute_routed(&primary, fallback.as_ref(), &messages)
@@ -246,22 +473,272 @@ impl<P: Platform> AgentLoop<P> {
                     Some(total_tokens),
                     Some(response.estimated_cost_usd),
                     None,
-                    serde_json::json!({ "task_id": task_id, "step": step }),
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "step": step,
+                        "task_type": format!("{task_type:?}"),
+                        "vision_escalated": should_escalate_vision,
+                    }),
                 );
             }
 
-            // Parse action
-            let action: ComputerAction = match serde_json::from_str(&response.content) {
-                Ok(a) => a,
-                Err(_) => {
-                    // Fallback to done if unparseable
-                    ComputerAction::Done {
-                        summary: response.content.clone(),
+            // 12a. Check for hybrid MCP tool invocation first when MCP bridge is attached
+            if let Some(ref bridge) = self.mcp_bridge
+                && let Some(mcp_inv) = try_parse_mcp_tool_call(&response.content)
+            {
+                let mcp_summary = format!("McpTool({})", mcp_inv.name);
+                if let Some(ref cb) = self.progress_callback {
+                    cb(step, &mcp_summary);
+                }
+                let outcome = bridge
+                    .execute_governed(
+                        task_id,
+                        step,
+                        &mcp_inv,
+                        &self.interaction_handler,
+                        self.audit.as_ref(),
+                    )
+                    .await?;
+                step_history.push(StepRecord {
+                    step,
+                    action_summary: mcp_summary,
+                    outcome,
+                    ax_digest: current_ax_digest,
+                });
+                if step_history.len() > self.config.max_history_steps {
+                    step_history.remove(0);
+                }
+                prev_action_was_mutating = false;
+                last_action_feedback = None;
+                continue;
+            }
+
+            // 12a-openbot. Check for OpenBot step actions (WorkspaceTool, FillSecret, TakeTheWheel, DelegateToBot)
+            if let Some(ob_action) = try_parse_openbot_step_action(&response.content) {
+                match ob_action {
+                    OpenBotStepAction::WorkspaceTool(ref ws_call) => {
+                        if let Some(ref sandbox) = self.workspace_sandbox {
+                            let ws_summary = format!("WorkspaceTool({ws_call:?})");
+                            if let Some(ref cb) = self.progress_callback {
+                                cb(step, &ws_summary);
+                            }
+                            let ws_outcome = sandbox
+                                .execute_tool(
+                                    task_id,
+                                    step,
+                                    ws_call,
+                                    &self.interaction_handler,
+                                    &self.kill_switch,
+                                    self.audit.as_ref(),
+                                )
+                                .await?;
+                            step_history.push(StepRecord {
+                                step,
+                                action_summary: ws_outcome.summary,
+                                outcome: ws_outcome.output,
+                                ax_digest: current_ax_digest,
+                            });
+                            if step_history.len() > self.config.max_history_steps {
+                                step_history.remove(0);
+                            }
+                            prev_action_was_mutating = false;
+                            last_action_feedback = None;
+                            continue;
+                        }
+                    }
+                    OpenBotStepAction::FillSecret {
+                        ref token,
+                        ref secret_ref,
+                    } => {
+                        let resolver = self.vault_resolver.clone().unwrap_or_default();
+                        let lease_start = Instant::now();
+                        let leased = resolver.resolve(secret_ref)?;
+                        self.secret_scrubber
+                            .register(secret_ref.clone(), leased.value.clone());
+                        if let Some(tok) = token {
+                            self.platform
+                                .act(&ComputerAction::Click {
+                                    token: Some(tok.clone()),
+                                    coords: None,
+                                    button: None,
+                                    click_count: None,
+                                })
+                                .await?;
+                        }
+                        self.platform
+                            .act(&ComputerAction::Type {
+                                text: leased.value.clone(),
+                            })
+                            .await?;
+                        let lease_ms = lease_start.elapsed().as_millis() as u64;
+                        let summary = format!("FillSecret({secret_ref})");
+                        if let Some(ref cb) = self.progress_callback {
+                            cb(step, &summary);
+                        }
+                        if let Some(ref logger) = self.audit {
+                            logger.log_governance(
+                                "secret_lease",
+                                self.workspace_sandbox.as_ref().map(|s| s.bot_id()),
+                                AuditCategory::Permitted,
+                                "RULE-SEC-006",
+                                "Opaque vault credential leased and injected without plaintext exposure",
+                                summary.clone(),
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "step": step,
+                                    "secret_ref": secret_ref,
+                                    "lease_ms": lease_ms,
+                                    "value": "[REDACTED]",
+                                }),
+                            );
+                        }
+                        step_history.push(StepRecord {
+                            step,
+                            action_summary: summary,
+                            outcome: format!(
+                                "Injected opaque credential '{secret_ref}' ({lease_ms}ms)"
+                            ),
+                            ax_digest: current_ax_digest,
+                        });
+                        if step_history.len() > self.config.max_history_steps {
+                            step_history.remove(0);
+                        }
+                        prev_action_was_mutating = true;
+                        last_action_feedback = None;
+                        continue;
+                    }
+                    OpenBotStepAction::TakeTheWheel {
+                        ref blocker,
+                        ref instructions,
+                    } => {
+                        let summary = format!("TakeTheWheel(\"{blocker}\")");
+                        if let Some(ref cb) = self.progress_callback {
+                            cb(step, &summary);
+                        }
+                        let req = WheelHandoffRequest {
+                            task_id: task_id.to_string(),
+                            bot_id: self
+                                .workspace_sandbox
+                                .as_ref()
+                                .map(|s| s.bot_id().to_string()),
+                            step,
+                            blocker: blocker.clone(),
+                            instructions: instructions.clone(),
+                        };
+                        if let Some(ref logger) = self.audit {
+                            logger.log_governance(
+                                "wheel_handoff_requested",
+                                req.bot_id.as_deref(),
+                                AuditCategory::Permitted,
+                                "RULE-STD-000",
+                                "Bot paused for human-in-the-loop 'Take the Wheel' intervention",
+                                summary.clone(),
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "step": step,
+                                    "blocker": blocker,
+                                }),
+                            );
+                        }
+                        match self.interaction_handler.request_wheel_handoff(&req).await? {
+                            Some(operator_note) => {
+                                if let Some(ref logger) = self.audit {
+                                    logger.log_governance(
+                                        "wheel_handoff_resumed",
+                                        req.bot_id.as_deref(),
+                                        AuditCategory::Permitted,
+                                        "RULE-STD-000",
+                                        "Human operator handed control back to bot",
+                                        format!("WheelResumed(\"{operator_note}\")"),
+                                        serde_json::json!({
+                                            "task_id": task_id,
+                                            "step": step,
+                                            "note": operator_note,
+                                        }),
+                                    );
+                                }
+                                step_history.push(StepRecord {
+                                    step,
+                                    action_summary: summary,
+                                    outcome: format!(
+                                        "Human operator resolved blocker: \"{operator_note}\""
+                                    ),
+                                    ax_digest: current_ax_digest,
+                                });
+                                if step_history.len() > self.config.max_history_steps {
+                                    step_history.remove(0);
+                                }
+                                prev_action_was_mutating = false;
+                                last_action_feedback = None;
+                                continue;
+                            }
+                            None => {
+                                return Ok(format!(
+                                    "[WAITING_FOR_HUMAN] {blocker}: {instructions}"
+                                ));
+                            }
+                        }
+                    }
+                    OpenBotStepAction::DelegateToBot {
+                        ref target_bot_id,
+                        ref goal,
+                        ref artifacts,
+                    } => {
+                        let summary = format!("DelegateToBot({target_bot_id}, \"{goal}\")");
+                        if let Some(ref cb) = self.progress_callback {
+                            cb(step, &summary);
+                        }
+                        let outcome = if let Some(ref del_cb) = self.delegation_callback {
+                            del_cb(target_bot_id, goal, artifacts)?
+                        } else {
+                            format!("Queued A2A handoff to @{target_bot_id}: {goal}")
+                        };
+                        step_history.push(StepRecord {
+                            step,
+                            action_summary: summary,
+                            outcome,
+                            ax_digest: current_ax_digest,
+                        });
+                        if step_history.len() > self.config.max_history_steps {
+                            step_history.remove(0);
+                        }
+                        prev_action_was_mutating = false;
+                        last_action_feedback = None;
+                        continue;
                     }
                 }
+            }
+
+            // 12b. Parse GUI action and resolve Set-of-Marks badge references
+            let mut action: ComputerAction = match serde_json::from_str(&response.content) {
+                Ok(a) => a,
+                Err(_) => ComputerAction::Done {
+                    summary: response.content.clone(),
+                },
             };
 
-            // 8. Blocklist check on action target app
+            // Resolve SoM badge tokens (e.g. "#1", "1", "som_1") to ax_token and coordinates
+            if let ComputerAction::Click {
+                ref mut token,
+                ref mut coords,
+                ..
+            } = action
+                && let Some(tok_str) = token.clone()
+                && let Some(mark) = resolve_som_badge(&tok_str, &active_som_marks)
+            {
+                *token = Some(mark.ax_token.clone());
+                if coords.is_none() {
+                    *coords = Some((mark.center.0 as f64, mark.center.1 as f64));
+                }
+            }
+
+            // Emit live progress callback if configured
+            let action_summary = format_action_summary(&action);
+            if let Some(ref cb) = self.progress_callback {
+                cb(step, &action_summary);
+            }
+
+            // 13. Blocklist check on action target app
             match &action {
                 ComputerAction::FocusApp { app_name }
                     if self.blocklist.is_blocked(app_name, "") =>
@@ -280,7 +757,7 @@ impl<P: Platform> AgentLoop<P> {
                 _ => {}
             }
 
-            // 9. Resolve target label from snapshot for safety classification
+            // 14. Resolve target label from snapshot for safety classification
             let target_label: Option<String> = match &action {
                 ComputerAction::Click { token, coords, .. } => {
                     let mut found = None;
@@ -305,38 +782,72 @@ impl<P: Platform> AgentLoop<P> {
                 _ => None,
             };
 
-            // 10. Safety tier check
+            // 15. Safety tier check & interactive approval
             let tier = ActionTier::classify(&action, target_label.as_deref());
             if tier.requires_confirmation() {
                 info!(
-                    "Irreversible action {:?} requires explicit user approval",
-                    action
+                    "Action {:?} requires explicit user approval (Tier: {:?})",
+                    action, tier
                 );
-                if let Some(audit) = &self.audit {
-                    audit.log(
-                        "safety_intercept",
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(format!(
-                            "Irreversible action '{action:?}' requires user confirmation"
-                        )),
-                        serde_json::json!({
-                            "action_type": action_type_name(&action),
-                            "tier": "Irreversible",
-                            "blocklist": false,
-                        }),
-                    );
+                let approval_req = ApprovalRequest {
+                    task_id: task_id.to_string(),
+                    step,
+                    action: action.clone(),
+                    target_label: target_label.clone(),
+                    reason: format!(
+                        "Irreversible action '{:?}' requires user confirmation",
+                        action
+                    ),
+                };
+
+                let approved = self
+                    .interaction_handler
+                    .request_approval(&approval_req)
+                    .await?;
+
+                if approved {
+                    info!("Action {:?} approved by interaction handler", action);
+                    if let Some(audit) = &self.audit {
+                        audit.log(
+                            "action_approved",
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(format!("User approved action {:?}", action)),
+                            serde_json::json!({
+                                "task_id": task_id,
+                                "step": step,
+                                "action": action_type_name(&action),
+                            }),
+                        );
+                    }
+                } else {
+                    warn!("Action {:?} denied by interaction handler", action);
+                    if let Some(audit) = &self.audit {
+                        audit.log(
+                            "action_denied",
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(format!(
+                                "Irreversible action '{action:?}' requires user confirmation"
+                            )),
+                            serde_json::json!({
+                                "action_type": action_type_name(&action),
+                                "tier": "Irreversible",
+                                "blocklist": false,
+                            }),
+                        );
+                    }
+                    return Err(GmError::SafetyViolation(format!(
+                        "Irreversible action '{action:?}' requires user confirmation and was denied by user"
+                    )));
                 }
-                return Err(GmError::SafetyViolation(format!(
-                    "Irreversible action '{action:?}' requires user confirmation"
-                )));
             }
 
-            // 11. User coexistence check:
-            // Pause CGEvent actions if user input occurred within the last N seconds,
-            // while allowing background AX actions to proceed immediately without pausing.
+            // 16. User coexistence check:
             if action.is_cgevent_action() {
                 let mut activity = self.platform.user_activity().await?;
                 if activity.seconds_since_last_event < self.config.user_active_pause_seconds {
@@ -362,12 +873,12 @@ impl<P: Platform> AgentLoop<P> {
                 );
             }
 
-            // 12. Dispatch action or terminate
+            // 17. Dispatch action or handle terminal / AskUser actions
             match &action {
                 ComputerAction::Done { summary } => {
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        frame,
+                        frame_capture.clone(),
                         Some(sanitized_snapshot),
                         action.clone(),
                         None,
@@ -378,17 +889,36 @@ impl<P: Platform> AgentLoop<P> {
                     return Ok(summary.clone());
                 }
                 ComputerAction::AskUser { question } => {
-                    let duration_ms = step_start.elapsed().as_millis() as u64;
-                    recorder.record_step(
-                        frame,
-                        Some(sanitized_snapshot),
-                        action.clone(),
-                        None,
-                        response.content.clone(),
-                        duration_ms,
-                    );
-                    recorder.finish(Some(format!("Asked user: {question}")));
-                    return Ok(question.clone());
+                    match self.interaction_handler.ask_user(question).await? {
+                        Some(answer) => {
+                            info!("AskUser answered: \"{answer}\" -> continuing loop");
+                            let rec = StepRecord {
+                                step,
+                                action_summary: format!("AskUser(\"{question}\")"),
+                                outcome: format!("User replied: \"{answer}\""),
+                                ax_digest: current_ax_digest,
+                            };
+                            step_history.push(rec);
+                            if step_history.len() > self.config.max_history_steps {
+                                step_history.remove(0);
+                            }
+                            prev_action_was_mutating = false;
+                            continue;
+                        }
+                        None => {
+                            let duration_ms = step_start.elapsed().as_millis() as u64;
+                            recorder.record_step(
+                                frame_capture.clone(),
+                                Some(sanitized_snapshot),
+                                action.clone(),
+                                None,
+                                response.content.clone(),
+                                duration_ms,
+                            );
+                            recorder.finish(Some(format!("Asked user: {question}")));
+                            return Ok(question.clone());
+                        }
+                    }
                 }
                 other => {
                     if let Some(audit) = &self.audit {
@@ -407,20 +937,43 @@ impl<P: Platform> AgentLoop<P> {
                     }
                     self.platform.act(other).await?;
 
-                    // 13. Verify-after-act: capture post-action snapshot and compute diff
+                    // 18. Verify-after-act: capture post-action snapshot and compute diff
                     let raw_post = self.platform.ax_snapshot(None).await?;
                     let sanitized_post = sanitize_ax_snapshot(raw_post);
                     let diff = compute_ax_diff(&sanitized_snapshot, &sanitized_post);
 
                     let duration_ms = step_start.elapsed().as_millis() as u64;
                     recorder.record_step(
-                        frame,
+                        frame_capture.clone(),
                         Some(sanitized_snapshot.clone()),
                         action.clone(),
                         Some(diff.clone()),
                         response.content.clone(),
                         duration_ms,
                     );
+
+                    let outcome = if diff.is_empty() {
+                        "No observable UI change".to_string()
+                    } else {
+                        format!(
+                            "UI changed (+{} added, -{} removed, ~{} modified)",
+                            diff.added_tokens.len(),
+                            diff.removed_tokens.len(),
+                            diff.changed_elements.len()
+                        )
+                    };
+
+                    let rec = StepRecord {
+                        step,
+                        action_summary: action_summary.clone(),
+                        outcome,
+                        ax_digest: current_ax_digest,
+                    };
+                    step_history.push(rec);
+                    if step_history.len() > self.config.max_history_steps {
+                        step_history.remove(0);
+                    }
+                    prev_action_was_mutating = action.modifies_ui_state();
 
                     // Check if UI state was expected to change but diff was empty
                     if action.modifies_ui_state() && diff.is_empty() {
@@ -444,7 +997,6 @@ impl<P: Platform> AgentLoop<P> {
                             return Ok(question);
                         }
                     } else {
-                        // Progress observed or state changed, reset retries
                         consecutive_no_change_retries = 0;
                         last_action_feedback = None;
                     }
@@ -462,8 +1014,9 @@ impl<P: Platform> AgentLoop<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::CallbackInteractionHandler;
     use gm_core::config::{BudgetConfig, ProvidersConfig};
-    use gm_core::types::UserActivity;
+    use gm_core::types::{AxElement, Rect, UserActivity};
     use gm_llm::{BudgetManager, MockLlmBackend};
     use gm_platform::MockPlatform;
 
@@ -589,14 +1142,12 @@ mod tests {
     #[tokio::test]
     async fn test_user_coexistence_ax_allowed_and_cgevent_paused() {
         let platform = Arc::new(MockPlatform::new());
-        // Set user to active (input 0.2s ago)
         platform.set_user_activity(UserActivity {
             seconds_since_last_event: 0.2,
             is_user_active: true,
         });
 
         let mock_backend = Arc::new(MockLlmBackend::new());
-        // Queue step 1 (AX Click) and step 2 (Done)
         mock_backend.queue_response(
             "{\"action\":\"Click\",\"params\":{\"token\":\"btn_1\",\"coords\":null,\"button\":null,\"click_count\":null}}",
         );
@@ -614,6 +1165,7 @@ mod tests {
             max_action_retries: 2,
             trajectory_dir: None,
             capture_frames: false,
+            ..Default::default()
         };
 
         let agent = AgentLoop::new(
@@ -629,7 +1181,6 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "Completed");
 
-        // Verify that AX action was indeed executed
         let actions = platform.get_executed_actions();
         assert_eq!(actions.len(), 1);
         assert!(actions[0].is_ax_action());
@@ -639,7 +1190,6 @@ mod tests {
     async fn test_verify_after_act_retry_bounds_with_ask_user_fallback() {
         let platform = Arc::new(MockPlatform::new());
         let mock_backend = Arc::new(MockLlmBackend::new());
-        // Action that modifies UI state: typing text
         mock_backend.set_response("{\"action\":\"Type\",\"params\":{\"text\":\"test text\"}}");
 
         let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
@@ -651,15 +1201,14 @@ mod tests {
         let config = AgentLoopConfig {
             max_steps: 10,
             user_active_pause_seconds: 0.1,
-            max_action_retries: 2, // Bound is 2 retries
+            max_action_retries: 2,
             trajectory_dir: None,
             capture_frames: false,
+            ..Default::default()
         };
 
         let agent = AgentLoop::new(platform, llm, router, kill_switch, blocklist, config);
 
-        // MockPlatform snapshot doesn't change after Type, so diff is empty
-        // AgentLoop should retry up to 2 times, then fall back to ask_user!
         let res = agent.run_task("test_retry_bound", "Type something").await;
         assert!(res.is_ok());
         let msg = res.unwrap();
@@ -699,5 +1248,387 @@ mod tests {
         assert!(entries.iter().any(|e| e.event_type == "task_start"));
         assert!(entries.iter().any(|e| e.event_type == "model_call"));
         assert!(entries.iter().any(|e| e.event_type == "task_done"));
+    }
+
+    #[tokio::test]
+    async fn test_som_badge_resolution_in_agent_loop() {
+        let platform = Arc::new(MockPlatform::new());
+        // Configure snapshot with 2 interactive elements
+        let snapshot = AxSnapshot {
+            window_id: 1,
+            app_name: "TestApp".into(),
+            window_title: "Window".into(),
+            bounds: Rect::new(0.0, 0.0, 1000.0, 800.0),
+            elements: vec![
+                AxElement {
+                    token: "submit_btn_real".into(),
+                    role: "AXButton".into(),
+                    label: Some("Submit".into()),
+                    value: None,
+                    frame: Rect::new(100.0, 200.0, 80.0, 30.0),
+                    is_enabled: true,
+                    is_secure: false,
+                },
+                AxElement {
+                    token: "cancel_btn_real".into(),
+                    role: "AXButton".into(),
+                    label: Some("Cancel".into()),
+                    value: None,
+                    frame: Rect::new(200.0, 200.0, 80.0, 30.0),
+                    is_enabled: true,
+                    is_secure: false,
+                },
+            ],
+            timestamp_ms: 10,
+        };
+        platform.set_snapshot(snapshot);
+
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Model refers to badge #1
+        mock_backend.queue_response(
+            "{\"action\":\"Click\",\"params\":{\"token\":\"#1\",\"coords\":null,\"button\":null,\"click_count\":null}}",
+        );
+        mock_backend.queue_response("{\"action\":\"Done\",\"params\":{\"summary\":\"Done\"}}");
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+
+        let agent = AgentLoop::new(
+            platform.clone(),
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig {
+                sparse_ax_threshold: 5, // 2 elements < 5 threshold triggers SoM vision!
+                ..Default::default()
+            },
+        );
+
+        let res = agent.run_task("test_som_res", "Click submit badge").await;
+        assert!(res.is_ok());
+
+        let executed = platform.get_executed_actions();
+        assert_eq!(executed.len(), 1);
+        if let ComputerAction::Click { token, coords, .. } = &executed[0] {
+            assert_eq!(token.as_deref(), Some("submit_btn_real"));
+            assert_eq!(*coords, Some((140.0, 215.0))); // Center of badge #1
+        } else {
+            panic!("Expected click action");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stagnation_detection_triggers_vision_escalation() {
+        let platform = Arc::new(MockPlatform::new());
+        // Populate snapshot with 10 elements so it does NOT trigger sparse UI
+        let mut elements = Vec::new();
+        for i in 1..=10 {
+            elements.push(AxElement {
+                token: format!("el_{i}"),
+                role: "AXButton".into(),
+                label: Some(format!("Button {i}")),
+                value: None,
+                frame: Rect::new(10.0 * i as f64, 10.0, 50.0, 30.0),
+                is_enabled: true,
+                is_secure: false,
+            });
+        }
+        let snapshot = AxSnapshot {
+            window_id: 1,
+            app_name: "App".into(),
+            window_title: "Title".into(),
+            bounds: Rect::new(0.0, 0.0, 1000.0, 800.0),
+            elements,
+            timestamp_ms: 100,
+        };
+        platform.set_snapshot(snapshot);
+
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Step 1: mutating action (Scroll) that fails to change the UI snapshot
+        mock_backend.queue_response("{\"action\":\"Scroll\",\"params\":{\"dx\":0,\"dy\":-100}}");
+        // Step 2: Done
+        mock_backend.queue_response(
+            "{\"action\":\"Done\",\"params\":{\"summary\":\"Escalated and done\"}}",
+        );
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend.clone(), budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+
+        let agent = AgentLoop::new(
+            platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig {
+                sparse_ax_threshold: 2, // 10 elements > 2 -> starts as CuAxStep
+                ..Default::default()
+            },
+        );
+
+        let res = agent
+            .run_task("test_stagnation", "Test stagnation vision")
+            .await;
+        assert!(res.is_ok());
+
+        // In step 2, stagnation was detected, causing CuVisionStep and receiving 1 image!
+        assert_eq!(mock_backend.received_images(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_interactive_approval_flow_approved() {
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Step 1: Irreversible click action
+        mock_backend.queue_response(
+            "{\"action\":\"Click\",\"params\":{\"token\":\"send_btn\",\"coords\":null,\"button\":null,\"click_count\":null}}",
+        );
+        // Step 2: Done
+        mock_backend
+            .queue_response("{\"action\":\"Done\",\"params\":{\"summary\":\"Email sent\"}}");
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+        let audit = Arc::new(AuditLogger::in_memory());
+
+        let interactive_handler = Arc::new(CallbackInteractionHandler::with_approval_always(true));
+
+        let agent = AgentLoop::new(
+            platform.clone(),
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_audit(audit.clone())
+        .with_interaction_handler(interactive_handler);
+
+        let res = agent.run_task("test_approve", "Send wire transfer").await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "Email sent");
+
+        // Action was actually executed on the platform!
+        let actions = platform.get_executed_actions();
+        assert_eq!(actions.len(), 1);
+
+        // Audit log records action_approved
+        let entries = audit.entries();
+        assert!(entries.iter().any(|e| e.event_type == "action_approved"));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_approval_flow_denied() {
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Irreversible click action
+        mock_backend.set_response(
+            "{\"action\":\"Click\",\"params\":{\"token\":\"send_btn\",\"coords\":null,\"button\":null,\"click_count\":null}}",
+        );
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+        let audit = Arc::new(AuditLogger::in_memory());
+
+        let interactive_handler = Arc::new(CallbackInteractionHandler::with_approval_always(false));
+
+        let agent = AgentLoop::new(
+            platform.clone(),
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_audit(audit.clone())
+        .with_interaction_handler(interactive_handler);
+
+        let res = agent.run_task("test_deny", "Send wire transfer").await;
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            GmError::SafetyViolation(msg) => {
+                assert!(msg.contains("user confirmation"));
+                assert!(msg.contains("denied"));
+            }
+            other => panic!("Expected SafetyViolation, got {other:?}"),
+        }
+
+        // Action was NOT executed on the platform!
+        let actions = platform.get_executed_actions();
+        assert_eq!(actions.len(), 0);
+
+        // Audit log records action_denied
+        let entries = audit.entries();
+        assert!(entries.iter().any(|e| e.event_type == "action_denied"));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_ask_user_continuation() {
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Step 1: Model asks user for clarification
+        mock_backend.queue_response(
+            "{\"action\":\"AskUser\",\"params\":{\"question\":\"Which account number?\"}}",
+        );
+        // Step 2: Model finishes
+        mock_backend.queue_response(
+            "{\"action\":\"Done\",\"params\":{\"summary\":\"Processed account 1234\"}}",
+        );
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+
+        let handler = Arc::new(
+            CallbackInteractionHandler::new().with_ask_user_callback(|_q| Some("1234".to_string())),
+        );
+
+        let agent = AgentLoop::new(
+            platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_interaction_handler(handler);
+
+        let res = agent.run_task("test_ask_continue", "Process payment").await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "Processed account 1234");
+    }
+
+    #[tokio::test]
+    async fn test_step_progress_callback() {
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        mock_backend.queue_response(
+            "{\"action\":\"Click\",\"params\":{\"token\":\"btn_1\",\"coords\":null,\"button\":null,\"click_count\":null}}",
+        );
+        mock_backend.queue_response("{\"action\":\"Done\",\"params\":{\"summary\":\"All done\"}}");
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+
+        let progress_steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let progress_steps_clone = Arc::clone(&progress_steps);
+
+        let agent = AgentLoop::new(
+            platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_progress_callback(move |step, action_summary| {
+            progress_steps_clone
+                .lock()
+                .push((step, action_summary.to_string()));
+        });
+
+        let res = agent.run_task("test_progress", "Click button").await;
+        assert!(res.is_ok());
+
+        let recorded = progress_steps.lock();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, 1);
+        assert!(recorded[0].1.contains("Click"));
+        assert_eq!(recorded[1].0, 2);
+        assert!(recorded[1].1.contains("Done"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_openbot_workspace_secret_and_wheel() {
+        let dir = std::env::temp_dir().join(format!("agent_ob_test_{}", uuid::Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("OB_LOOP_SECRET_TEST", "ultra_secret_password_777");
+        }
+        let scrubber = SecretScrubber::new();
+        let sandbox = BotWorkspaceSandbox::new("coder", &dir)
+            .unwrap()
+            .with_scrubber(scrubber.clone());
+        let resolver = VaultSecretResolver::new(gm_llm::KeychainSecrets::new(
+            "co.anysphere.grok-muse.ob-loop-test",
+        ));
+
+        let platform = Arc::new(MockPlatform::new());
+        let mock_backend = Arc::new(MockLlmBackend::new());
+        // Step 1: Write file in workspace
+        mock_backend.queue_response(
+            r#"{"action":"WorkspaceWriteFile","params":{"path":"notes.txt","content":"hello openbot\n"}}"#,
+        );
+        // Step 2: Lease & inject opaque secret
+        mock_backend.queue_response(
+            r#"{"action":"FillSecret","params":{"token":"btn_1","secret_ref":"secret://keychain/ob_loop_secret_test"}}"#,
+        );
+        // Step 3: Hit 2FA wall -> TakeTheWheel
+        mock_backend.queue_response(
+            r#"{"action":"TakeTheWheel","params":{"blocker":"2FA code needed","instructions":"Enter SMS code"}}"#,
+        );
+        // Step 4: Done
+        mock_backend.queue_response(
+            r#"{"action":"Done","params":{"summary":"Completed after human wheel handoff"}}"#,
+        );
+
+        let budget = Arc::new(BudgetManager::new(BudgetConfig::default()));
+        let llm = Arc::new(HybridLlmClient::new(mock_backend, budget));
+        let router = LlmRouter::new(ProvidersConfig::default());
+        let kill_switch = KillSwitch::new();
+        let blocklist = BlocklistManager::default();
+        let audit = Arc::new(AuditLogger::in_memory());
+        let handler = Arc::new(
+            crate::approval::CallbackInteractionHandler::with_approval_always(true)
+                .with_wheel_callback(|req| Some(format!("Operator solved {}", req.blocker))),
+        );
+
+        let agent = AgentLoop::new(
+            platform,
+            llm,
+            router,
+            kill_switch,
+            blocklist,
+            AgentLoopConfig::default(),
+        )
+        .with_workspace_sandbox(sandbox.clone())
+        .with_vault_resolver(resolver)
+        .with_secret_scrubber(scrubber.clone())
+        .with_audit(Arc::clone(&audit))
+        .with_interaction_handler(handler);
+
+        let result = agent
+            .run_task("ob_task_1", "Sign in and save notes")
+            .await
+            .unwrap();
+        assert_eq!(result, "Completed after human wheel handoff");
+        assert!(sandbox.workspace_dir().join("notes.txt").exists());
+
+        // Verify audit contains zero plaintext secret leaks!
+        let entries_json = serde_json::to_string(&audit.entries()).unwrap();
+        assert!(!entries_json.contains("ultra_secret_password_777"));
+        assert!(entries_json.contains("secret://keychain/ob_loop_secret_test"));
+
+        unsafe {
+            std::env::remove_var("OB_LOOP_SECRET_TEST");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

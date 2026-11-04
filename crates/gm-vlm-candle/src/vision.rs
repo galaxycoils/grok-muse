@@ -69,7 +69,16 @@ impl VisionEncoder {
         })
     }
 
-    /// Preprocess raw JPEG / image byte buffer into normalized float tensor `[1, 3, H, W]`.
+    /// Inspect raw JPEG/PNG image dimensions `(width, height)` when valid image headers are present.
+    pub fn decode_image_dimensions(image_bytes: &[u8]) -> Option<(u32, u32)> {
+        image::load_from_memory(image_bytes)
+            .ok()
+            .map(|img| (img.width(), img.height()))
+    }
+
+    /// Preprocess raw JPEG/PNG byte buffer into normalized float tensor `[1, 3, H, W]`.
+    /// Uses real `image::load_from_memory` RGB8 decoding + `Lanczos3` resampling for valid images,
+    /// with deterministic fallback for synthetic raw byte buffers in offline unit tests.
     pub fn preprocess_image(
         image_bytes: &[u8],
         target_size: (usize, usize),
@@ -89,18 +98,41 @@ impl VisionEncoder {
         }
         let total_pixels = target_h * target_w;
 
-        // Extract pseudo-RGB intensities from input buffer for deterministic offline inference
         let mut r = Vec::with_capacity(total_pixels);
         let mut g = Vec::with_capacity(total_pixels);
         let mut b = Vec::with_capacity(total_pixels);
 
-        let byte_len = image_bytes.len();
-        for i in 0..total_pixels {
-            let byte_val = image_bytes[i % byte_len] as f32 / 255.0;
-            // Standard ImageNet normalization approx: mean [0.485, 0.456, 0.406], std [0.229, 0.224, 0.225]
-            r.push((byte_val - 0.485) / 0.229);
-            g.push((byte_val * 0.9 - 0.456) / 0.224);
-            b.push((byte_val * 0.8 - 0.406) / 0.225);
+        if let Ok(decoded) = image::load_from_memory(image_bytes) {
+            let rgb = decoded.to_rgb8();
+            let resized = if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
+                rgb
+            } else {
+                image::imageops::resize(
+                    &rgb,
+                    target_w as u32,
+                    target_h as u32,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            };
+
+            for pixel in resized.pixels() {
+                let rv = pixel[0] as f32 / 255.0;
+                let gv = pixel[1] as f32 / 255.0;
+                let bv = pixel[2] as f32 / 255.0;
+                // CLIP / ImageNet channel normalization
+                r.push((rv - 0.485) / 0.229);
+                g.push((gv - 0.456) / 0.224);
+                b.push((bv - 0.406) / 0.225);
+            }
+        } else {
+            // Deterministic fallback for synthetic byte buffers in offline unit tests
+            let byte_len = image_bytes.len();
+            for i in 0..total_pixels {
+                let byte_val = image_bytes[i % byte_len] as f32 / 255.0;
+                r.push((byte_val - 0.485) / 0.229);
+                g.push((byte_val * 0.9 - 0.456) / 0.224);
+                b.push((byte_val * 0.8 - 0.406) / 0.225);
+            }
         }
 
         let mut all_channels = Vec::with_capacity(3 * total_pixels);

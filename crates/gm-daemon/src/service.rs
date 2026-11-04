@@ -398,13 +398,14 @@ pub fn show_services_status() -> Result<()> {
     print_row("Daemon (gm-daemon)", &d_status);
     print_row("Computer-Use Helper (gm-cu-helper)", &h_status);
 
-    let socket_path = Path::new("/tmp/grok-muse-helper.sock");
+    let config = gm_core::config::GmConfig::load_or_default(None);
+    let socket_path = &config.socket_path;
     println!(
         "Helper Socket: {}",
         if socket_path.exists() {
-            "Active (/tmp/grok-muse-helper.sock)"
+            format!("Active ({})", socket_path.display())
         } else {
-            "Not active"
+            "Not active".to_string()
         }
     );
     println!("============================================================\n");

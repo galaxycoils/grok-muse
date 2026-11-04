@@ -82,6 +82,16 @@ impl IpcPlatformClient {
             other => Ok(other),
         }
     }
+
+    /// Ping the helper to verify connectivity.
+    pub async fn ping(&self) -> Result<()> {
+        match self.send_request(HelperRequest::Ping).await? {
+            HelperResponse::Pong => Ok(()),
+            other => Err(GmError::Ipc(format!(
+                "Unexpected response to Ping: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]

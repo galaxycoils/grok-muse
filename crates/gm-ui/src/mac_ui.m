@@ -7,10 +7,20 @@
 typedef void (*GmHotkeyCallback)(int hotkey_id);
 typedef void (*GmTaskSubmittedCallback)(const char *instruction);
 typedef void (*GmPauseToggledCallback)(int is_paused);
+typedef void (*GmApprovalDecisionCallback)(const char *request_id, bool approved);
 
 static GmHotkeyCallback g_hotkey_callback = NULL;
 static GmTaskSubmittedCallback g_task_callback = NULL;
 static GmPauseToggledCallback g_pause_callback = NULL;
+static GmApprovalDecisionCallback g_approval_callback = NULL;
+
+static void gm_run_on_main_queue(void (^block)(void)) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
+}
 
 static NSStatusItem *g_status_item = nil;
 static NSWindow *g_chat_window = nil;
@@ -30,6 +40,7 @@ static NSTextField *g_lbl_rem = nil;
 
 static BOOL g_is_paused = NO;
 static int g_current_overlay_state = 0; // 0=Idle, 1=Acting, 2=Paused, 3=Stopped
+static BOOL g_in_assistant_turn = NO;
 
 // Carbon Hotkey Refs
 static EventHandlerRef g_carbon_ui_handler = NULL;
@@ -190,6 +201,7 @@ static GmUiController *g_ui_controller = nil;
     if ([input length] == 0) return;
     
     if (g_chat_transcript) {
+        g_in_assistant_turn = NO;
         NSString *prev = [g_chat_transcript string];
         NSString *updated = [NSString stringWithFormat:@"%@\n\nUser: %@", prev, input];
         [g_chat_transcript setString:updated];
@@ -349,16 +361,16 @@ int gm_mac_ui_init_action_overlay(void) {
     }
 }
 
-void gm_mac_ui_set_overlay_state(int state, const char *status_text, const char *detail_text) {
+void gm_ui_set_hud_state(int state, const char *status_text, const char *detail_text) {
     @autoreleasepool {
-        if (!g_overlay_panel) {
-            gm_mac_ui_init_action_overlay();
-        }
-        g_current_overlay_state = state;
         NSString *statusStr = status_text ? [NSString stringWithUTF8String:status_text] : nil;
         NSString *detailStr = detail_text ? [NSString stringWithUTF8String:detail_text] : nil;
         
-        dispatch_async(dispatch_get_main_queue(), ^{
+        gm_run_on_main_queue(^{
+            g_current_overlay_state = state;
+            if (!g_overlay_panel) {
+                gm_mac_ui_init_action_overlay();
+            }
             switch (state) {
                 case 0: // Idle
                     g_overlay_indicator.layer.backgroundColor = [[NSColor systemGrayColor] CGColor];
@@ -382,15 +394,121 @@ void gm_mac_ui_set_overlay_state(int state, const char *status_text, const char 
                     break;
             }
             [g_overlay_panel orderFrontRegardless];
+
+            // Synchronize status item menu with HUD state
+            if (g_status_item && g_status_item.menu) {
+                NSMenuItem *statusItem = [g_status_item.menu itemWithTag:201];
+                if (statusItem) {
+                    [statusItem setTitle:[NSString stringWithFormat:@"Status: %@", statusStr ?: @"Unknown"]];
+                }
+                NSMenuItem *pauseItem = [g_status_item.menu itemWithTag:202];
+                if (pauseItem && (state == 0 || state == 2)) {
+                    [pauseItem setTitle:(state == 2) ? @"Resume Agent" : @"Pause Agent"];
+                }
+            }
+        });
+    }
+}
+
+void gm_mac_ui_set_overlay_state(int state, const char *status_text, const char *detail_text) {
+    gm_ui_set_hud_state(state, status_text, detail_text);
+}
+
+void gm_ui_append_chat_message(const char *role_cstr, const char *msg_cstr) {
+    if (!msg_cstr) return;
+    @autoreleasepool {
+        NSString *role = role_cstr ? [NSString stringWithUTF8String:role_cstr] : @"Assistant";
+        NSString *msg = [NSString stringWithUTF8String:msg_cstr];
+        
+        gm_run_on_main_queue(^{
+            g_in_assistant_turn = NO;
+            if (!g_chat_window) {
+                gm_mac_ui_init_chat_window();
+            }
+            if (g_chat_transcript) {
+                NSString *prev = [g_chat_transcript string];
+                NSString *updated = [NSString stringWithFormat:@"%@\n\n%@: %@", prev, role, msg];
+                [g_chat_transcript setString:updated];
+                [g_chat_transcript scrollRangeToVisible:NSMakeRange([updated length], 0)];
+            }
+        });
+    }
+}
+
+void gm_ui_append_chat_delta(const char *delta_cstr) {
+    if (!delta_cstr) return;
+    @autoreleasepool {
+        NSString *delta = [NSString stringWithUTF8String:delta_cstr];
+        if (!delta) return;
+        
+        gm_run_on_main_queue(^{
+            if (!g_chat_window) {
+                gm_mac_ui_init_chat_window();
+            }
+            if (g_chat_transcript) {
+                NSString *prev = [g_chat_transcript string];
+                if (!g_in_assistant_turn) {
+                    g_in_assistant_turn = YES;
+                    prev = [NSString stringWithFormat:@"%@\n\nAssistant: ", prev];
+                }
+                NSString *updated = [prev stringByAppendingString:delta];
+                [g_chat_transcript setString:updated];
+                [g_chat_transcript scrollRangeToVisible:NSMakeRange([updated length], 0)];
+            }
+        });
+    }
+}
+
+void gm_ui_set_approval_callback(GmApprovalDecisionCallback cb) {
+    g_approval_callback = cb;
+}
+
+void gm_ui_present_approval_sheet(const char *request_id_cstr, const char *title_cstr, const char *details_cstr) {
+    if (!request_id_cstr) return;
+    @autoreleasepool {
+        NSString *reqId = [NSString stringWithUTF8String:request_id_cstr];
+        if (!reqId) {
+            reqId = [NSString stringWithCString:request_id_cstr encoding:NSISOLatin1StringEncoding];
+        }
+        if (!reqId) {
+            reqId = @"unknown";
+        }
+        NSString *title = title_cstr ? [NSString stringWithUTF8String:title_cstr] : @"Action Approval Required";
+        NSString *details = details_cstr ? [NSString stringWithUTF8String:details_cstr] : @"Grok-Muse requests permission to perform this irreversible action.";
+        
+        gm_run_on_main_queue(^{
+            [NSApp activateIgnoringOtherApps:YES];
+            NSAlert *alert = [[NSAlert alloc] init];
+            [alert setMessageText:title];
+            [alert setInformativeText:details];
+            [alert setAlertStyle:NSAlertStyleWarning];
+            [alert addButtonWithTitle:@"Approve Action"];     // NSAlertFirstButtonReturn
+            [alert addButtonWithTitle:@"Deny & Stop"];        // NSAlertSecondButtonReturn
+            
+            NSWindow *targetWindow = g_chat_window ?: [NSApp keyWindow];
+            if (targetWindow && [targetWindow isVisible]) {
+                [alert beginSheetModalForWindow:targetWindow completionHandler:^(NSModalResponse returnCode) {
+                    bool approved = (returnCode == NSAlertFirstButtonReturn);
+                    if (g_approval_callback) {
+                        g_approval_callback([reqId UTF8String], approved);
+                    }
+                }];
+            } else {
+                NSModalResponse response = [alert runModal];
+                bool approved = (response == NSAlertFirstButtonReturn);
+                if (g_approval_callback) {
+                    g_approval_callback([reqId UTF8String], approved);
+                }
+            }
         });
     }
 }
 
 void gm_mac_ui_show_overlay(int show) {
-    if (!g_overlay_panel) {
-        gm_mac_ui_init_action_overlay();
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
+    gm_run_on_main_queue(^{
+        if (!g_overlay_panel) {
+            gm_mac_ui_init_action_overlay();
+        }
         if (show) {
             [g_overlay_panel orderFrontRegardless];
         } else {
@@ -613,10 +731,10 @@ int gm_mac_ui_init_chat_window(void) {
 }
 
 int gm_mac_ui_show_chat_window(void) {
-    if (!g_chat_window) {
-        gm_mac_ui_init_chat_window();
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
+    gm_run_on_main_queue(^{
+        if (!g_chat_window) {
+            gm_mac_ui_init_chat_window();
+        }
         [NSApp activateIgnoringOtherApps:YES];
         [g_chat_window makeKeyAndOrderFront:nil];
         if (g_chat_input) {

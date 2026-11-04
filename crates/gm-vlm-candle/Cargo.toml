@@ -11,6 +11,10 @@ candle-core = "0.11.1"
 candle-nn = "0.11.1"
 candle-transformers = "0.11.1"
 safetensors = "0.8"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = { workspace = true }
+chrono = { workspace = true }
 gm-core = { workspace = true }
 gm-llm = { workspace = true, features = ["local-vlm"] }
 tokio = { workspace = true }

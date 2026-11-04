@@ -1,6 +1,7 @@
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
+use candle_transformers::generation::LogitsProcessor;
 
-/// Language model decoder scaffolding for SmolVLM and Qwen2-VL transformer layers.
+/// Language model decoder for SmolVLM and Qwen2-VL transformer layers.
 #[derive(Debug, Clone)]
 pub struct LanguageModel {
     pub vocab_size: usize,
@@ -53,7 +54,11 @@ impl LanguageModel {
             return Tensor::zeros((1, 0, self.text_dim), self.token_embedding.dtype(), device);
         }
 
-        let id_tensor = Tensor::from_slice(token_ids, (seq_len,), device)?;
+        let clamped: Vec<u32> = token_ids
+            .iter()
+            .map(|&id| id.min((self.vocab_size.saturating_sub(1)) as u32))
+            .collect();
+        let id_tensor = Tensor::from_slice(&clamped, (seq_len,), device)?;
         let embeds = self.token_embedding.index_select(&id_tensor, 0)?;
         embeds.reshape((1, seq_len, self.text_dim))
     }
@@ -75,5 +80,42 @@ impl LanguageModel {
 
         // 4. Reshape to [batch, seq_len, vocab_size]
         logits_flat.reshape((batch, seq_len, self.vocab_size))
+    }
+
+    /// Autoregressive token generation using `candle-transformers` `LogitsProcessor`.
+    pub fn generate_autoregressive(
+        &self,
+        initial_embeds: &Tensor,
+        max_new_tokens: usize,
+        eos_token_id: u32,
+        temperature: f32,
+        device: &Device,
+    ) -> CandleResult<Vec<u32>> {
+        let temp_opt = if temperature <= 0.01 {
+            None
+        } else {
+            Some(temperature as f64)
+        };
+        let mut logits_processor = LogitsProcessor::new(42, temp_opt, None);
+        let mut current_seq = initial_embeds.clone();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for _ in 0..max_new_tokens {
+            let (_, seq_len, _) = current_seq.dims3()?;
+            if seq_len == 0 {
+                break;
+            }
+            let logits = self.forward(&current_seq)?;
+            let last_logits = logits.i((0, seq_len - 1))?.to_dtype(DType::F32)?;
+            let next_token = logits_processor.sample(&last_logits)?;
+            if next_token == eos_token_id {
+                break;
+            }
+            generated.push(next_token);
+            let next_embed = self.embed_tokens(&[next_token], device)?;
+            current_seq = Tensor::cat(&[&current_seq, &next_embed], 1)?;
+        }
+
+        Ok(generated)
     }
 }

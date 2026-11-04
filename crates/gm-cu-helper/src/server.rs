@@ -2,7 +2,7 @@ use gm_core::error::Result;
 use gm_core::ipc::{
     HelperRequest, HelperResponse, IpcMessage, read_ipc_message, write_ipc_message,
 };
-use gm_platform::Platform;
+use gm_platform::{Platform, ShmFrameRing};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -14,12 +14,16 @@ use tracing::{info, warn};
 
 pub struct HelperServer<P: Platform + 'static> {
     platform: Arc<P>,
+    shm_ring: Arc<ShmFrameRing>,
 }
+
+pub use gm_core::ipc::is_peer_authorized;
 
 impl<P: Platform + 'static> HelperServer<P> {
     pub fn new(platform: P) -> Self {
         Self {
             platform: Arc::new(platform),
+            shm_ring: Arc::new(ShmFrameRing::default()),
         }
     }
 
@@ -35,14 +39,46 @@ impl<P: Platform + 'static> HelperServer<P> {
             }
 
             let listener = UnixListener::bind(path)?;
-            info!("Helper server listening on {:?}", path);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                if let Err(e) = std::fs::set_permissions(path, perms) {
+                    warn!(
+                        "Failed to lock socket permissions to 0o600 on {:?}: {e}",
+                        path
+                    );
+                }
+            }
+            let my_euid = unsafe { libc::geteuid() };
+            info!(
+                "Helper server listening on {:?} (UID: {my_euid}, mode 0600)",
+                path
+            );
 
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
+                        match stream.peer_cred() {
+                            Ok(cred) => {
+                                if !is_peer_authorized(cred.uid(), my_euid) {
+                                    warn!(
+                                        "Rejected peer connection with mismatched UID (peer: {}, expected: {})",
+                                        cred.uid(),
+                                        my_euid
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to inspect peer credentials on helper socket: {e}");
+                                continue;
+                            }
+                        }
+
                         let platform = Arc::clone(&self.platform);
+                        let shm_ring = Arc::clone(&self.shm_ring);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, platform).await {
+                            if let Err(e) = handle_connection(stream, platform, shm_ring).await {
                                 warn!("Connection error: {e}");
                             }
                         });
@@ -80,8 +116,9 @@ impl<P: Platform + 'static> HelperServer<P> {
                 })?;
 
                 let platform = Arc::clone(&self.platform);
+                let shm_ring = Arc::clone(&self.shm_ring);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(server, platform).await {
+                    if let Err(e) = handle_connection(server, platform, shm_ring).await {
                         warn!("Connection error: {e}");
                     }
                 });
@@ -96,6 +133,7 @@ impl<P: Platform + 'static> HelperServer<P> {
 async fn handle_connection<P: Platform, S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     platform: Arc<P>,
+    shm_ring: Arc<ShmFrameRing>,
 ) -> Result<()> {
     loop {
         let request: IpcMessage<HelperRequest> = match read_ipc_message(&mut stream).await {
@@ -122,7 +160,7 @@ async fn handle_connection<P: Platform, S: AsyncRead + AsyncWrite + Unpin>(
                 max_long_edge,
                 quality,
             } => match platform.capture(max_long_edge, quality).await {
-                Ok(frame) => HelperResponse::Frame(frame),
+                Ok(frame) => HelperResponse::Frame(shm_ring.promote_frame(frame)),
                 Err(e) => HelperResponse::Error(e.to_string()),
             },
             HelperRequest::GetAxSnapshot { window_id } => {
@@ -185,4 +223,67 @@ async fn handle_connection<P: Platform, S: AsyncRead + AsyncWrite + Unpin>(
         write_ipc_message(&mut stream, &response).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_credential_authorization_logic() {
+        assert!(is_peer_authorized(501, 501));
+        assert!(is_peer_authorized(0, 0));
+        assert!(!is_peer_authorized(501, 502));
+        assert!(!is_peer_authorized(1000, 1001));
+        assert!(!is_peer_authorized(0, 501));
+    }
+
+    #[tokio::test]
+    async fn test_helper_server_socket_permissions_and_ping() {
+        let sock_path =
+            std::env::temp_dir().join(format!("gm_helper_test_{}.sock", std::process::id()));
+        let platform = gm_platform::MockPlatform::new();
+        let server = HelperServer::new(platform);
+        let s_path = sock_path.clone();
+
+        let srv_handle = tokio::spawn(async move {
+            let _ = server.run(s_path).await;
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert!(sock_path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&sock_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "Helper socket permissions must be 0o600");
+        }
+
+        let client = gm_platform::IpcPlatformClient::new(&sock_path);
+        let ping_res = client.ping().await;
+        assert!(ping_res.is_ok());
+
+        // Verify zero-copy POSIX SharedMemory promotion on CaptureLatestFrame
+        #[cfg(unix)]
+        {
+            use gm_platform::Platform;
+            let frame = client.capture(Some(640), Some(80)).await.unwrap();
+            assert!(
+                matches!(frame.data, gm_core::types::FrameData::SharedMemory { .. }),
+                "HelperServer must promote captured frames to POSIX SharedMemory on Unix"
+            );
+            let recovered = gm_platform::resolve_frame_bytes(&frame).unwrap();
+            assert!(!recovered.is_empty());
+        }
+
+        srv_handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
 }

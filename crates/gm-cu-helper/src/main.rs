@@ -24,7 +24,7 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let config = GmConfig::default();
+    let config = GmConfig::load_or_default(None);
     let socket_path = args.socket.unwrap_or(config.socket_path);
 
     info!("Starting gm-cu-helper daemon at {:?}", socket_path);

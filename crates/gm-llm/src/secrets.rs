@@ -4,6 +4,80 @@ use tracing::{debug, info};
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "co.anysphere.grok-muse";
 pub const META_KEY_ACCOUNT: &str = "meta_api_key";
 pub const XAI_KEY_ACCOUNT: &str = "xai_api_key";
+pub const OPENBOT_WEB_TOKEN_ACCOUNT: &str = "openbot_web_token";
+pub const TELEGRAM_TOKEN_ACCOUNT: &str = "telegram_bot_token";
+pub const SLACK_TOKEN_ACCOUNT: &str = "slack_bot_token";
+pub const DISCORD_TOKEN_ACCOUNT: &str = "discord_bot_token";
+
+#[derive(Debug, Clone)]
+pub struct LeasedSecret {
+    pub secret_ref: String,
+    pub value: String,
+}
+
+/// Resolves opaque vault references (`secret://keychain/<account>` or `secret://1password/<vault>/<item>/<field>`)
+/// without exposing plaintext credentials in LLM prompts or transcripts.
+#[derive(Debug, Clone, Default)]
+pub struct VaultSecretResolver {
+    keychain: KeychainSecrets,
+}
+
+impl VaultSecretResolver {
+    pub fn new(keychain: KeychainSecrets) -> Self {
+        Self { keychain }
+    }
+
+    pub fn keychain(&self) -> &KeychainSecrets {
+        &self.keychain
+    }
+
+    pub fn resolve(&self, secret_ref: &str) -> Result<LeasedSecret> {
+        if let Some(account) = secret_ref.strip_prefix("secret://keychain/") {
+            let clean = account.trim();
+            if clean.is_empty() {
+                return Err(GmError::Config(
+                    "Empty keychain account in secret URI".into(),
+                ));
+            }
+            let value = self.keychain.get_secret(clean)?;
+            return Ok(LeasedSecret {
+                secret_ref: secret_ref.to_string(),
+                value,
+            });
+        }
+
+        if let Some(op_path) = secret_ref.strip_prefix("secret://1password/") {
+            let clean = op_path.trim();
+            if clean.is_empty() {
+                return Err(GmError::Config("Empty 1Password path in secret URI".into()));
+            }
+            let op_uri = format!("op://{clean}");
+            let output = std::process::Command::new("op")
+                .args(["read", &op_uri, "--no-newline"])
+                .output()
+                .map_err(|e| {
+                    GmError::Config(format!("Failed to invoke 1Password CLI (`op`): {e}"))
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(GmError::Config(format!(
+                    "1Password CLI (`op read`) failed for '{secret_ref}': {stderr}"
+                )));
+            }
+            let value = String::from_utf8(output.stdout).map_err(|e| {
+                GmError::Config(format!("1Password secret is not valid UTF-8: {e}"))
+            })?;
+            return Ok(LeasedSecret {
+                secret_ref: secret_ref.to_string(),
+                value,
+            });
+        }
+
+        Err(GmError::Config(format!(
+            "Unsupported secret URI scheme '{secret_ref}'. Expected 'secret://keychain/<account>' or 'secret://1password/<vault>/<item>/<field>'"
+        )))
+    }
+}
 
 /// macOS Keychain Secret Manager for Meta and xAI API Keys.
 #[derive(Debug, Clone)]
@@ -22,6 +96,11 @@ impl KeychainSecrets {
         Self {
             service: service.into(),
         }
+    }
+
+    /// Retrieve secret from OS keychain or environment, returning Option<String>.
+    pub fn get(&self, account: &str) -> Option<String> {
+        self.get_secret(account).ok()
     }
 
     /// Retrieve secret from OS keychain, falling back to environment variable if absent.
@@ -207,5 +286,24 @@ mod tests {
 
         // Verify gone (when env var not set)
         assert!(secrets.get_secret(account).is_err());
+    }
+
+    #[test]
+    fn test_vault_secret_resolver_keychain_and_invalid_scheme() {
+        unsafe {
+            std::env::set_var("VAULT_TEST_TOKEN", "s3cr3t_vault_val_42");
+        }
+        let resolver =
+            VaultSecretResolver::new(KeychainSecrets::new("co.anysphere.grok-muse.vault-test"));
+        let leased = resolver
+            .resolve("secret://keychain/vault_test_token")
+            .unwrap();
+        assert_eq!(leased.secret_ref, "secret://keychain/vault_test_token");
+        assert_eq!(leased.value, "s3cr3t_vault_val_42");
+
+        assert!(resolver.resolve("http://not-a-secret").is_err());
+        unsafe {
+            std::env::remove_var("VAULT_TEST_TOKEN");
+        }
     }
 }

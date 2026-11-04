@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "gm_cu_helper"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gm-cu-helper"
 path = "src/main.rs"
@@ -17,6 +21,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS native bindings can be added here or via objc2

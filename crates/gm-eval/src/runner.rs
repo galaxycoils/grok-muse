@@ -95,6 +95,7 @@ impl EvalRunner {
                 max_action_retries: 3,
                 trajectory_dir: None,
                 capture_frames: false,
+                ..Default::default()
             },
         );
 

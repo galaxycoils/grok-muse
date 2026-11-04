@@ -1,24 +1,49 @@
-# Grok-Muse Hybrid Agent
+# Grok-Muse Hybrid Agent (`v0.3.0` — OpenBot Multi-Agent & Coworker Suite)
 
-> **Fast computer-use + proactive personal agent for macOS.**  
-> Built in Rust with native macOS ScreenCaptureKit, Accessibility APIs, CoreGraphics, EventKit, and hybrid LLM routing (Meta Muse + xAI Grok).
+> **Fast computer-use + proactive personal agent + OpenBot multi-agent coworker suite for macOS.**  
+> Built in Rust with native macOS ScreenCaptureKit, Accessibility APIs, CoreGraphics, EventKit, Seatbelt (`sandbox-exec`) workspace confinement, Candle Metal local VLM inference, and hybrid LLM routing (Meta Muse + xAI Grok + Local VLM).
 
 ---
 
 ## 📑 Table of Contents
 1. [Goal State & Metrics (G1–G8)](#goal-state--metrics-g1g8)
-2. [System Architecture](#system-architecture)
-3. [Workspace Crates](#workspace-crates)
-4. [Installation & Packaging (DMG)](#installation--packaging-dmg)
-5. [LaunchAgent Service Management](#launchagent-service-management)
-6. [macOS Onboarding & Permissions](#macos-onboarding--permissions)
-7. [Keychain Secret Management](#keychain-secret-management)
-8. [CLI Command Reference](#cli-command-reference)
-9. [Proactive Engine & Quiet Gate](#proactive-engine--quiet-gate)
-10. [Memory Upkeep Engine](#memory-upkeep-engine)
-11. [Desktop Shell & Keyboard Shortcuts](#desktop-shell--keyboard-shortcuts)
-12. [Benchmarking & Evaluation (`xtask`)](#benchmarking--evaluation-xtask)
-13. [Continuous Integration (CI)](#continuous-integration-ci)
+2. [What's New in `v0.3.0` (OpenBot Coworker Suite)](#whats-new-in-v030-openbot-coworker-suite)
+3. [System Architecture](#system-architecture)
+4. [Workspace Crates](#workspace-crates)
+5. [Installation & Packaging (DMG)](#installation--packaging-dmg)
+6. [LaunchAgent Service Management](#launchagent-service-management)
+7. [macOS Onboarding & Permissions](#macos-onboarding--permissions)
+8. [Keychain & Opaque Vault Secret Management](#keychain--opaque-vault-secret-management)
+9. [CLI Command Reference](#cli-command-reference)
+10. [OpenBot Multi-Agent Coworkers, Queue, Channels & Companion Web UI](#openbot-multi-agent-coworkers-queue-channels--companion-web-ui)
+11. [Proactive Engine & Quiet Gate](#proactive-engine--quiet-gate)
+12. [Memory Upkeep Engine](#memory-upkeep-engine)
+13. [Desktop Shell & Keyboard Shortcuts](#desktop-shell--keyboard-shortcuts)
+14. [Benchmarking & Evaluation (`xtask`)](#benchmarking--evaluation-xtask)
+15. [Continuous Integration (CI)](#continuous-integration-ci)
+
+---
+
+## What's New in `v0.3.0` (OpenBot Coworker Suite)
+
+Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`crates/gm-openbot`) alongside the `v0.2.0` Set-of-Marks (SoM) vision grounding, MCP tool bridge, and native Candle Metal VLM engine (`crates/gm-vlm-candle`):
+
+1. **Persistent Multi-Bot Roster & Isolated Per-Bot Workspaces**:
+   - Ships with 4 specialized AI teammates out of the box: `@muse` (*General Desktop Operator*), `@researcher` (*Deep Knowledge & Web Researcher*), `@coder` (*Sandboxed Software Engineer*), and `@guardian` (*Security & Governance Analyst*), plus custom bot creation via `gm bots create`.
+   - Each bot gets an isolated directory tree (`<storage_dir>/bots/<bot_id>/{workspace,inbox,outbox}`) and dedicated SQLite FTS5 memory store.
+2. **Crash-Safe SQLite WAL FIFO Task Queues**:
+   - Priority-ordered durable task queues (`gm queue`) with `pause`, `resume`, `cancel`, `reassign`, JSONL `backup`/`restore`, and automatic crash recovery of interrupted in-flight tasks on daemon startup.
+3. **Multi-Bot Channels, A2A Artifact Handoffs & Context Compaction**:
+   - Persistent `#general`, `#research`, and `#ops` channels (`gm channels`) with automatic `@<bot_id>` mention parsing and task spawning.
+   - Structured Agent-to-Agent (`A2aCoordinator`) handoffs that copy artifacts from `<from_bot>/outbox/` into `<to_bot>/inbox/` with loop-depth guards (`max_handoff_depth = 4`), paired with `ContextCompactor` token-budget summarization.
+4. **macOS Kernel Seatbelt (`sandbox-exec`) Confinement & Governance Gateway**:
+   - Every bot shell tool (`WorkspaceShell`) executes inside a dynamically generated macOS Seatbelt SBPL profile (`/usr/bin/sandbox-exec`) restricting file writes strictly to the bot's `workspace/` and `outbox/`.
+   - `SecurityGateway` evaluates every GUI, MCP, and workspace action against explicit policy rules (`RULE-BLK-001` through `RULE-SEC-006`) and logs `Permitted`, `Refused`, and `Failed` records with rule citations.
+5. ***"Take the Wheel"* Human Handoff & Opaque Vault Secrets**:
+   - Detects 2FA/MFA/CAPTCHA/login walls, pauses the bot (`WaitingForHuman`), surfaces a `🛞 Take the Wheel` HUD/alert prompt, and resumes seamlessly once the human hands control back.
+   - Supports opaque `secret://keychain/<account>` and `secret://1password/<vault>/<item>/<field>` secret leases injected directly into target fields while `SecretScrubber` guarantees `0` plaintext leaks in LLM prompts, trajectories, or audit logs.
+6. **Loopback Companion Web / AG-UI SSE Server & Chat Bridges**:
+   - Built-in `axum` server (`gm serve`, default `127.0.0.1:7433`) serving the live Companion Web UI (`/`), Governance Audit Dashboard (`/admin/audit`), A2A Agent Card (`/.well-known/agent.json`), AG-UI SSE stream (`/ag-ui/events`), and HMAC-SHA256 verified Slack / Telegram / Discord webhook bridges.
 
 ---
 
@@ -80,11 +105,13 @@
 - **[`crates/gm-safety`](crates/gm-safety)**: Approval tier classifier, emergency kill switch, secure text field redaction, blocklist manager, append-only `AuditLogger`, weekly/monthly report synthesis.
 - **[`crates/gm-memory`](crates/gm-memory)**: SQLite FTS memory store, deduplication, knowledge clustering, and stale observation pruning.
 - **[`crates/gm-goals`](crates/gm-goals)**: Goal state machine, proactive scheduler, quiet gate, calendar/mail patrol, nightly review, feed stream, and ideas generator.
-- **[`crates/gm-agent`](crates/gm-agent)**: Autonomous computer-use loop, verify-after-act diffing, user-coexistence detection, trajectory recorder.
-- **[`crates/gm-daemon`](crates/gm-daemon)**: Unprivileged background daemon, primary CLI, and interactive terminal REPL (`gm chat`).
-- **[`crates/gm-ui`](crates/gm-ui)**: AppKit desktop shell (tray, floating windows, action overlay, global hotkeys).
-- **[`crates/gm-eval`](crates/gm-eval)**: 25-task macOS evaluation runner and deterministic offline replay fixtures.
-- **[`xtask`](xtask)**: Release packaging (`.dmg`), automated DMG verification (`verify-dmg`), hardened runtime signing, and automated benchmark gates (`bench-hotpath`, `bench-rss`, `bench-llm`).
+- **[`crates/gm-agent`](crates/gm-agent)**: Autonomous computer-use loop, Set-of-Marks (SoM) vision compositor, stagnation detector, MCP tool bridge, Seatbelt-confined workspace tools (`ReadFile`, `WriteFile` with 200-line unified diff preview, `ListFiles`, `Shell`), *"Take the Wheel"* human handoff, and trajectory recorder.
+- **[`crates/gm-openbot`](crates/gm-openbot)**: OpenBot multi-agent supervisor, persistent `BotRoster`, crash-safe SQLite `DurableTaskQueue`, multi-bot `ChannelStore`, `A2aCoordinator` artifact handoff engine, `ContextCompactor`, `BridgeRouter` (Telegram/Slack/Discord), and loopback `CompanionWebServer` (AG-UI SSE + `/admin/audit`).
+- **[`crates/gm-vlm-candle`](crates/gm-vlm-candle)**: Native Rust + Metal local Vision-Language Model inference engine (`Qwen2-VL-2B-Instruct` & `SmolVLM2`) with HuggingFace Hub pull/cache management.
+- **[`crates/gm-daemon`](crates/gm-daemon)**: Unprivileged background daemon, dual-socket IPC control server, primary CLI (`gm`), and interactive terminal REPL (`gm chat`).
+- **[`crates/gm-ui`](crates/gm-ui)**: AppKit desktop shell (tray, floating windows, action overlay, interactive approval & *"Take the Wheel"* sheets, global hotkeys).
+- **[`crates/gm-eval`](crates/gm-eval)**: 25-task macOS evaluation runner (G5), `v0.2.0` capability suite, and `v0.3.0` OpenBot evaluation suite (`ob_queue_01`–`ob_agui_05`).
+- **[`xtask`](xtask)**: Release packaging (`.dmg`), automated DMG verification (`verify-dmg`), hardened runtime signing, Apple notarization (`notarize`), and automated 8-gate certification (`test-all`).
 
 
 ---
@@ -194,6 +221,33 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 | `gm feed` | `[--limit <N>] [--json]` | Terminal timeline stream of recent observations, patrol insights, and tasks. |
 | `gm ideas` | `[--json]` | Proactive recommendations from calendar gaps, unread threads, and memory. |
 | `gm chat` | `[--system "<prompt>"]` | Interactive terminal REPL for conversation, memory retrieval, status, and inline tasks. |
+| `gm models` | `<list\|pull\|rm> [--json]` | Manage offline local Vision-Language Models (`qwen2-vl-2b`, `smolvlm2-2.2b`). |
+| `gm bots` | `<list\|show\|create\|rm> [--json]` | Manage OpenBot persistent agent roster and isolated per-bot workspaces. |
+| `gm queue` | `<list\|add\|pause\|resume\|cancel\|reassign\|backup\|restore>` | Manage crash-safe SQLite FIFO task queues across bots. |
+| `gm channels` | `<list\|post\|history\|assign\|archive\|restore>` | Post to multi-bot channels (`#general`, `#research`, `#ops`) and trigger `@bot` mentions. |
+| `gm serve` | `[--bind 127.0.0.1:7433]` | Launch the loopback OpenBot Companion Web UI, AG-UI SSE stream, and `/admin/audit` dashboard. |
+
+---
+
+## OpenBot Multi-Agent Coworkers, Queue, Channels & Companion Web UI
+
+```bash
+# List the persistent bot roster (muse, researcher, coder, guardian)
+gm bots list
+
+# Enqueue a prioritized task for @coder
+gm queue add --bot coder --priority 10 "Write unit tests and save summary in outbox/"
+
+# Post a message in #general mentioning @coder and @researcher
+gm channels post general "Hey @coder benchmark the hotpath and hand off report to @researcher"
+
+# Export or restore durable SQLite queue state
+gm queue backup /tmp/openbot_queue_backup.jsonl
+gm queue restore /tmp/openbot_queue_backup.jsonl
+
+# Launch the loopback Companion Web / AG-UI / Governance Audit server
+gm serve --bind 127.0.0.1:7433
+```
 
 
 ---

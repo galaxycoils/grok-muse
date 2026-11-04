@@ -10,7 +10,7 @@ pub enum TaskType {
     LiveWebSearch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     Meta,
     Xai,
