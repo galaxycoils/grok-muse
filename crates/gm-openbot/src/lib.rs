@@ -28,6 +28,207 @@ mod tests {
     use tokio::sync::broadcast;
 
     #[test]
+    fn corrupt_roster_is_preserved_for_recovery() {
+        let dir = std::env::temp_dir().join(format!("ob_roster_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("roster.json");
+        let damaged = "{\"my-custom-bot\": ";
+        std::fs::write(&file, damaged).unwrap();
+        assert!(BotRoster::open(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), damaged);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn channel_creation_never_resets_existing_state() {
+        let store = ChannelStore::in_memory().unwrap();
+        let members = vec!["coder".to_string()];
+        store
+            .create_channel(" #Launch ", "Original topic", Some("coder"), &members)
+            .unwrap();
+        store.set_channel_paused("#LAUNCH", true).unwrap();
+        store.set_archived("LAUNCH", true).unwrap();
+        assert!(
+            store
+                .create_channel("launch", "Replacement", None, &[])
+                .is_err()
+        );
+        let channel = store.get_channel(" #LAUNCH ").unwrap().unwrap();
+        assert_eq!(channel.topic, "Original topic");
+        assert_eq!(channel.participants, members);
+        assert!(channel.paused && channel.archived);
+        for invalid in ["", "#", "a/b", "a b", "a.b"] {
+            assert!(store.create_channel(invalid, "", None, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn mentions_handle_punctuation_without_matching_email_addresses() {
+        let bots = vec!["coder".into(), "researcher".into()];
+        assert_eq!(
+            extract_bot_mentions(
+                "(@Coder,@researcher): @coder! name@coder.com @unknown",
+                &bots
+            ),
+            vec!["coder", "researcher"]
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_channels_auth_validation_and_transcript_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ob_channels_{}", uuid::Uuid::new_v4()));
+        let mut cfg = GmConfig {
+            storage_dir: dir.clone(),
+            ..Default::default()
+        };
+        cfg.openbot.bots_dir = dir.join("bots");
+        let (tx, _) = broadcast::channel(32);
+        let sup =
+            OpenBotSupervisor::open(cfg.clone(), Arc::new(AuditLogger::in_memory()), tx).unwrap();
+        let server = CompanionWebServer::new(
+            sup.clone(),
+            BridgeRouter::new(sup.clone(), cfg.openbot.bridges),
+            Some("channel-token".into()),
+            None,
+        );
+        let (addr, handle) = server.bind_and_serve("127.0.0.1:0").await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let channel_body = serde_json::json!({ "id": "Launch", "topic": "Ship it", "owner_bot_id": "coder", "participants": ["researcher", "coder", "coder"] });
+        assert_eq!(
+            client
+                .post(format!("{base}/api/channels"))
+                .json(&channel_body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let response = client
+            .post(format!("{base}/api/channels"))
+            .bearer_auth("channel-token")
+            .json(&channel_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let channel: ChannelInfo = response.json().await.unwrap();
+        assert_eq!(channel.id, "launch");
+        assert_eq!(channel.participants, vec!["coder", "researcher"]);
+        assert_eq!(
+            client
+                .post(format!("{base}/api/channels"))
+                .bearer_auth("channel-token")
+                .json(&channel_body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            409
+        );
+        let invalid = serde_json::json!({ "id": "bad-owner", "owner_bot_id": "missing" });
+        assert_eq!(
+            client
+                .post(format!("{base}/api/channels"))
+                .bearer_auth("channel-token")
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert!(sup.channels().get_channel("bad-owner").unwrap().is_none());
+
+        let text = "<img src=x onerror=alert(1)> @coder,@researcher please review";
+        let response = client
+            .post(format!("{base}/api/channels/LAUNCH/messages"))
+            .bearer_auth("channel-token")
+            .json(&serde_json::json!({"content":text}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let post: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(post["spawned_tasks"].as_array().unwrap().len(), 2);
+        let messages: Vec<ChannelMessageRecord> = client
+            .get(format!("{base}/api/channels/launch/messages"))
+            .bearer_auth("channel-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, text);
+        assert_eq!(messages[0].channel_id, "launch");
+        for (id, content) in [("missing", "Hello"), ("launch", "   ")] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/api/channels/{id}/messages"))
+                    .bearer_auth("channel-token")
+                    .json(&serde_json::json!({"content":content}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                400
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/api/channels/missing/messages"))
+                .bearer_auth("channel-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(sup.queue().list_tasks(None).unwrap().len(), 2);
+        sup.channels().set_channel_paused("launch", true).unwrap();
+        let (_, tasks) = sup
+            .post_channel_message("launch", "operator", None, "Saved while paused")
+            .unwrap();
+        assert!(tasks.is_empty());
+        assert!(
+            sup.submit_task(Some("coder"), Some("launch"), "Blocked while paused", 0)
+                .is_err()
+        );
+        sup.channels().set_archived("launch", true).unwrap();
+        assert!(
+            sup.post_channel_message("launch", "operator", None, "Blocked while archived")
+                .is_err()
+        );
+        assert_eq!(
+            sup.channels().list_messages("launch", 100).unwrap().len(),
+            2
+        );
+        assert!(sup.submit_task(Some("coder"), None, "   ", 0).is_err());
+        assert!(
+            sup.submit_task(Some("coder"), Some("missing"), "Missing channel", 0)
+                .is_err()
+        );
+        let script = client
+            .get(format!("{base}/companion.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(script.status(), 200);
+        assert!(
+            script.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        handle.abort();
+        drop(sup);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_openbot_roster_and_queue_contract() {
         let dir = std::env::temp_dir().join(format!("ob_test_{}", uuid::Uuid::new_v4()));
         let roster = BotRoster::open(dir.join("bots")).unwrap();

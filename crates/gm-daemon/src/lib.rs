@@ -1255,7 +1255,8 @@ pub async fn run_daemon(config_path: Option<PathBuf>, task: Option<String>) -> R
             let bridges_cfg = config.openbot.bridges.clone();
             Some(tokio::spawn(async move {
                 let bridge = gm_openbot::BridgeRouter::new(sup.clone(), bridges_cfg);
-                let web = gm_openbot::CompanionWebServer::new(sup, bridge, None, None);
+                let (token, slack_secret) = companion_web_credentials();
+                let web = gm_openbot::CompanionWebServer::new(sup, bridge, token, slack_secret);
                 match web.bind_and_serve(&bind_addr).await {
                     Ok((_addr, handle)) => {
                         let _ = handle.await;
@@ -1848,12 +1849,26 @@ pub async fn run_channels(
     Ok(())
 }
 
+fn companion_web_credentials() -> (Option<String>, Option<String>) {
+    let read = |name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    (
+        read("GROK_MUSE_COMPANION_TOKEN"),
+        read("GROK_MUSE_SLACK_SIGNING_SECRET"),
+    )
+}
+
 pub async fn run_serve(bind: &str, config_path: Option<PathBuf>) -> Result<()> {
     let config = GmConfig::load_or_default(config_path.as_deref());
     let sup = open_default_openbot_supervisor(config_path)?;
     println!("==> Starting OpenBot Companion Web / AG-UI / A2A server on http://{bind} ...");
     let bridge = gm_openbot::BridgeRouter::new(sup.clone(), config.openbot.bridges);
-    let web = gm_openbot::CompanionWebServer::new(sup, bridge, None, None);
+    let (token, slack_secret) = companion_web_credentials();
+    let web = gm_openbot::CompanionWebServer::new(sup, bridge, token, slack_secret);
     let (_addr, handle) = web.bind_and_serve(bind).await?;
     let _ = handle.await;
     Ok(())

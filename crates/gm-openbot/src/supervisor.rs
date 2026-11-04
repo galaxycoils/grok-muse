@@ -1,5 +1,5 @@
 use crate::a2a::A2aCoordinator;
-use crate::channels::{ChannelMessageRecord, ChannelStore};
+use crate::channels::{ChannelInfo, ChannelMessageRecord, ChannelStore};
 use crate::compaction::ContextCompactor;
 use crate::queue::{DurableTaskQueue, QueuedTask};
 use crate::roster::BotRoster;
@@ -147,11 +147,51 @@ impl OpenBotSupervisor {
         if self.roster.get_bot(target_bot).is_none() {
             return Err(GmError::Config(format!("Unknown bot '{target_bot}'")));
         }
-        let task = self
-            .queue
-            .enqueue(target_bot, channel_id, instruction, priority)?;
+        if instruction.trim().is_empty() {
+            return Err(GmError::Config("Instruction cannot be empty".into()));
+        }
+        let channel = channel_id
+            .map(|id| {
+                self.channels
+                    .get_channel(id)?
+                    .ok_or_else(|| GmError::Config(format!("Unknown channel '{id}'")))
+            })
+            .transpose()?;
+        if channel.as_ref().is_some_and(|c| c.archived || c.paused) {
+            return Err(GmError::Config("Channel is archived or paused".into()));
+        }
+        let task = self.queue.enqueue(
+            target_bot,
+            channel.as_ref().map(|c| c.id.as_str()),
+            instruction,
+            priority,
+        )?;
         self.broadcast_queue_state(target_bot);
         Ok(task)
+    }
+
+    pub fn create_channel(
+        &self,
+        id: &str,
+        topic: &str,
+        owner_bot_id: Option<&str>,
+        participants: &[String],
+    ) -> Result<ChannelInfo> {
+        for bot_id in participants.iter().map(String::as_str).chain(owner_bot_id) {
+            if self.roster.get_bot(bot_id).is_none() {
+                return Err(GmError::Config(format!("Unknown bot '{bot_id}'")));
+            }
+        }
+        let mut members = participants.to_vec();
+        if let Some(owner) = owner_bot_id
+            && !members.iter().any(|id| id == owner)
+        {
+            members.push(owner.to_string());
+        }
+        members.sort();
+        members.dedup();
+        self.channels
+            .create_channel(id, topic, owner_bot_id, &members)
     }
 
     /// Post a message in a channel and automatically enqueue tasks for any `@bot` mentions
@@ -163,7 +203,20 @@ impl OpenBotSupervisor {
         bot_id: Option<&str>,
         content: &str,
     ) -> Result<(ChannelMessageRecord, Vec<QueuedTask>)> {
+        let chan_info = self
+            .channels
+            .get_channel(channel_id)?
+            .ok_or_else(|| GmError::Config(format!("Unknown channel '{channel_id}'")))?;
         let valid_ids: Vec<String> = self.roster.list_bots().into_iter().map(|b| b.id).collect();
+        // Validate the owner before persisting a human message that needs its responder.
+        if bot_id.is_none()
+            && !chan_info.paused
+            && crate::channels::extract_bot_mentions(content, &valid_ids).is_empty()
+            && let Some(owner) = &chan_info.owner_bot_id
+            && self.roster.get_bot(owner).is_none()
+        {
+            return Err(GmError::Config(format!("Unknown channel owner '{owner}'")));
+        }
         let msg = self
             .channels
             .post_message(channel_id, author, bot_id, content, &valid_ids)?;
@@ -177,10 +230,7 @@ impl OpenBotSupervisor {
         });
 
         let mut spawned = Vec::new();
-        let chan_info = self.channels.get_channel(channel_id)?;
-        let chan_paused = chan_info.as_ref().map(|c| c.paused).unwrap_or(false);
-
-        if !chan_paused {
+        if !chan_info.paused {
             if !msg.mentioned_bots.is_empty() {
                 for target_bot in &msg.mentioned_bots {
                     // Prevent a bot from self-triggering in a loop
@@ -191,7 +241,7 @@ impl OpenBotSupervisor {
                     }
                 }
             } else if bot_id.is_none()
-                && let Some(owner) = chan_info.and_then(|c| c.owner_bot_id)
+                && let Some(owner) = chan_info.owner_bot_id
             {
                 let t = self.submit_task(Some(&owner), Some(&msg.channel_id), content, 0)?;
                 spawned.push(t);

@@ -39,7 +39,8 @@ impl BotRoster {
 
         let mut loaded: BTreeMap<String, BotProfile> = if roster_file.exists() {
             let content = std::fs::read_to_string(&roster_file)?;
-            serde_json::from_str(&content).unwrap_or_default()
+            // A damaged roster must never be replaced by defaults on the next read.
+            serde_json::from_str(&content)?
         } else {
             BTreeMap::new()
         };

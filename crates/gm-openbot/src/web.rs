@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 const COMPANION_UI_HTML: &str = include_str!("companion_ui.html");
+const COMPANION_UI_JS: &str = include_str!("companion_ui.js");
 
 #[derive(Clone)]
 pub struct CompanionWebState {
@@ -58,6 +59,16 @@ pub struct ChannelPostBody {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelBody {
+    pub id: String,
+    #[serde(default)]
+    pub topic: String,
+    pub owner_bot_id: Option<String>,
+    #[serde(default)]
+    pub participants: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AgUiRunRequest {
     pub bot_id: Option<String>,
@@ -88,6 +99,7 @@ fn check_auth(
 pub fn build_companion_router(state: CompanionWebState) -> Router {
     Router::new()
         .route("/", get(serve_index))
+        .route("/companion.js", get(serve_script))
         .route("/admin/audit", get(serve_index))
         .route("/.well-known/agent.json", get(serve_agent_card))
         .route("/a2a/card", get(serve_agent_card))
@@ -96,7 +108,7 @@ pub fn build_companion_router(state: CompanionWebState) -> Router {
         .route("/api/bots", get(list_bots))
         .route("/api/queue", get(list_queue).post(enqueue_task))
         .route("/api/tasks/:id/:action", post(control_task_route))
-        .route("/api/channels", get(list_channels))
+        .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/:id/messages",
             get(list_channel_messages).post(post_channel_message),
@@ -146,6 +158,13 @@ impl CompanionWebServer {
 
 async fn serve_index() -> Html<&'static str> {
     Html(COMPANION_UI_HTML)
+}
+
+async fn serve_script() -> impl IntoResponse {
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        COMPANION_UI_JS,
+    )
 }
 
 async fn serve_agent_card(State(state): State<CompanionWebState>) -> impl IntoResponse {
@@ -289,12 +308,45 @@ async fn list_channels(
     Ok(Json(chans))
 }
 
+async fn create_channel(
+    headers: HeaderMap,
+    State(state): State<CompanionWebState>,
+    Json(body): Json<CreateChannelBody>,
+) -> std::result::Result<impl IntoResponse, StatusCode> {
+    check_auth(&headers, state.bearer_token.as_deref())?;
+    if state
+        .supervisor
+        .channels()
+        .get_channel(&body.id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    let channel = state
+        .supervisor
+        .create_channel(
+            &body.id,
+            &body.topic,
+            body.owner_bot_id.as_deref(),
+            &body.participants,
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok((StatusCode::CREATED, Json(channel)))
+}
+
 async fn list_channel_messages(
     headers: HeaderMap,
     Path(id): Path<String>,
     State(state): State<CompanionWebState>,
 ) -> std::result::Result<impl IntoResponse, StatusCode> {
     check_auth(&headers, state.bearer_token.as_deref())?;
+    state
+        .supervisor
+        .channels()
+        .get_channel(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let msgs = state
         .supervisor
         .channels()
@@ -374,7 +426,8 @@ async fn stream_agui_events(
             let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".into());
             Some(Ok(Event::default().event(evt.event_type).data(json)))
         }
-        Err(_) => None,
+        // A lagged client must reload snapshots rather than silently miss state changes.
+        Err(_) => Some(Ok(Event::default().event("RESYNC_REQUIRED").data("{}"))),
     });
     Ok(Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()

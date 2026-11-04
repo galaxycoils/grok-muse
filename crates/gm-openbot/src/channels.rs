@@ -32,10 +32,8 @@ pub struct ChannelMessageRecord {
 /// Extract `@bot_id` mentions from a channel message against known bot IDs.
 pub fn extract_bot_mentions(text: &str, valid_bot_ids: &[String]) -> Vec<String> {
     let mut mentioned = Vec::new();
-    for token in text.split_whitespace() {
-        let trimmed =
-            token.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '_' && c != '-');
-        if let Some(handle) = trimmed.strip_prefix('@') {
+    for token in text.split(|c: char| !c.is_alphanumeric() && c != '@' && c != '_' && c != '-') {
+        if let Some(handle) = token.strip_prefix('@') {
             let lower = handle.to_lowercase();
             if valid_bot_ids.iter().any(|b| b == &lower) && !mentioned.contains(&lower) {
                 mentioned.push(lower);
@@ -43,6 +41,11 @@ pub fn extract_bot_mentions(text: &str, valid_bot_ids: &[String]) -> Vec<String>
         }
     }
     mentioned
+}
+
+/// Use one canonical identifier for HTTP, CLI, and database access.
+pub fn normalize_channel_id(id: &str) -> String {
+    id.trim().trim_start_matches('#').to_lowercase()
 }
 
 /// Persistent SQLite store for OpenBot multi-agent group channels (`#general`, `#research`, `#ops`)
@@ -151,14 +154,24 @@ impl ChannelStore {
         owner_bot_id: Option<&str>,
         participants: &[String],
     ) -> Result<ChannelInfo> {
-        let clean_id = id.trim().trim_start_matches('#').to_lowercase();
+        let clean_id = normalize_channel_id(id);
+        if clean_id.is_empty()
+            || clean_id.len() > 64
+            || !clean_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(GmError::Config(
+                "Channel ID must be 1–64 letters, digits, underscores or hyphens".into(),
+            ));
+        }
         let name = format!("#{clean_id}");
         let now = Utc::now().to_rfc3339();
         let parts_json = serde_json::to_string(participants)?;
         self.conn
             .lock()
             .execute(
-                r#"INSERT OR REPLACE INTO channels (
+                r#"INSERT INTO channels (
                     id, name, topic, owner_bot_id, participants_json, paused, archived, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)"#,
                 params![clean_id, name, topic, owner_bot_id, parts_json, now],
@@ -170,7 +183,7 @@ impl ChannelStore {
     }
 
     pub fn get_channel(&self, channel_id: &str) -> Result<Option<ChannelInfo>> {
-        let clean = channel_id.trim().trim_start_matches('#');
+        let clean = normalize_channel_id(channel_id);
         self.conn
             .lock()
             .query_row(
@@ -211,7 +224,18 @@ impl ChannelStore {
         content: &str,
         valid_bot_ids: &[String],
     ) -> Result<ChannelMessageRecord> {
-        let clean_chan = channel_id.trim().trim_start_matches('#');
+        let clean_chan = normalize_channel_id(channel_id);
+        let channel = self
+            .get_channel(&clean_chan)?
+            .ok_or_else(|| GmError::Config(format!("Unknown channel '{clean_chan}'")))?;
+        if channel.archived {
+            return Err(GmError::Config(format!(
+                "Channel '{clean_chan}' is archived"
+            )));
+        }
+        if content.trim().is_empty() {
+            return Err(GmError::Config("Message cannot be empty".into()));
+        }
         let mentioned = extract_bot_mentions(content, valid_bot_ids);
         let mentioned_json = serde_json::to_string(&mentioned)?;
         let id = format!("msg-{}", uuid::Uuid::new_v4());
@@ -243,7 +267,7 @@ impl ChannelStore {
         channel_id: &str,
         limit: usize,
     ) -> Result<Vec<ChannelMessageRecord>> {
-        let clean_chan = channel_id.trim().trim_start_matches('#');
+        let clean_chan = normalize_channel_id(channel_id);
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
@@ -278,7 +302,7 @@ impl ChannelStore {
     }
 
     pub fn set_channel_paused(&self, channel_id: &str, paused: bool) -> Result<bool> {
-        let clean = channel_id.trim().trim_start_matches('#');
+        let clean = normalize_channel_id(channel_id);
         let rows = self
             .conn
             .lock()
@@ -291,7 +315,7 @@ impl ChannelStore {
     }
 
     pub fn reassign_owner(&self, channel_id: &str, new_owner_bot_id: &str) -> Result<bool> {
-        let clean = channel_id.trim().trim_start_matches('#');
+        let clean = normalize_channel_id(channel_id);
         let rows = self
             .conn
             .lock()
@@ -304,7 +328,7 @@ impl ChannelStore {
     }
 
     pub fn set_archived(&self, channel_id: &str, archived: bool) -> Result<bool> {
-        let clean = channel_id.trim().trim_start_matches('#');
+        let clean = normalize_channel_id(channel_id);
         let rows = self
             .conn
             .lock()

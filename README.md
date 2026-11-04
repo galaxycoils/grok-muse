@@ -118,6 +118,21 @@ Grok-Muse `v0.3.0` integrates the **OpenBot Multi-Agent & Coworker Suite** (`cra
 
 ## Installation & Packaging (DMG)
 
+### Source checkout prerequisites
+
+The workspace currently expects the separate Darius repository beside this checkout
+(the same layout used by CI):
+
+```bash
+git clone https://github.com/galaxycoils/darius.git Darius
+git clone https://github.com/galaxycoils/grok-muse.git grok-muse
+cd grok-muse
+cargo test -p gm-openbot --locked
+```
+
+The dependency is not pinned to a Darius revision yet; this is tracked in the
+[reliability review](docs/openmausbot-comparison.md).
+
 ### Building the DMG
 ```bash
 # Build binaries, bundle .app packages, codesign, and create target/dist/Grok-Muse.dmg
@@ -230,6 +245,20 @@ If Keychain entries are absent (e.g., in automated CI environments), Grok-Muse a
 ---
 
 ## OpenBot Multi-Agent Coworkers, Queue, Channels & Companion Web UI
+
+The companion now supports channel conversations and creating channels with a topic,
+members, and default responder. It refreshes automatically, preserves failed sends,
+and supports the server's optional bearer token. **Automatic queue execution is not
+connected yet:** messages and tasks are persisted, but `gm serve` does not run agents.
+See the [OpenMausBot comparison and reliability review](docs/openmausbot-comparison.md)
+for the feature roadmap and runtime blockers.
+
+For token-protected local use, set `GROK_MUSE_COMPANION_TOKEN` in the server process's
+environment before starting `gm serve` or `gm daemon`, then enter that token in the
+companion's Connect form. The page keeps it only until reload. Keep the default
+loopback bind; remote access/pairing is not established by this setting. Slack's
+optional signing secret uses `GROK_MUSE_SLACK_SIGNING_SECRET`; replay protection is
+still outstanding (see the review).
 
 ```bash
 # List the persistent bot roster (muse, researcher, coder, guardian)
