@@ -441,7 +441,7 @@ mod signature_tests {
         std::fs::write(&config.image_path, image).unwrap();
         std::fs::write(&config.manifest_path, b"modified manifest").unwrap();
         assert!(verified_image(&config).is_err());
-        std::fs::remove_dir_all(directory).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
 
@@ -489,6 +489,6 @@ mod export_tests {
             .unwrap();
         assert!(collect_files(&dir, Path::new(""), &mut vec![], &mut 0, &mut 0, 0).is_err());
         drop(dir);
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

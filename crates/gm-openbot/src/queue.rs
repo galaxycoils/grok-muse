@@ -731,7 +731,7 @@ mod runtime_invariants {
             1
         );
         drop(second);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn corrupt_states_and_imports_fail_without_partial_writes() {
@@ -780,6 +780,6 @@ mod runtime_invariants {
         assert_eq!(queue.events_after(0, 100).unwrap()[0].0, id);
         assert!(queue.events_after(id, 100).unwrap().is_empty());
         drop(queue);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

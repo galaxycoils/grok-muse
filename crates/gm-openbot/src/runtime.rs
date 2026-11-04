@@ -119,7 +119,7 @@ mod tests {
         assert!(RuntimeLease::acquire(&dir).is_err());
         drop(first);
         assert!(RuntimeLease::acquire(&dir).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -237,6 +237,6 @@ mod worker_tests {
         let _ = runtime.await;
         drop(client);
         drop(supervisor);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

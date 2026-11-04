@@ -761,6 +761,7 @@ mod tests {
                 .to_string()
                 .contains("Host shell fallback is disabled")
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        drop(sandbox);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
