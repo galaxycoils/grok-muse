@@ -2190,6 +2190,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp_data);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_install_command_execution() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
